@@ -463,6 +463,11 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/api/health")
+def api_health() -> dict:
+    return {"status": "ok"}
+
+
 @app.get("/api/public/student-search")
 def public_student_search(q: str = "", db: Session = Depends(get_db)) -> list[dict]:
     """Kiosk-friendly search after QR scan (name or phone fragment)."""
