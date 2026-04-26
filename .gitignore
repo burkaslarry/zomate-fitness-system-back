@@ -25,3 +25,9 @@ doc/api/
 
 .flutter-plugins
 .flutter-plugins-dependencies
+
+# Python/FastAPI
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
