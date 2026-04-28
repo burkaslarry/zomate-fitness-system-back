@@ -1,3 +1,10 @@
+"""
+SQLAlchemy ORM models — table names prefixed ``zomate_fs_*`` (PostgreSQL).
+
+Aligned with product requirements F01–F04: students, branches, coaches,
+courses, check-ins, audits, soft-delete ledger via ``DeletedRecord``.
+"""
+
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint

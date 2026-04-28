@@ -9,8 +9,8 @@ from datetime import date, datetime, timedelta
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
-from sqlalchemy import func, or_, select
+from fastapi.responses import PlainTextResponse, RedirectResponse, Response
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session, joinedload
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -49,7 +49,45 @@ from .schemas import (
     TrialPurchaseInput,
 )
 
-app = FastAPI(title="Zomate Fitness System Demo API")
+# -----------------------------------------------------------------------------
+# Zomate Fitness — FastAPI service (zomate-fitness-system-back)
+#
+# REST + WebSocket; PostgreSQL tables ``zomate_fs_*``. Admin CSV import/export
+# (students, branches, coaches), attendance CSV template. Bearer auth (ADMIN /
+# CLERK). CORS: CORS_ALLOWED_ORIGINS.
+#
+# Ops: GET /health, GET /health/db · GET /api/health, GET /api/health/db (probes & Swagger).
+#
+# Swagger UI: GET /docs · ReDoc: GET /redoc · OpenAPI JSON: GET /openapi.json
+# -----------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Zomate Fitness API",
+    description="""
+REST API + WebSocket；資料表前缀 ``zomate_fs_*``（PostgreSQL）。
+
+**Swagger UI：** [`/docs`](/docs) · **ReDoc：** [`/redoc`](/redoc) · **OpenAPI JSON：** [`/openapi.json`](/openapi.json)
+
+多數受保護路由需在 **Authorize** 貼上 `Bearer <token>`（由 `POST /api/auth/login` 取得）。
+""",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    swagger_ui_parameters={"persistAuthorization": True},
+    openapi_tags=[
+        {
+            "name": "health",
+            "description": "Liveness / readiness；**毋須** Authorization。",
+        },
+    ],
+)
+
+
+@app.get("/", include_in_schema=False)
+def root_redirect_to_docs() -> RedirectResponse:
+    """Landing：導向 Swagger UI。"""
+    return RedirectResponse(url="/docs")
 
 def _cors_origins_from_env() -> list[str]:
     raw = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
@@ -458,14 +496,45 @@ def on_startup() -> None:
         db.close()
 
 
-@app.get("/health")
+API_SERVICE_NAME = "zomate-fitness-api"
+
+
+def _health_liveness_payload() -> dict:
+    return {"status": "ok", "service": API_SERVICE_NAME}
+
+
+def _health_database_payload(db: Session) -> dict:
+    db.execute(text("SELECT 1"))
+    return {"status": "ok", "database": "connected", "service": API_SERVICE_NAME}
+
+
+# -----------------------------------------------------------------------------
+# Health & DB connectivity (deploy probes, local smoke tests, Swagger · tags=health)
+# -----------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["health"], summary="Liveness（程序運行）")
 def health() -> dict:
-    return {"status": "ok"}
+    """Kubernetes / Render **liveness**：不依賴資料庫。"""
+    return _health_liveness_payload()
 
 
-@app.get("/api/health")
+@app.get("/health/db", tags=["health"], summary="Readiness · PostgreSQL")
+def health_db(db: Session = Depends(get_db)) -> dict:
+    """**Readiness**：``SELECT 1`` on ``DATABASE_URL``（eventxp / Render PostgreSQL）。"""
+    return _health_database_payload(db)
+
+
+@app.get("/api/health", tags=["health"], summary="Liveness（/api 前缀）")
 def api_health() -> dict:
-    return {"status": "ok"}
+    """與 ``GET /health`` 相同，方便前端與統一路径前缀。"""
+    return _health_liveness_payload()
+
+
+@app.get("/api/health/db", tags=["health"], summary="Readiness · PostgreSQL（/api 前缀）")
+def api_health_db(db: Session = Depends(get_db)) -> dict:
+    """與 ``GET /health/db`` 相同。"""
+    return _health_database_payload(db)
 
 
 @app.get("/api/public/student-search")
@@ -955,7 +1024,12 @@ def import_coaches_csv(
     return {"imported": added}
 
 
-# --- Students CSV ---
+# -----------------------------------------------------------------------------
+# Students CSV — PostgreSQL table ``zomate_fs_students``
+# GET ``/api/admin/students/export.csv`` · POST ``/api/admin/students/import``
+# Column layout shared with Next.js mock routes when API base is empty (dev only).
+# Auth: ``require_admin_or_clerk``.
+# -----------------------------------------------------------------------------
 
 
 @app.get("/api/admin/students/export.csv")
@@ -1183,6 +1257,25 @@ def download_qrcode_pdf(
     return Response(content=pdf, media_type="application/pdf", headers=headers)
 
 
+# -----------------------------------------------------------------------------
+# Attendance: CSV template only (batch import pipeline TBD)
+# -----------------------------------------------------------------------------
+
+
+@app.get("/api/admin/attendance/template.csv")
+def export_attendance_template_csv(user: AppUser = Depends(require_admin_or_clerk)) -> PlainTextResponse:
+    """CSV template for attendance workflows (stored/processed server-side later)."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["student_name", "phone", "pin", "checkin_time_iso"])
+    w.writerow(["Larry Lo", "+85291234567", "12345", "2026-04-26T10:00:00Z"])
+    return PlainTextResponse(
+        buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="attendance-template.csv"'},
+    )
+
+
 # --- Courses (admin + coach) ---
 
 
@@ -1279,6 +1372,8 @@ def admin_create_course(
 def coach_list_courses(
     coach_id: int,
     day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> list[CourseOut]:
@@ -1299,10 +1394,15 @@ def coach_list_courses(
         )
     )
     if day:
-        q = q.filter(
-            func.date(Course.scheduled_start) == day,
-        )
-    courses = q.order_by(Course.scheduled_start.asc()).limit(200).all()
+        q = q.filter(func.date(Course.scheduled_start) == day)
+    elif from_date is not None and to_date is not None:
+        if to_date < from_date:
+            raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
+        range_start = datetime.combine(from_date, datetime.min.time())
+        range_end_excl = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
+        q = q.filter(Course.scheduled_start < range_end_excl, Course.scheduled_end > range_start)
+    limit_n = 400 if (from_date is not None and to_date is not None) else 200
+    courses = q.order_by(Course.scheduled_start.asc()).limit(limit_n).all()
     return [course_to_out(c) for c in courses]
 
 

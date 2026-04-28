@@ -22,6 +22,10 @@ python run.py
 
 API runs at `http://localhost:8000`.
 
+**Swagger UI:** http://localhost:8000/docs · **ReDoc:** http://localhost:8000/redoc · OpenAPI schema: `/openapi.json`. Root `/` redirects to `/docs`.
+
+**Health checks:** `GET /api/health` / `GET /health`（liveness）；`GET /api/health/db` / `GET /health/db`（PostgreSQL readiness）。毋須認證。
+
 ## Table naming
 
 All demo tables use the requested prefix:
