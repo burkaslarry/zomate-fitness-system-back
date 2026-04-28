@@ -5,9 +5,10 @@ Aligned with product requirements F01–F04: students, branches, coaches,
 courses, check-ins, audits, soft-delete ledger via ``DeletedRecord``.
 """
 
-from datetime import datetime
+from datetime import datetime, date
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Date as DateColumn
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -51,6 +52,11 @@ class Course(Base):
     scheduled_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     scheduled_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Course set: 1–10 lessons, up to 3 weekdays (0=Mon … 6=Sun), comma-separated in DB.
+    total_lessons: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    lesson_weekdays: Mapped[str] = mapped_column(String(32), nullable=False, default="0")
+    series_start_date: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
+    series_end_date: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
 
     branch: Mapped["Branch"] = relationship(back_populates="courses")
     coach: Mapped["Coach"] = relationship(back_populates="courses")

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -107,6 +107,22 @@ class CourseCreate(BaseModel):
     scheduled_end: datetime
     student_ids: list[int] = Field(default_factory=list)
     credits_on_enroll: int = Field(default=10, ge=0, le=200)
+    # Calendar start for the series — defaults to scheduled_start.date() if omitted.
+    course_start_date: date | None = None
+    lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
+    total_lessons: int = Field(default=1, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_weekdays(self) -> "CourseCreate":
+        u = sorted(set(self.lesson_weekdays))
+        if not u:
+            raise ValueError("lesson_weekdays must include at least one day (Mon–Sun).")
+        if len(u) > 3:
+            raise ValueError("At most 3 weekdays may be selected.")
+        if any(d < 0 or d > 6 for d in u):
+            raise ValueError("weekday must be between 0 (Mon) and 6 (Sun).")
+        object.__setattr__(self, "lesson_weekdays", u)
+        return self
 
 
 class CourseReschedule(BaseModel):
@@ -135,4 +151,8 @@ class CourseOut(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
     created_at: datetime
+    total_lessons: int = 1
+    lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
+    series_start_date: date | None = None
+    series_end_date: date | None = None
     enrollments: list[CourseEnrollmentOut] = Field(default_factory=list)

@@ -70,7 +70,7 @@ REST API + WebSocket；資料表前缀 ``zomate_fs_*``（PostgreSQL）。
 
 多數受保護路由需在 **Authorize** 貼上 `Bearer <token>`（由 `POST /api/auth/login` 取得）。
 """,
-    version="1.0.0",
+    version="1.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -206,22 +206,25 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
     packet = io.BytesIO()
     canvas = Canvas(packet, pagesize=A4)
     width, _ = A4
-    canvas.setFont("Helvetica", 14)
-    canvas.drawString(40, 810, "Zomate Fitness QR Code")
+    canvas.setFont("Helvetica-Bold", 16)
+    canvas.drawString(40, 800, "Zomate Fitness — QR Paper (Print-out)")
+    canvas.setFont("Helvetica", 11)
+    canvas.drawString(40, 776, "Print this page and display at reception / gym floor.")
     canvas.setFont("Helvetica", 10)
-    canvas.drawString(40, 788, f"用途：{label}")
-    canvas.drawString(40, 768, f"內容：{payload[:150]}")
+    canvas.drawString(40, 752, f"Purpose: {label}")
+    canvas.drawString(40, 732, f"Payload: {payload[:180]}{'…' if len(payload) > 180 else ''}")
     canvas.drawImage(
         ImageReader(qr_buffer),
         (width - 260) / 2,
-        300,
+        290,
         width=260,
         height=260,
         preserveAspectRatio=True,
         mask="auto",
     )
     canvas.setFont("Helvetica", 9)
-    canvas.drawString(40, 50, "Scan this QR code with your mobile device.")
+    canvas.drawString(40, 56, "Scan with mobile — Zomate Fitness check-in / onboarding.")
+    canvas.drawString(40, 42, "A4 printable layout · QR for counter display.")
     canvas.showPage()
     canvas.save()
     return packet.getvalue()
@@ -322,40 +325,119 @@ def allocate_enrollment_pin(db: Session, course_id: int) -> str:
     raise HTTPException(status_code=500, detail="Could not allocate class PIN.")
 
 
+def _migrate_courses_extended_columns(db: Session) -> None:
+    stmts = [
+        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS total_lessons INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS lesson_weekdays VARCHAR(32) NOT NULL DEFAULT '0'",
+        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS series_start_date DATE NULL",
+        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS series_end_date DATE NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
+    if not raw or not str(raw).strip():
+        return [0]
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(part)
+        except ValueError:
+            continue
+        if 0 <= v <= 6:
+            out.append(v)
+    return sorted(set(out)) if out else [0]
+
+
+def enumerate_lesson_dates(start: date, weekdays: list[int], count: int) -> list[date]:
+    if count < 1:
+        return []
+    wd_set = set(w for w in weekdays if 0 <= w <= 6)
+    if not wd_set:
+        wd_set = {start.weekday()}
+    dates: list[date] = []
+    d = start
+    guard = 0
+    while len(dates) < count and guard < 800:
+        if d.weekday() in wd_set:
+            dates.append(d)
+            if len(dates) >= count:
+                break
+        d += timedelta(days=1)
+        guard += 1
+    return dates
+
+
+def get_lesson_dates_for_course(course: Course) -> list[date]:
+    ws = parse_lesson_weekdays_str(course.lesson_weekdays)
+    start = course.series_start_date or course.scheduled_start.date()
+    try:
+        n = int(course.total_lessons)
+    except (TypeError, ValueError):
+        n = 1
+    n = max(1, min(10, n))
+    if n <= 1 and (not getattr(course, "lesson_weekdays", None) or course.lesson_weekdays == "0"):
+        return [course.scheduled_start.date()]
+    return enumerate_lesson_dates(start, ws, n)
+
+
+def course_active_at_now(course: Course, now: datetime) -> bool:
+    d = now.date()
+    if d not in get_lesson_dates_for_course(course):
+        return False
+    t_start = course.scheduled_start.time()
+    t_end = course.scheduled_end.time()
+    t = now.time()
+    if t_start <= t_end:
+        return t_start <= t <= t_end
+    return t >= t_start or t <= t_end
+
+
 def resolve_today_primary_course_for_student(
     db: Session, student: Student, now: datetime | None = None
 ) -> tuple[Course | None, Coach | None]:
-    """Pick one class today for coach notification when using account PIN / FaceID (not class PIN)."""
+    """Pick one class today when using account PIN / FaceID (not class PIN)."""
     now = now or datetime.utcnow()
-    today = now.date()
     rows = (
         db.query(Course, Coach)
         .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
         .join(Coach, Coach.id == Course.coach_id)
         .filter(
             CourseEnrollment.student_id == student.id,
-            func.date(Course.scheduled_start) == today,
             ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
             ~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")),
         )
         .all()
     )
-    if not rows:
-        return None, None
-    if len(rows) == 1:
-        return rows[0][0], rows[0][1]
+    candidates: list[tuple[Course, Coach]] = []
     for course, coach in rows:
+        if course_active_at_now(course, now):
+            candidates.append((course, coach))
+    if not candidates:
+        return None, None
+    if len(candidates) == 1:
+        return candidates[0][0], candidates[0][1]
+    for course, coach in candidates:
         if course.scheduled_start <= now <= course.scheduled_end:
             return course, coach
-    best = min(rows, key=lambda r: abs((r[0].scheduled_start - now).total_seconds()))
+    best = min(candidates, key=lambda r: abs((r[0].scheduled_start - now).total_seconds()))
     return best[0], best[1]
 
 
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
 ) -> tuple[Course | None, Coach | None, str] | None:
-    """Class PIN → that course's coach only. Account PIN → today's primary course heuristic."""
+    """Class PIN → that course's coach only when today's date matches a scheduled lesson day."""
     pin = pin.strip()
+    now = datetime.utcnow()
     enr = (
         db.query(CourseEnrollment)
         .options(
@@ -367,7 +449,9 @@ def resolve_checkin_pin_context(
     )
     if enr:
         c = enr.course
-        return c, c.coach, "class_pin"
+        if now.date() in get_lesson_dates_for_course(c):
+            return c, c.coach, "class_pin"
+        return None
     if student.pin_code == pin:
         c, coach = resolve_today_primary_course_for_student(db, student)
         return c, coach, "account_pin"
@@ -388,6 +472,10 @@ def course_to_out(course: Course) -> CourseOut:
                 checkin_pin=e.checkin_pin,
             )
         )
+    ws = parse_lesson_weekdays_str(getattr(course, "lesson_weekdays", None))
+    total = getattr(course, "total_lessons", None) or 1
+    s_start = getattr(course, "series_start_date", None)
+    s_end = getattr(course, "series_end_date", None)
     return CourseOut(
         id=course.id,
         title=course.title,
@@ -399,6 +487,10 @@ def course_to_out(course: Course) -> CourseOut:
         scheduled_start=course.scheduled_start,
         scheduled_end=course.scheduled_end,
         created_at=course.created_at,
+        total_lessons=int(total),
+        lesson_weekdays=ws,
+        series_start_date=s_start,
+        series_end_date=s_end,
         enrollments=enrollments,
     )
 
@@ -490,6 +582,7 @@ def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
+        _migrate_courses_extended_columns(db)
         _seed_default_users(db)
         db.commit()
     finally:
@@ -1276,6 +1369,212 @@ def export_attendance_template_csv(user: AppUser = Depends(require_admin_or_cler
     )
 
 
+# -----------------------------------------------------------------------------
+# NEXT.js-compatible report mocks (PostgreSQL-backed where applicable).
+# Frontend uses NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 with these paths.
+# -----------------------------------------------------------------------------
+
+_V1_SALES_ROWS: list[dict] = [
+    {
+        "date": "2026-04-02",
+        "clientName": "Chan Tai Man",
+        "courseType": "PT 10",
+        "amount": 8800,
+        "coachName": "Coach A",
+        "paymentStatus": "PAID_FULL",
+        "installmentStatus": "NONE",
+    },
+    {
+        "date": "2026-04-18",
+        "clientName": "Lee Siu Ming",
+        "courseType": "PT 30",
+        "amount": 22800,
+        "coachName": "Coach B",
+        "paymentStatus": "INSTALLMENT_ACTIVE",
+        "installmentStatus": "ACTIVE",
+    },
+    {
+        "date": "2026-04-22",
+        "clientName": "Wong Ka Yan",
+        "courseType": "Trial → PT 10",
+        "amount": 1280,
+        "coachName": "Coach A",
+        "paymentStatus": "PENDING",
+        "installmentStatus": "NONE",
+    },
+]
+
+_V1_EXPENSE_ROWS: list[dict] = [
+    {
+        "id": "e1",
+        "category": "Rent",
+        "amount": 28000,
+        "date": "2026-04-01",
+        "memo": "Studio rent",
+        "invoiceRef": "INV-R-001",
+    },
+    {
+        "id": "e2",
+        "category": "Utilities",
+        "amount": 1200,
+        "date": "2026-04-05",
+        "memo": "Electricity",
+        "invoiceRef": "",
+    },
+]
+
+_V1_LEDGER_ROWS: list[dict] = [
+    {
+        "studentName": "Larry Lo",
+        "sessionStartIso": datetime.utcnow().isoformat() + "Z",
+        "reason": "attended",
+        "notes": "Ledger seed · FastAPI",
+    }
+]
+
+
+@app.get("/api/v1/reports/sales")
+def v1_reports_sales(
+    sort: str | None = None,
+    columns: str | None = None,
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    rows = list(_V1_SALES_ROWS)
+    if sort:
+        part = sort.split(",")[0]
+        if ":" in part:
+            col, direction = part.split(":", 1)
+            desc = direction.lower() == "desc"
+            if col == "amount":
+                rows.sort(key=lambda r: r.get("amount", 0), reverse=desc)
+            elif col == "date":
+                rows.sort(key=lambda r: r.get("date", ""), reverse=desc)
+            elif col in ("clientName", "courseType", "coachName", "paymentStatus", "installmentStatus"):
+                rows.sort(key=lambda r: str(r.get(col, "")).lower(), reverse=desc)
+    meta: dict[str, object] = {"source": "fastapi", "sort": sort or ""}
+    if columns:
+        meta["columns"] = columns
+    return {"rows": rows, "meta": meta}
+
+
+@app.get("/api/v1/reports/expenses")
+def v1_reports_expenses_get(user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    return {"rows": list(_V1_EXPENSE_ROWS)}
+
+
+@app.post("/api/v1/reports/expenses")
+def v1_reports_expenses_post(payload: dict, user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    cat = payload.get("category")
+    amt = payload.get("amount")
+    if not isinstance(amt, (int, float)) or not cat:
+        raise HTTPException(status_code=400, detail="category and amount required")
+    nid = f"e{len(_V1_EXPENSE_ROWS) + 1}-{secrets.token_hex(4)}"
+    row = {
+        "id": nid,
+        "category": str(cat),
+        "amount": float(amt),
+        "date": str(payload.get("date") or datetime.utcnow().date().isoformat()),
+        "memo": str(payload.get("memo") or ""),
+        "invoiceRef": str(payload.get("invoiceRef") or ""),
+    }
+    _V1_EXPENSE_ROWS.append(row)
+    return {"ok": True, "row": row}
+
+
+@app.get("/api/v1/reports/coach-attendance")
+def v1_reports_coach_attendance(
+    month: str | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    q = (
+        db.query(AuditLog, Student, Course, Coach)
+        .join(Student, AuditLog.student_id == Student.id)
+        .outerjoin(Course, AuditLog.course_id == Course.id)
+        .outerjoin(Coach, AuditLog.coach_id == Coach.id)
+        .filter(AuditLog.action == "checkin_redeem")
+    )
+    if month and len(month) >= 7 and month[4] == "-":
+        try:
+            y = int(month[:4])
+            mo = int(month[5:7])
+            range_start = datetime(y, mo, 1)
+            range_end_excl = datetime(y + (1 if mo == 12 else 0), (1 if mo == 12 else mo + 1), 1)
+            q = q.filter(AuditLog.created_at >= range_start, AuditLog.created_at < range_end_excl)
+        except ValueError:
+            pass
+    tuples = q.order_by(AuditLog.created_at.desc()).limit(2000).all()
+    detail_rows: list[dict[str, object]] = []
+    coach_buckets: dict[tuple[str, str], dict[str, float]] = {}
+    for a, st, course, coach in tuples:
+        coach_name = coach.full_name if coach else ""
+        st_d = ""
+        ed = ""
+        ctitle = ""
+        if course:
+            ctitle = course.title or ""
+            st_d = course.series_start_date.isoformat() if course.series_start_date else course.scheduled_start.date().isoformat()
+            ed = course.series_end_date.isoformat() if course.series_end_date else course.scheduled_end.date().isoformat()
+            dur_h = max(
+                0.25,
+                (course.scheduled_end - course.scheduled_start).total_seconds() / 3600.0,
+            )
+        else:
+            dur_h = 1.0
+        ym = a.created_at.strftime("%Y-%m")
+        ck = (coach_name, ym)
+        if ck not in coach_buckets:
+            coach_buckets[ck] = {"hours": 0.0, "classes": 0.0}
+        coach_buckets[ck]["hours"] += dur_h
+        coach_buckets[ck]["classes"] += 1.0
+        detail_rows.append(
+            {
+                "studentName": st.full_name,
+                "courseName": ctitle,
+                "sessionTimeIso": a.created_at.isoformat(),
+                "coachName": coach_name,
+                "courseStartDate": st_d,
+                "courseEndDate": ed,
+            }
+        )
+    summary_rows: list[dict[str, object]] = []
+    for (cname, mon), agg in sorted(coach_buckets.items(), key=lambda x: (x[0][0], x[0][1])):
+        hrs = agg["hours"]
+        cls_ct = int(agg["classes"])
+        summary_rows.append(
+            {
+                "coachName": cname or "—",
+                "month": mon,
+                "classesTaught": cls_ct,
+                "hoursOnFloor": round(hrs, 2),
+                "grossPayHkd": int(hrs * 450),
+            }
+        )
+    return {"rows": detail_rows, "summary": summary_rows, "month": month}
+
+
+@app.get("/api/v1/session-ledger")
+def v1_session_ledger_get(user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    return {"entries": list(_V1_LEDGER_ROWS)}
+
+
+@app.post("/api/v1/session-ledger")
+def v1_session_ledger_post(payload: dict, user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    req = payload or {}
+    if not req.get("studentName"):
+        raise HTTPException(status_code=400, detail="studentName required")
+    _V1_LEDGER_ROWS.insert(
+        0,
+        {
+            "studentName": str(req["studentName"]),
+            "sessionStartIso": str(req.get("sessionStartIso") or datetime.utcnow().isoformat() + "Z"),
+            "reason": str(req.get("reason") or "attended"),
+            "notes": str(req.get("notes") or ""),
+        },
+    )
+    return {"ok": True}
+
+
 # --- Courses (admin + coach) ---
 
 
@@ -1312,12 +1611,26 @@ def admin_create_course(
     if not coach:
         raise HTTPException(status_code=400, detail="Invalid coach_id.")
 
+    start_d = payload.course_start_date or payload.scheduled_start.date()
+    ws = list(payload.lesson_weekdays)
+    lesson_dates = enumerate_lesson_dates(start_d, ws, payload.total_lessons)
+    if not lesson_dates:
+        raise HTTPException(status_code=400, detail="Could not schedule lessons from the given start date.")
+    series_end = lesson_dates[-1]
+    dur = payload.scheduled_end - payload.scheduled_start
+    first_start = datetime.combine(lesson_dates[0], payload.scheduled_start.time())
+    first_end = first_start + dur
+
     course = Course(
         title=payload.title,
         branch_id=payload.branch_id,
         coach_id=payload.coach_id,
-        scheduled_start=payload.scheduled_start,
-        scheduled_end=payload.scheduled_end,
+        scheduled_start=first_start,
+        scheduled_end=first_end,
+        total_lessons=payload.total_lessons,
+        lesson_weekdays=",".join(str(x) for x in ws),
+        series_start_date=lesson_dates[0],
+        series_end_date=series_end,
     )
     db.add(course)
     db.flush()
@@ -1346,7 +1659,7 @@ def admin_create_course(
             student.lesson_balance += payload.credits_on_enroll
         msg = (
             f"課堂確認：{payload.title} @ {branch.name} "
-            f"{payload.scheduled_start.strftime('%Y-%m-%d %H:%M')}。"
+            f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
             f" 你嘅課堂簽到 PIN：{pin}（亦可用帳戶 PIN 簽到）。"
             f" 餘額已加 {payload.credits_on_enroll} 堂，現有 {student.lesson_balance} 堂。"
         )
@@ -1393,16 +1706,22 @@ def coach_list_courses(
             ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
         )
     )
+    limit_n = 400 if (from_date is not None and to_date is not None or day is not None) else 200
+    courses_raw = q.order_by(Course.scheduled_start.asc()).limit(800).all()
     if day:
-        q = q.filter(func.date(Course.scheduled_start) == day)
+        courses = [c for c in courses_raw if day in get_lesson_dates_for_course(c)][:limit_n]
     elif from_date is not None and to_date is not None:
         if to_date < from_date:
             raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
-        range_start = datetime.combine(from_date, datetime.min.time())
-        range_end_excl = datetime.combine(to_date + timedelta(days=1), datetime.min.time())
-        q = q.filter(Course.scheduled_start < range_end_excl, Course.scheduled_end > range_start)
-    limit_n = 400 if (from_date is not None and to_date is not None) else 200
-    courses = q.order_by(Course.scheduled_start.asc()).limit(limit_n).all()
+        picked: list[Course] = []
+        for c in courses_raw:
+            for ld in get_lesson_dates_for_course(c):
+                if from_date <= ld <= to_date:
+                    picked.append(c)
+                    break
+        courses = picked[:limit_n]
+    else:
+        courses = courses_raw[:limit_n]
     return [course_to_out(c) for c in courses]
 
 
