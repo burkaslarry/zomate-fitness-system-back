@@ -1,6 +1,8 @@
 from datetime import date, datetime
 
-from pydantic import BaseModel, Field, model_validator
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class StudentOnboardCreate(BaseModel):
@@ -16,6 +18,73 @@ class StudentOnboardCreate(BaseModel):
 class TrialPurchaseInput(BaseModel):
     phone: str
     credits: int = Field(default=10, ge=1, le=200)
+
+
+class ParqQuestionsIn(BaseModel):
+    """Frontend PAR-Q checklist — aligns with ``lib/schemas/student.ts``."""
+
+    q1_heart_condition: bool = False
+    q2_chest_pain_activity: bool = False
+    q3_chest_pain_rest: bool = False
+    q4_dizziness: bool = False
+    q5_bone_joint_problem: bool = False
+    q6_blood_pressure_meds: bool = False
+    q7_other_reason: bool = False
+
+    def any_yes(self) -> bool:
+        return any(self.model_dump().values())
+
+
+class StudentRegisterV1(BaseModel):
+    """``POST /api/v1/students/register`` — F01 wizard body (Zod mirror)."""
+
+    full_name: str = Field(min_length=1, max_length=120)
+    hkid: str = Field(min_length=8, max_length=32)
+    phone: str = Field(min_length=8, max_length=30)
+    email: str | None = None
+    emergency_contact_name: str = Field(min_length=1, max_length=120)
+    emergency_contact_phone: str = Field(min_length=8, max_length=30)
+    form_type: Literal["new", "renewal"]
+    parq: ParqQuestionsIn
+    medical_clearance_file_name: str | None = ""
+    cooling_off_acknowledged: bool = True
+    disclaimer_accepted: bool = True
+    digital_signature: str = Field(min_length=2, max_length=120)
+    package_sessions: Literal[10, 30]
+    renewal_notes: str | None = None
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        if v == "":
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def validate_ack_and_clearance(self) -> "StudentRegisterV1":
+        if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
+            raise ValueError("請確認冷靜期條款及免責聲明。")
+        if self.parq.any_yes():
+            clr = (self.medical_clearance_file_name or "").strip()
+            if not clr:
+                raise ValueError("PAR-Q 任一為「是」時請上載醫生 clearance（檔名）。")
+        return self
+
+
+class RenewalCreate(BaseModel):
+    """續會須對應已存在學員（以 admin / student-search 揀選後帶 student_id）。"""
+    student_id: int = Field(ge=1)
+    full_name: str = Field(min_length=2, max_length=120)
+    phone: str = Field(min_length=6, max_length=30)
+    course_ratio: Literal["1:1", "1:2"]
+    lessons: Literal[10, 30]
+    payment_method: str = Field(min_length=1, max_length=80)
+    coach_name: str | None = Field(default=None, max_length=120)
+    remarks: str | None = None
+    applicant_name: str = Field(min_length=1, max_length=120)
+    signature: str = Field(min_length=1, max_length=120)
+    renewal_date: date
+    pin_code: str | None = Field(default=None, min_length=4, max_length=10)
 
 
 class CheckinInput(BaseModel):
@@ -70,6 +139,9 @@ class BranchOut(BaseModel):
     name: str
     address: str
     code: str
+    business_start_time: str = "09:00"
+    business_end_time: str = "22:00"
+    remarks: str | None = None
     created_at: datetime
 
     class Config:
@@ -79,7 +151,18 @@ class BranchOut(BaseModel):
 class BranchCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     address: str = Field(min_length=1, max_length=255)
-    code: str = Field(min_length=1, max_length=32)
+    code: str | None = Field(default=None, max_length=32)
+    business_start_time: str = Field(default="09:00", pattern=r"^\d{2}:\d{2}$")
+    business_end_time: str = Field(default="22:00", pattern=r"^\d{2}:\d{2}$")
+    remarks: str | None = None
+
+
+class BranchUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    address: str | None = Field(default=None, min_length=1, max_length=255)
+    business_start_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    business_end_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    remarks: str | None = None
 
 
 class CoachOut(BaseModel):
@@ -96,6 +179,14 @@ class CoachOut(BaseModel):
 class CoachCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     phone: str = Field(min_length=6, max_length=30)
+    branch_id: int | None = None
+
+
+class CoachUpdate(BaseModel):
+    """Partial update — omit fields you do not want to change."""
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=120)
+    phone: str | None = Field(default=None, min_length=6, max_length=30)
     branch_id: int | None = None
 
 

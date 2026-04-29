@@ -21,6 +21,9 @@ class Branch(Base):
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     address: Mapped[str] = mapped_column(String(255), nullable=False)
     code: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    business_start_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
+    business_end_time: Mapped[str] = mapped_column(String(5), nullable=False, default="22:00")
+    remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     coaches: Mapped[list["Coach"]] = relationship(back_populates="branch")
@@ -100,6 +103,27 @@ class Student(Base):
     course_enrollments: Mapped[list["CourseEnrollment"]] = relationship(
         back_populates="student"
     )
+    renewal_records: Mapped[list["RenewalRecord"]] = relationship(back_populates="student")
+
+
+class RenewalRecord(Base):
+    __tablename__ = "zomate_fs_renewal_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    student_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    phone: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    course_ratio: Mapped[str] = mapped_column(String(8), nullable=False)
+    lessons: Mapped[int] = mapped_column(Integer, nullable=False)
+    payment_method: Mapped[str] = mapped_column(String(80), nullable=False)
+    coach_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
+    applicant_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    signature: Mapped[str] = mapped_column(String(120), nullable=False)
+    renewal_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    student: Mapped["Student"] = relationship(back_populates="renewal_records")
 
 
 class CheckinLog(Base):

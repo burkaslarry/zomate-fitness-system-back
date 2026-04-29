@@ -1,3 +1,4 @@
+import calendar
 import csv
 import io
 import json
@@ -5,7 +6,7 @@ import hashlib
 import hmac
 import os
 import secrets
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,15 +29,18 @@ from .models import (
     DeletedRecord,
     AppUser,
     AuthSession,
+    RenewalRecord,
     Student,
     WhatsAppLog,
 )
 from .schemas import (
     BranchCreate,
+    BranchUpdate,
     BranchOut,
     CheckinInput,
     CoachCreate,
     CoachOut,
+    CoachUpdate,
     CourseCreate,
     CourseEnrollmentOut,
     CourseOut,
@@ -44,8 +48,10 @@ from .schemas import (
     FaceIdCheckinInput,
     LoginInput,
     LoginSession,
+    RenewalCreate,
     StudentOnboardCreate,
     StudentOut,
+    StudentRegisterV1,
     TrialPurchaseInput,
 )
 
@@ -82,6 +88,35 @@ REST API + WebSocket；資料表前缀 ``zomate_fs_*``（PostgreSQL）。
         },
     ],
 )
+
+_AGENT_DEBUG_LOG = "/Users/larrylo/SourceProject/zomate-fitness/.cursor/debug-195967.log"
+
+
+def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    try:
+        payload = {
+            "sessionId": "195967",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(datetime.utcnow().timestamp() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+@app.on_event("startup")
+def _agent_log_renewal_route_registered() -> None:
+    paths = [getattr(r, "path", "") for r in app.routes if getattr(r, "path", None)]
+    _agent_dbg(
+        "H4",
+        "main.py:startup",
+        "renewal_route_probe",
+        {"renewal_in_routes": "/api/renewal" in paths, "nroutes": len(paths)},
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -212,7 +247,6 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
     canvas.drawString(40, 776, "Print this page and display at reception / gym floor.")
     canvas.setFont("Helvetica", 10)
     canvas.drawString(40, 752, f"Purpose: {label}")
-    canvas.drawString(40, 732, f"Payload: {payload[:180]}{'…' if len(payload) > 180 else ''}")
     canvas.drawImage(
         ImageReader(qr_buffer),
         (width - 260) / 2,
@@ -325,6 +359,66 @@ def allocate_enrollment_pin(db: Session, course_id: int) -> str:
     raise HTTPException(status_code=500, detail="Could not allocate class PIN.")
 
 
+def _add_calendar_months(d: date, months: int) -> date:
+    y, month = d.year, d.month + months
+    while month > 12:
+        y += 1
+        month -= 12
+    while month < 1:
+        y -= 1
+        month += 12
+    last = calendar.monthrange(y, month)[1]
+    return date(y, month, min(d.day, last))
+
+
+def _membership_expiry_iso(package_sessions: int) -> str:
+    """Match ``computeMembershipExpiryIso`` (10→+3 months, 30→+6 months, from today)."""
+    start = datetime.utcnow().date()
+    months_add = 3 if package_sessions == 10 else 6
+    end_d = _add_calendar_months(start, months_add)
+    dt = datetime(end_d.year, end_d.month, end_d.day, 12, 0, 0, tzinfo=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def _register_v1_health_notes(payload: StudentRegisterV1) -> str:
+    parts = [
+        f"HKID: {payload.hkid.strip()}",
+        f"Emergency: {payload.emergency_contact_name.strip()} / {payload.emergency_contact_phone.strip()}",
+        f"Form type: {payload.form_type}",
+        f"Digital signature (step 3): {payload.digital_signature.strip()}",
+        f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
+    ]
+    em = (payload.email or "").strip()
+    if em:
+        parts.insert(2, f"Email: {em}")
+    clr = (payload.medical_clearance_file_name or "").strip()
+    if clr:
+        parts.append(f"Medical clearance file: {clr}")
+    rn = (payload.renewal_notes or "").strip()
+    if rn:
+        parts.append(f"Renewal notes: {rn}")
+    return "\n".join(parts)
+
+
+def _active_branches_filter():
+    return ~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches"))
+
+
+def allocate_branch_code(db: Session, preferred: str | None, name: str) -> str:
+    raw = (preferred or "").strip().upper()
+    if not raw:
+        ascii_part = "".join(ch for ch in name.upper() if ch.isalnum())[:12]
+        raw = ascii_part or f"BR{secrets.randbelow(9000) + 1000}"
+    raw = raw[:32]
+    if not db.query(Branch).filter(Branch.code == raw).filter(_active_branches_filter()).first():
+        return raw
+    for i in range(2, 100):
+        candidate = f"{raw[:28]}{i}"
+        if not db.query(Branch).filter(Branch.code == candidate).filter(_active_branches_filter()).first():
+            return candidate
+    raise HTTPException(status_code=409, detail="Branch code already exists.")
+
+
 def _migrate_courses_extended_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS total_lessons INTEGER NOT NULL DEFAULT 1",
@@ -338,6 +432,51 @@ def _migrate_courses_extended_columns(db: Session) -> None:
         db.commit()
     except Exception:
         db.rollback()
+
+
+def _migrate_branch_extended_columns(db: Session) -> None:
+    stmts = [
+        "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS business_start_time VARCHAR(5) NOT NULL DEFAULT '09:00'",
+        "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS business_end_time VARCHAR(5) NOT NULL DEFAULT '22:00'",
+        "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS remarks TEXT NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _seed_default_branches(db: Session) -> None:
+    branches = [
+        {
+            "code": "TST",
+            "name": "尖沙咀分店",
+            "address": "柯士甸道102號22樓",
+            "business_start_time": "09:00",
+            "business_end_time": "22:00",
+            "remarks": "近佐敦地鐵站D出口",
+        },
+        {
+            "code": "SHEUNGWAN",
+            "name": "上環分店",
+            "address": "宏基商業大廈一樓全層",
+            "business_start_time": "09:00",
+            "business_end_time": "22:00",
+            "remarks": "上環街市及文娛中心對面",
+        },
+    ]
+    for item in branches:
+        row = db.query(Branch).filter(Branch.code == item["code"]).first()
+        if row is None:
+            db.add(Branch(**item))
+            continue
+        row.name = item["name"]
+        row.address = item["address"]
+        row.business_start_time = item["business_start_time"]
+        row.business_end_time = item["business_end_time"]
+        row.remarks = item["remarks"]
 
 
 def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
@@ -582,7 +721,9 @@ def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
+        _migrate_branch_extended_columns(db)
         _migrate_courses_extended_columns(db)
+        _seed_default_branches(db)
         _seed_default_users(db)
         db.commit()
     finally:
@@ -632,19 +773,31 @@ def api_health_db(db: Session = Depends(get_db)) -> dict:
 
 @app.get("/api/public/student-search")
 def public_student_search(q: str = "", db: Session = Depends(get_db)) -> list[dict]:
-    """Kiosk-friendly search after QR scan (name or phone fragment)."""
-    raw = (q or "").strip()
+    """Kiosk-friendly search after QR scan (name or phone fragment).
+
+    Matches **full_name** with collapsed whitespace so ``Larry Lo`` finds ``Larry  Lo``.
+    """
+    raw = " ".join((q or "").split()).strip()
     if len(raw) < 1:
         return []
     if len(raw) > 64:
         raise HTTPException(status_code=400, detail="Query too long")
-    pattern = f"%{raw}%"
+
+    escaped = raw.replace("\\", "").replace("%", "").replace("_", "").strip()
+    if not escaped:
+        return []
+
+    deleted_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+
+    normalized_name = func.regexp_replace(func.trim(Student.full_name), "[[:space:]]+", " ", "g")
+    pattern = f"%{escaped}%"
+
     rows = (
         db.query(Student)
-        .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
+        .filter(~Student.id.in_(deleted_ids))
         .filter(
             or_(
-                Student.full_name.ilike(pattern),
+                normalized_name.ilike(pattern),
                 Student.phone.ilike(pattern),
             )
         )
@@ -690,6 +843,181 @@ def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> 
     db.commit()
     db.refresh(student)
     return student
+
+
+@app.post("/api/v1/students/register")
+def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db)) -> dict:
+    """F01 multi-step wizard — persist to PostgreSQL + return PIN + membership expiry."""
+    phone = payload.phone.strip()
+    existing = db.query(Student).filter(Student.phone == phone).first()
+    expiry_iso = _membership_expiry_iso(payload.package_sessions)
+
+    if existing is not None and _is_deleted(db, "students", existing.id):
+        raise HTTPException(status_code=409, detail="Student phone belongs to a deleted record.")
+
+    if existing is not None:
+        if payload.form_type != "renewal":
+            raise HTTPException(
+                status_code=409,
+                detail="電話已登記。如需續會請選「Renewal 續會」或聯絡中心。",
+            )
+        merged_notes = (existing.health_notes or "").strip()
+        block = _register_v1_health_notes(payload)
+        existing.health_notes = (merged_notes + "\n\n--- renewal registration ---\n" + block)[-120_000:]
+        existing.full_name = payload.full_name.strip()
+        if payload.email is not None:
+            existing.email = (payload.email.strip() or None)
+        existing.disclaimer_accepted = True
+        existing.lesson_balance = int(existing.lesson_balance) + int(payload.package_sessions)
+        db.add(
+            AuditLog(
+                action="register_student_v1_renewal",
+                student_id=existing.id,
+                detail=json.dumps({"package_sessions": payload.package_sessions}, ensure_ascii=False),
+            )
+        )
+        log_whatsapp(
+            db,
+            existing,
+            phone,
+            f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {existing.lesson_balance} 堂，PIN 不變（{existing.pin_code}）。",
+        )
+        db.commit()
+        db.refresh(existing)
+        return {"pin_code": existing.pin_code, "membership_expiry_iso": expiry_iso}
+
+    if payload.form_type == "renewal":
+        raise HTTPException(
+            status_code=404,
+            detail="找不到此電話之學籍。請改選「新人申請」或核對號碼。",
+        )
+
+    pin = allocate_student_pin(db, None)
+    student = Student(
+        full_name=payload.full_name.strip(),
+        phone=phone,
+        email=(payload.email or "").strip() or None,
+        health_notes=_register_v1_health_notes(payload),
+        disclaimer_accepted=True,
+        pin_code=pin,
+        lesson_balance=int(payload.package_sessions),
+    )
+    db.add(student)
+    db.flush()
+    db.add(
+        AuditLog(
+            action="register_student_v1",
+            student_id=student.id,
+            detail=json.dumps(
+                {"hkid": payload.hkid.strip(), "sessions": payload.package_sessions},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    log_whatsapp(
+        db,
+        student,
+        phone,
+        f"歡迎 {student.full_name}！你的簽到 PIN 是 {student.pin_code}，已存入 {payload.package_sessions} 堂。",
+    )
+    db.commit()
+    db.refresh(student)
+    return {"pin_code": student.pin_code, "membership_expiry_iso": expiry_iso}
+
+
+@app.post("/api/renewal")
+def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
+    # region agent log
+    _agent_dbg(
+        "H5",
+        "main.py:renewal",
+        "handler_entered",
+        {
+            "student_id": payload.student_id,
+            "phone_len": len((payload.phone or "").strip()),
+            "name_len": len((payload.full_name or "").strip()),
+        },
+    )
+    # endregion
+    full_name = payload.full_name.strip()
+    phone = payload.phone.strip()
+    payment_method = payload.payment_method.strip()
+    coach_name = payload.coach_name.strip() if payload.coach_name else None
+    remarks = payload.remarks.strip() if payload.remarks else None
+    applicant_name = payload.applicant_name.strip()
+    signature = payload.signature.strip()
+
+    if not full_name or not phone or not payment_method or not applicant_name or not signature:
+        raise HTTPException(status_code=400, detail="Required fields cannot be blank.")
+
+    student = db.get(Student, payload.student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if student.phone.strip() != phone:
+        raise HTTPException(status_code=400, detail="Phone does not match the selected student.")
+    if student.full_name.strip() != full_name:
+        raise HTTPException(status_code=400, detail="Name does not match the selected student.")
+
+    student.lesson_balance += int(payload.lessons)
+    renewal_record = RenewalRecord(
+        student_id=student.id,
+        student_name=full_name,
+        phone=phone,
+        course_ratio=payload.course_ratio,
+        lessons=int(payload.lessons),
+        payment_method=payment_method,
+        coach_name=coach_name,
+        remarks=remarks,
+        applicant_name=applicant_name,
+        signature=signature,
+        renewal_date=payload.renewal_date,
+    )
+    db.add(renewal_record)
+    db.flush()
+
+    detail_obj = {
+        "renewal_id": renewal_record.id,
+        "course_ratio": payload.course_ratio,
+        "lessons_added": int(payload.lessons),
+        "payment_method": payment_method,
+        "coach_name": coach_name,
+        "renewal_date": payload.renewal_date.isoformat(),
+        "lesson_balance_after": student.lesson_balance,
+    }
+    db.add(
+        AuditLog(
+            action="renewal_submit",
+            student_id=student.id,
+            detail=json.dumps(detail_obj, ensure_ascii=False),
+        )
+    )
+    log_whatsapp(
+        db,
+        student,
+        student.phone,
+        f"續會已確認：已加入 {payload.lessons} 堂，現有餘額 {student.lesson_balance} 堂。",
+    )
+
+    db.commit()
+    db.refresh(student)
+    db.refresh(renewal_record)
+    return {
+        "message": "Renewal submitted",
+        "student": {
+            "id": student.id,
+            "full_name": student.full_name,
+            "phone": student.phone,
+            "lesson_balance": student.lesson_balance,
+        },
+        "renewal": {
+            "id": renewal_record.id,
+            "course_ratio": renewal_record.course_ratio,
+            "lessons": renewal_record.lessons,
+            "payment_method": renewal_record.payment_method,
+            "coach_name": renewal_record.coach_name,
+            "renewal_date": renewal_record.renewal_date.isoformat(),
+        },
+    }
 
 
 @app.get("/api/students", response_model=list[StudentOut])
@@ -983,13 +1311,48 @@ def list_branches(db: Session = Depends(get_db), user: AppUser = Depends(require
 def create_branch(
     payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> Branch:
-    if db.query(Branch).filter(Branch.code == payload.code).first():
-        raise HTTPException(status_code=409, detail="Branch code already exists.")
-    b = Branch(**payload.model_dump())
+    data = payload.model_dump()
+    data["name"] = data["name"].strip()
+    data["address"] = data["address"].strip()
+    data["remarks"] = data["remarks"].strip() if data.get("remarks") else None
+    data["code"] = allocate_branch_code(db, data.get("code"), data["name"])
+    if not data["name"] or not data["address"]:
+        raise HTTPException(status_code=400, detail="Branch name and address are required.")
+    b = Branch(**data)
     db.add(b)
     db.commit()
     db.refresh(b)
     return b
+
+
+@app.patch("/api/admin/branches/{branch_id}", response_model=BranchOut)
+def update_branch(
+    branch_id: int,
+    payload: BranchUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> Branch:
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch or _is_deleted(db, "branches", branch.id):
+        raise HTTPException(status_code=404, detail="Branch not found.")
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    for key in ("name", "address", "business_start_time", "business_end_time", "remarks"):
+        if key not in data:
+            continue
+        val = data[key]
+        if isinstance(val, str):
+            val = val.strip()
+        if key in {"name", "address"}:
+            if not val:
+                raise HTTPException(status_code=400, detail=f"{key} cannot be empty.")
+        if key == "remarks" and isinstance(val, str) and val == "":
+            val = None
+        setattr(branch, key, val)
+    db.commit()
+    db.refresh(branch)
+    return branch
 
 
 @app.get("/api/admin/branches/export.csv")
@@ -998,14 +1361,23 @@ def export_branches_csv(
 ) -> PlainTextResponse:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["name", "address", "code"])
+    w.writerow(["name", "address", "code", "business_start_time", "business_end_time", "remarks"])
     for row in (
         db.query(Branch)
         .filter(~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")))
         .order_by(Branch.id)
         .all()
     ):
-        w.writerow([row.name, row.address, row.code])
+        w.writerow(
+            [
+                row.name,
+                row.address,
+                row.code,
+                row.business_start_time,
+                row.business_end_time,
+                row.remarks or "",
+            ]
+        )
     return PlainTextResponse(
         buf.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -1020,18 +1392,40 @@ def import_branches_csv(
     raw = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
     added = 0
+    skipped = 0
     for row in reader:
         name = (row.get("name") or "").strip()
         address = (row.get("address") or "").strip()
-        code = (row.get("code") or "").strip()
-        if not name or not address or not code:
+        code = (row.get("code") or "").strip() or None
+        start = (row.get("business_start_time") or "09:00").strip() or "09:00"
+        end = (row.get("business_end_time") or "22:00").strip() or "22:00"
+        remarks = (row.get("remarks") or "").strip() or None
+        if not name or not address:
+            skipped += 1
             continue
-        if db.query(Branch).filter(Branch.code == code).first():
+        dup_name = (
+            db.query(Branch)
+            .filter(Branch.name == name)
+            .filter(_active_branches_filter())
+            .first()
+        )
+        if dup_name:
+            skipped += 1
             continue
-        db.add(Branch(name=name, address=address, code=code))
+        branch_code = allocate_branch_code(db, code, name)
+        db.add(
+            Branch(
+                name=name,
+                address=address,
+                code=branch_code,
+                business_start_time=start,
+                business_end_time=end,
+                remarks=remarks,
+            )
+        )
         added += 1
     db.commit()
-    return {"imported": added}
+    return {"imported": added, "skipped": skipped}
 
 
 # --- Coaches ---
@@ -1064,6 +1458,50 @@ def create_coach(
     db.commit()
     db.refresh(c)
     return c
+
+
+@app.patch("/api/admin/coaches/{coach_id}", response_model=CoachOut)
+def update_coach(
+    coach_id: int,
+    payload: CoachUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> Coach:
+    coach = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach or _is_deleted(db, "coaches", coach.id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+
+    if "phone" in data and data["phone"]:
+        other = (
+            db.query(Coach)
+            .filter(Coach.phone == data["phone"], Coach.id != coach_id)
+            .first()
+        )
+        if other:
+            raise HTTPException(status_code=409, detail="Coach phone already exists.")
+
+    if "branch_id" in data:
+        bid = data["branch_id"]
+        if bid is not None:
+            if not db.query(Branch).filter(
+                Branch.id == bid,
+                ~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")),
+            ).first():
+                raise HTTPException(status_code=400, detail="Invalid branch_id.")
+        coach.branch_id = bid
+
+    if "full_name" in data and data["full_name"] is not None:
+        coach.full_name = data["full_name"].strip()
+    if "phone" in data and data["phone"]:
+        coach.phone = data["phone"].strip()
+
+    db.commit()
+    db.refresh(coach)
+    return coach
 
 
 @app.get("/api/admin/coaches/export.csv")
@@ -1172,33 +1610,79 @@ def export_students_csv(
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
+    """Upsert by **full_name**: same姓名 → replace欄位；新姓名 insert（phone 必填且不可與其他人重複）。"""
     raw = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
     added = 0
+    updated = 0
     skipped = 0
+    active_students_sq = ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
+
     for row in reader:
         full_name = (row.get("full_name") or "").strip()
-        phone = (row.get("phone") or "").strip()
-        if not full_name or not phone:
+        if not full_name:
             skipped += 1
             continue
-        if db.query(Student).filter(Student.phone == phone).first():
-            skipped += 1
-            continue
+
+        phone_raw = (row.get("phone") or "").strip()
         email = (row.get("email") or "").strip() or None
         health_notes = (row.get("health_notes") or "").strip() or None
         disc = (row.get("disclaimer_accepted") or "1").strip() in ("1", "true", "True", "yes")
         pin_raw = (row.get("pin_code") or "").strip()
-        pin = allocate_student_pin(db, pin_raw if pin_raw else None)
         try:
             balance = int((row.get("lesson_balance") or "0").strip() or 0)
         except ValueError:
             balance = 0
         face = (row.get("face_id_external") or "").strip() or None
+
+        existing = (
+            db.query(Student)
+            .filter(active_students_sq, Student.full_name == full_name)
+            .first()
+        )
+
+        if existing is not None:
+            if phone_raw:
+                other = (
+                    db.query(Student)
+                    .filter(active_students_sq, Student.phone == phone_raw, Student.id != existing.id)
+                    .first()
+                )
+                if other:
+                    skipped += 1
+                    continue
+                existing.phone = phone_raw
+            if pin_raw:
+                try:
+                    existing.pin_code = allocate_student_pin(db, pin_raw)
+                except HTTPException:
+                    skipped += 1
+                    continue
+            existing.email = email
+            existing.health_notes = health_notes
+            existing.disclaimer_accepted = disc
+            existing.lesson_balance = balance
+            existing.face_id_external = face
+            updated += 1
+            continue
+
+        if not phone_raw:
+            skipped += 1
+            continue
+        if db.query(Student).filter(active_students_sq, Student.phone == phone_raw).first():
+            skipped += 1
+            continue
+
+        try:
+            pin = allocate_student_pin(db, pin_raw if pin_raw else None)
+        except HTTPException:
+            skipped += 1
+            continue
+
         db.add(
             Student(
                 full_name=full_name,
-                phone=phone,
+                phone=phone_raw,
                 email=email,
                 health_notes=health_notes,
                 disclaimer_accepted=disc,
@@ -1208,8 +1692,9 @@ def import_students_csv(
             )
         )
         added += 1
+
     db.commit()
-    return {"imported": added, "skipped": skipped}
+    return {"imported": added, "updated": updated, "skipped": skipped}
 
 
 @app.delete("/api/admin/students/{student_id}")
@@ -1321,7 +1806,6 @@ def download_qrcode_pdf(
     kind: str,
     origin: str | None = None,
     payload: str | None = None,
-    user: AppUser = Depends(require_admin_or_clerk),
 ) -> Response:
     kind_map = {
         "onboard": "onboard",
@@ -1335,14 +1819,14 @@ def download_qrcode_pdf(
     if kind == "onboard":
         data = f"{base}/student/onboard"
         name = "onboard_qr.pdf"
-        label = "新學生入職"
+        label = "Registration"
     elif kind == "checkin":
         data = payload or f"{base}/student/checkin?from=qr"
-        label = "核心簽到入口"
+        label = "Check-In"
         name = "checkin_qr.pdf"
     else:
         data = payload or json.dumps({"type": "zomate_checkin", "v": 1})
-        label = "簽到 JSON"
+        label = "Check-In (JSON)"
         name = "checkin_payload_qr.pdf"
 
     pdf = _build_qr_code_pdf_bytes(label=label, payload=data)
