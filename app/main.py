@@ -131,6 +131,7 @@ def _cors_origins_from_env() -> list[str]:
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
+        "https://zomate-fitness-system-front.vercel.app",
     ]
     if not raw:
         return defaults
