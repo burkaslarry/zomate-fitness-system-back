@@ -4,13 +4,14 @@ import io
 import json
 import hashlib
 import hmac
-import os
 import secrets
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session, joinedload
 from reportlab.lib.pagesizes import A4
@@ -18,19 +19,26 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 import qrcode
 
+from .config import settings
 from .database import Base, engine, get_db
 from .models import (
     AuditLog,
+    ActivityLog,
     Branch,
     CheckinLog,
     Coach,
     Course,
     CourseEnrollment,
     DeletedRecord,
+    Expense,
     AppUser,
     AuthSession,
+    Package,
+    Receipt,
     RenewalRecord,
     Student,
+    StudentPhoto,
+    TrialClass,
     WhatsAppLog,
 )
 from .schemas import (
@@ -48,12 +56,17 @@ from .schemas import (
     FaceIdCheckinInput,
     LoginInput,
     LoginSession,
+    ExpenseCreate,
+    MemberCreate,
+    PackageOut,
     RenewalCreate,
     StudentOnboardCreate,
     StudentOut,
     StudentRegisterV1,
+    TrialClassCreate,
     TrialPurchaseInput,
 )
+from .storage import FileStorageService
 
 # -----------------------------------------------------------------------------
 # Zomate Fitness — FastAPI service (zomate-fitness-system-back)
@@ -125,18 +138,7 @@ def root_redirect_to_docs() -> RedirectResponse:
     return RedirectResponse(url="/docs")
 
 def _cors_origins_from_env() -> list[str]:
-    raw = os.getenv("CORS_ALLOWED_ORIGINS", "").strip()
-    defaults = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-        "https://zomate-fitness-system-front.vercel.app",
-    ]
-    if not raw:
-        return defaults
-    parsed = [item.strip() for item in raw.split(",") if item.strip()]
-    return parsed or defaults
+    return settings.cors_origins
 
 
 app.add_middleware(
@@ -146,6 +148,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+UPLOADS_DIR = settings.uploads_dir.resolve()
+ACTIVE_MEMBER_DAYS = settings.active_member_days
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+storage_service = FileStorageService(UPLOADS_DIR)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": "http_error", "message": str(exc.detail), "details": None},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": "validation_error", "message": "Request validation failed.", "details": exc.errors()},
+    )
 
 
 class ConnectionManager:
@@ -420,6 +444,59 @@ def allocate_branch_code(db: Session, preferred: str | None, name: str) -> str:
     raise HTTPException(status_code=409, detail="Branch code already exists.")
 
 
+def normalize_hkid(raw: str) -> str:
+    return "".join((raw or "").upper().split())
+
+
+def get_student_by_hkid_or_404(db: Session, hkid: str) -> Student:
+    normalized = normalize_hkid(hkid)
+    student = db.query(Student).filter(Student.hkid == normalized).first()
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Member not found.")
+    return student
+
+
+def _file_url(relative_path: str | None) -> str | None:
+    return f"/uploads/{relative_path}" if relative_path else None
+
+
+def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
+    return storage_service.save_upload(file, kind, hkid)
+
+
+def _is_active_member(db: Session, student_id: int) -> bool:
+    cutoff = datetime.utcnow() - timedelta(days=ACTIVE_MEMBER_DAYS)
+    return (
+        db.query(CheckinLog.id)
+        .filter(CheckinLog.student_id == student_id, CheckinLog.created_at >= cutoff)
+        .first()
+        is not None
+    )
+
+
+def student_to_member_dict(db: Session, student: Student) -> dict:
+    return {
+        "id": student.id,
+        "hkid": student.hkid,
+        "full_name": student.full_name,
+        "phone": student.phone,
+        "email": student.email,
+        "emergency_contact_name": student.emergency_contact_name,
+        "emergency_contact_phone": student.emergency_contact_phone,
+        "pin_code": student.pin_code,
+        "lesson_balance": student.lesson_balance,
+        "photo_path": student.photo_path,
+        "photo_url": _file_url(student.photo_path),
+        "is_active": _is_active_member(db, student.id),
+        "created_at": student.created_at.isoformat(),
+    }
+
+
+def record_activity(db: Session, student: Student, activity_type: str, ref_id: int | None = None) -> None:
+    if student.hkid:
+        db.add(ActivityLog(member_hkid=student.hkid, type=activity_type, ref_id=ref_id))
+
+
 def _migrate_courses_extended_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS total_lessons INTEGER NOT NULL DEFAULT 1",
@@ -440,6 +517,35 @@ def _migrate_branch_extended_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS business_start_time VARCHAR(5) NOT NULL DEFAULT '09:00'",
         "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS business_end_time VARCHAR(5) NOT NULL DEFAULT '22:00'",
         "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS remarks TEXT NULL",
+        "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _migrate_management_columns(db: Session) -> None:
+    stmts = [
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS hkid VARCHAR(32) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR(120) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR(30) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS photo_path VARCHAR(512) NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
+        "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS specialty VARCHAR(160) NULL",
+        "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS package_id INTEGER NULL REFERENCES zomate_fs_packages(id)",
+        "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS coach_id INTEGER NULL REFERENCES zomate_fs_coaches(id)",
+        "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS branch_id INTEGER NULL REFERENCES zomate_fs_branches(id)",
+        "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2) NULL",
+        "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS receipt_id INTEGER NULL REFERENCES zomate_fs_receipts(id)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_receipts_member_hkid ON zomate_fs_receipts (member_hkid)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_trial_classes_member_hkid ON zomate_fs_trial_classes (member_hkid)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_expenses_date ON zomate_fs_expenses (date)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_activity_log_member_hkid ON zomate_fs_activity_log (member_hkid)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_activity_log_created_at ON zomate_fs_activity_log (created_at)",
     ]
     try:
         for s in stmts:
@@ -478,6 +584,26 @@ def _seed_default_branches(db: Session) -> None:
         row.business_start_time = item["business_start_time"]
         row.business_end_time = item["business_end_time"]
         row.remarks = item["remarks"]
+        row.active = True
+
+
+def _seed_management_defaults(db: Session) -> None:
+    packages = [
+        {"name": "10 堂套票", "sessions": 10, "price": 0},
+        {"name": "30 堂套票", "sessions": 30, "price": 0},
+    ]
+    for item in packages:
+        row = db.query(Package).filter(Package.name == item["name"]).first()
+        if row is None:
+            db.add(Package(**item))
+        else:
+            row.sessions = item["sessions"]
+            row.price = item["price"]
+            row.active = True
+
+    first_branch = db.query(Branch).order_by(Branch.id).first()
+    if first_branch and db.query(Coach).count() == 0:
+        db.add(Coach(full_name="Zomate Coach", phone="00000000", branch_id=first_branch.id, specialty="General", active=True))
 
 
 def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
@@ -724,7 +850,9 @@ def on_startup() -> None:
     try:
         _migrate_branch_extended_columns(db)
         _migrate_courses_extended_columns(db)
+        _migrate_management_columns(db)
         _seed_default_branches(db)
+        _seed_management_defaults(db)
         _seed_default_users(db)
         db.commit()
     finally:
@@ -850,7 +978,10 @@ def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> 
 def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db)) -> dict:
     """F01 multi-step wizard — persist to PostgreSQL + return PIN + membership expiry."""
     phone = payload.phone.strip()
+    hkid = normalize_hkid(payload.hkid)
     existing = db.query(Student).filter(Student.phone == phone).first()
+    if hkid and db.query(Student).filter(Student.hkid == hkid, Student.phone != phone).first():
+        raise HTTPException(status_code=409, detail="HKID already registered.")
     expiry_iso = _membership_expiry_iso(payload.package_sessions)
 
     if existing is not None and _is_deleted(db, "students", existing.id):
@@ -866,6 +997,9 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         block = _register_v1_health_notes(payload)
         existing.health_notes = (merged_notes + "\n\n--- renewal registration ---\n" + block)[-120_000:]
         existing.full_name = payload.full_name.strip()
+        existing.hkid = hkid
+        existing.emergency_contact_name = payload.emergency_contact_name.strip()
+        existing.emergency_contact_phone = payload.emergency_contact_phone.strip()
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
@@ -896,8 +1030,11 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     pin = allocate_student_pin(db, None)
     student = Student(
         full_name=payload.full_name.strip(),
+        hkid=hkid,
         phone=phone,
         email=(payload.email or "").strip() or None,
+        emergency_contact_name=payload.emergency_contact_name.strip(),
+        emergency_contact_phone=payload.emergency_contact_phone.strip(),
         health_notes=_register_v1_health_notes(payload),
         disclaimer_accepted=True,
         pin_code=pin,
@@ -924,6 +1061,238 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     db.commit()
     db.refresh(student)
     return {"pin_code": student.pin_code, "membership_expiry_iso": expiry_iso}
+
+
+@app.post("/api/members")
+def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
+    hkid = normalize_hkid(payload.hkid)
+    phone = payload.phone.strip()
+    if db.query(Student).filter(Student.hkid == hkid).first():
+        raise HTTPException(status_code=409, detail="HKID already registered.")
+    if db.query(Student).filter(Student.phone == phone).first():
+        raise HTTPException(status_code=409, detail="Phone already registered.")
+    pin = allocate_student_pin(db, None)
+    notes = "\n".join(
+        [
+            f"HKID: {hkid}",
+            f"Emergency: {payload.emergency_contact_name.strip()} / {payload.emergency_contact_phone.strip()}",
+            f"Digital signature (step 3): {payload.digital_signature.strip()}",
+            f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
+            f"Medical clearance file: {(payload.medical_clearance_file_name or '').strip()}",
+        ]
+    )
+    student = Student(
+        full_name=payload.full_name.strip(),
+        hkid=hkid,
+        phone=phone,
+        email=(payload.email or "").strip() or None,
+        emergency_contact_name=payload.emergency_contact_name.strip(),
+        emergency_contact_phone=payload.emergency_contact_phone.strip(),
+        health_notes=notes,
+        disclaimer_accepted=True,
+        pin_code=pin,
+        lesson_balance=0,
+    )
+    db.add(student)
+    db.flush()
+    db.add(AuditLog(action="member_create", student_id=student.id, detail=json.dumps({"hkid": hkid}, ensure_ascii=False)))
+    record_activity(db, student, "member_create", student.id)
+    db.commit()
+    db.refresh(student)
+    return {"member": student_to_member_dict(db, student), "pin_code": student.pin_code}
+
+
+@app.get("/api/members/search")
+def search_members(q: str = "", db: Session = Depends(get_db)) -> list[dict]:
+    raw = " ".join((q or "").split()).strip()
+    if len(raw) < 1:
+        return []
+    escaped = raw.replace("\\", "").replace("%", "").replace("_", "")
+    pattern = f"%{escaped}%"
+    deleted_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    rows = (
+        db.query(Student)
+        .filter(~Student.id.in_(deleted_ids))
+        .filter(or_(Student.full_name.ilike(pattern), Student.phone.ilike(pattern), Student.hkid.ilike(pattern)))
+        .order_by(Student.full_name)
+        .limit(20)
+        .all()
+    )
+    return [student_to_member_dict(db, row) for row in rows]
+
+
+@app.get("/api/members/{hkid}")
+def get_member(hkid: str, db: Session = Depends(get_db)) -> dict:
+    return student_to_member_dict(db, get_student_by_hkid_or_404(db, hkid))
+
+
+@app.get("/api/members/{hkid}/full")
+def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
+    student = get_student_by_hkid_or_404(db, hkid)
+    receipts = db.query(Receipt).filter(Receipt.student_id == student.id).order_by(Receipt.created_at.desc()).all()
+    renewals = db.query(RenewalRecord).filter(RenewalRecord.student_id == student.id).order_by(RenewalRecord.created_at.desc()).all()
+    trials = db.query(TrialClass).filter(TrialClass.student_id == student.id).order_by(TrialClass.created_at.desc()).all()
+    logs = db.query(ActivityLog).filter(ActivityLog.member_hkid == (student.hkid or normalize_hkid(hkid))).order_by(ActivityLog.created_at.desc()).limit(100).all()
+    return {
+        "profile": student_to_member_dict(db, student),
+        "receipts": [
+            {
+                "id": r.id,
+                "file_path": r.file_path,
+                "file_url": _file_url(r.file_path),
+                "amount": float(r.amount) if r.amount is not None else None,
+                "payment_method": r.payment_method,
+                "note": r.note,
+                "source": r.source,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in receipts
+        ],
+        "packages": [
+            {
+                "id": rr.id,
+                "package_id": rr.package_id,
+                "coach_id": rr.coach_id,
+                "branch_id": rr.branch_id,
+                "name": f"{rr.lessons} 堂",
+                "coach": rr.coach_name,
+                "payment_method": rr.payment_method,
+                "amount": float(rr.amount) if rr.amount is not None else None,
+                "remaining": student.lesson_balance,
+                "created_at": rr.created_at.isoformat(),
+            }
+            for rr in renewals
+        ],
+        "trial_classes": [
+            {
+                "id": t.id,
+                "type": t.type,
+                "coach_id": t.coach_id,
+                "branch_id": t.branch_id,
+                "class_date": t.class_date.isoformat(),
+                "note": t.note,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t in trials
+        ],
+        "activity_log": [
+            {
+                "id": a.id,
+                "type": a.type,
+                "ref_id": a.ref_id,
+                "detail": None,
+                "created_at": a.created_at.isoformat(),
+            }
+            for a in logs
+        ],
+    }
+
+
+@app.post("/api/members/{hkid}/photo")
+def upload_member_photo(hkid: str, file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
+    student = get_student_by_hkid_or_404(db, hkid)
+    path = _save_upload_file(file, "photos", student.hkid or hkid, 2 * 1024 * 1024)
+    student.photo_path = path
+    photo = StudentPhoto(student_id=student.id, member_hkid=student.hkid or normalize_hkid(hkid), file_path=path)
+    db.add(photo)
+    db.add(AuditLog(action="member_photo_upload", student_id=student.id, detail=path))
+    record_activity(db, student, "member_photo_upload", photo.id)
+    db.commit()
+    return {"id": photo.id, "file_path": path, "file_url": _file_url(path)}
+
+
+@app.post("/api/members/{hkid}/receipts")
+def upload_member_receipt(
+    hkid: str,
+    file: UploadFile = File(...),
+    amount: float | None = Form(default=None),
+    payment_method: str | None = Form(default=None),
+    note: str | None = Form(default=None),
+    source: str = Form(default="REGISTER"),
+    db: Session = Depends(get_db),
+) -> dict:
+    student = get_student_by_hkid_or_404(db, hkid)
+    path = _save_upload_file(file, "receipts", student.hkid or hkid, 5 * 1024 * 1024)
+    receipt = Receipt(
+        student_id=student.id,
+        member_hkid=student.hkid or normalize_hkid(hkid),
+        file_path=path,
+        amount=amount,
+        payment_method=(payment_method or "").strip() or None,
+        note=(note or "").strip() or None,
+        source=source if source in {"REGISTER", "RENEWAL"} else "REGISTER",
+    )
+    db.add(receipt)
+    db.flush()
+    db.add(AuditLog(action="receipt_upload", student_id=student.id, detail=json.dumps({"receipt_id": receipt.id, "source": receipt.source}, ensure_ascii=False)))
+    record_activity(db, student, "receipt_upload", receipt.id)
+    db.commit()
+    return {"id": receipt.id, "file_path": path, "file_url": _file_url(path)}
+
+
+@app.post("/api/members/{hkid}/resend-pin")
+def resend_member_pin(hkid: str, db: Session = Depends(get_db)) -> dict:
+    get_student_by_hkid_or_404(db, hkid)
+    raise HTTPException(status_code=501, detail="WhatsApp 未接駁 — Coming soon")
+
+
+@app.post("/api/renewals")
+def create_renewal_multipart(
+    member_hkid: str = Form(...),
+    package_id: int = Form(...),
+    coach_id: int | None = Form(default=None),
+    branch_id: int | None = Form(default=None),
+    amount: float = Form(...),
+    payment_method: str = Form(...),
+    note: str | None = Form(default=None),
+    receipt: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    student = get_student_by_hkid_or_404(db, member_hkid)
+    package = db.get(Package, package_id)
+    if package is None or not package.active:
+        raise HTTPException(status_code=400, detail="Invalid package_id.")
+    coach = db.get(Coach, coach_id) if coach_id else None
+    branch = db.get(Branch, branch_id) if branch_id else None
+    receipt_row = None
+    if receipt is not None and receipt.filename:
+        path = _save_upload_file(receipt, "receipts", student.hkid or member_hkid, 5 * 1024 * 1024)
+        receipt_row = Receipt(
+            student_id=student.id,
+            member_hkid=student.hkid or normalize_hkid(member_hkid),
+            file_path=path,
+            amount=amount,
+            payment_method=payment_method,
+            note=note,
+            source="RENEWAL",
+        )
+        db.add(receipt_row)
+        db.flush()
+    student.lesson_balance += int(package.sessions)
+    renewal_row = RenewalRecord(
+        student_id=student.id,
+        student_name=student.full_name,
+        phone=student.phone,
+        course_ratio="1:1",
+        lessons=int(package.sessions),
+        payment_method=payment_method,
+        coach_name=coach.full_name if coach else None,
+        package_id=package.id,
+        coach_id=coach.id if coach else None,
+        branch_id=branch.id if branch else None,
+        amount=amount,
+        receipt_id=receipt_row.id if receipt_row else None,
+        remarks=note,
+        applicant_name=student.full_name,
+        signature=student.full_name,
+        renewal_date=date.today(),
+    )
+    db.add(renewal_row)
+    db.flush()
+    db.add(AuditLog(action="renewal_create", student_id=student.id, detail=json.dumps({"renewal_id": renewal_row.id, "package_id": package.id}, ensure_ascii=False)))
+    record_activity(db, student, "renewal_create", renewal_row.id)
+    db.commit()
+    return {"renewal_id": renewal_row.id, "receipt_id": receipt_row.id if receipt_row else None, "member": student_to_member_dict(db, student)}
 
 
 @app.post("/api/renewal")
@@ -1021,9 +1390,9 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
     }
 
 
-@app.get("/api/students", response_model=list[StudentOut])
-def list_students(db: Session = Depends(get_db)) -> list[StudentOut]:
-    return (
+@app.get("/api/students")
+def list_students(db: Session = Depends(get_db)) -> list[dict]:
+    rows = (
         db.query(Student)
         .filter(
             ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
@@ -1031,6 +1400,7 @@ def list_students(db: Session = Depends(get_db)) -> list[StudentOut]:
         .order_by(Student.id.desc())
         .all()
     )
+    return [student_to_member_dict(db, row) for row in rows]
 
 
 @app.post("/api/auth/login", response_model=LoginSession)
@@ -1166,6 +1536,138 @@ async def faceid_checkin(payload: FaceIdCheckinInput, db: Session = Depends(get_
         notified_coach=coach,
         pin_resolution="faceid",
     )
+
+
+@app.get("/api/packages", response_model=list[PackageOut])
+def list_packages(active: bool | None = True, db: Session = Depends(get_db)) -> list[Package]:
+    query = db.query(Package)
+    if active is not None:
+        query = query.filter(Package.active == active)
+    return query.order_by(Package.sessions, Package.id).all()
+
+
+@app.get("/api/branches", response_model=list[BranchOut])
+def list_public_branches(active: bool | None = True, db: Session = Depends(get_db)) -> list[Branch]:
+    query = db.query(Branch).filter(~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")))
+    if active is not None:
+        query = query.filter(Branch.active == active)
+    return query.order_by(Branch.id).all()
+
+
+@app.post("/api/branches", response_model=BranchOut)
+def create_public_branch(payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Branch:
+    return create_branch(payload, db, user)
+
+
+@app.patch("/api/branches/{branch_id}", response_model=BranchOut)
+def update_public_branch(branch_id: int, payload: BranchUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Branch:
+    return update_branch(branch_id, payload, db, user)
+
+
+@app.get("/api/coaches", response_model=list[CoachOut])
+def list_public_coaches(active: bool | None = True, db: Session = Depends(get_db)) -> list[Coach]:
+    query = db.query(Coach).filter(~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")))
+    if active is not None:
+        query = query.filter(Coach.active == active)
+    return query.order_by(Coach.id).all()
+
+
+@app.post("/api/coaches", response_model=CoachOut)
+def create_public_coach(payload: CoachCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Coach:
+    return create_coach(payload, db, user)
+
+
+@app.patch("/api/coaches/{coach_id}", response_model=CoachOut)
+def update_public_coach(coach_id: int, payload: CoachUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Coach:
+    return update_coach(coach_id, payload, db, user)
+
+
+@app.post("/api/trial-classes")
+def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db)) -> dict:
+    student = get_student_by_hkid_or_404(db, payload.member_hkid)
+    coach = db.get(Coach, payload.coach_id) if payload.coach_id else None
+    branch = db.get(Branch, payload.branch_id) if payload.branch_id else None
+    row = TrialClass(
+        student_id=student.id,
+        member_hkid=student.hkid or normalize_hkid(payload.member_hkid),
+        type=payload.type,
+        coach_id=coach.id if coach else None,
+        branch_id=branch.id if branch else None,
+        class_date=payload.class_date,
+        note=(payload.note or "").strip() or None,
+    )
+    db.add(row)
+    db.flush()
+    db.add(AuditLog(action="trial_class_create", student_id=student.id, coach_id=coach.id if coach else None, detail=json.dumps({"trial_class_id": row.id, "type": row.type}, ensure_ascii=False)))
+    record_activity(db, student, "trial_class_create", row.id)
+    db.commit()
+    return {"id": row.id, "member": student_to_member_dict(db, student)}
+
+
+@app.get("/api/trial-classes")
+def list_trial_classes(member_hkid: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
+    query = db.query(TrialClass)
+    if member_hkid:
+        query = query.filter(TrialClass.member_hkid == normalize_hkid(member_hkid))
+    rows = query.order_by(TrialClass.created_at.desc()).limit(200).all()
+    return [
+        {
+            "id": row.id,
+            "member_hkid": row.member_hkid,
+            "type": row.type,
+            "coach_id": row.coach_id,
+            "branch_id": row.branch_id,
+            "class_date": row.class_date.isoformat(),
+            "note": row.note,
+            "created_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.post("/api/expenses")
+def create_expense(payload: ExpenseCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    row = Expense(date=payload.date, category=payload.category, amount=payload.amount, note=(payload.note or "").strip() or None)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"id": row.id, "date": row.date.isoformat(), "category": row.category, "amount": float(row.amount), "note": row.note}
+
+
+@app.get("/api/finance/summary")
+def finance_summary(from_: date | None = Query(default=None, alias="from"), to: date | None = None, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> dict:
+    today = date.today()
+    start = from_ or today.replace(day=1)
+    end = to or today
+    income_rows = db.query(Receipt).filter(func.date(Receipt.created_at) >= start, func.date(Receipt.created_at) <= end).all()
+    expense_rows = db.query(Expense).filter(Expense.date >= start, Expense.date <= end).all()
+    total_income = sum(float(r.amount or 0) for r in income_rows)
+    total_expense = sum(float(e.amount or 0) for e in expense_rows)
+
+    def grouped(items: list[tuple[str, float]]) -> list[dict]:
+        totals: dict[str, float] = {}
+        for key, amount in items:
+            label = key or "未填"
+            totals[label] = totals.get(label, 0) + float(amount or 0)
+        return [{"key": k, "amount": v} for k, v in sorted(totals.items())]
+
+    renewal_rows = db.query(RenewalRecord).filter(func.date(RenewalRecord.created_at) >= start, func.date(RenewalRecord.created_at) <= end).all()
+    branch_names = {b.id: b.name for b in db.query(Branch).all()}
+    coach_names = {c.id: c.full_name for c in db.query(Coach).all()}
+    daily: dict[str, float] = {}
+    for r in income_rows:
+        key = r.created_at.date().isoformat()
+        daily[key] = daily.get(key, 0) + float(r.amount or 0)
+    return {
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "net": total_income - total_expense,
+        "txn_count": len(income_rows) + len(expense_rows),
+        "by_payment_method": grouped([(r.payment_method or "未填", float(r.amount or 0)) for r in income_rows]),
+        "by_branch": grouped([(branch_names.get(r.branch_id, "未填"), float(r.amount or 0)) for r in renewal_rows]),
+        "by_coach": grouped([(coach_names.get(r.coach_id, r.coach_name or "未填"), float(r.amount or 0)) for r in renewal_rows]),
+        "daily_income": [{"date": k, "amount": v} for k, v in sorted(daily.items())],
+    }
 
 
 @app.get("/api/admin/summary")
@@ -1339,7 +1841,7 @@ def update_branch(
     data = payload.model_dump(exclude_unset=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update.")
-    for key in ("name", "address", "business_start_time", "business_end_time", "remarks"):
+    for key in ("name", "address", "business_start_time", "business_end_time", "remarks", "active"):
         if key not in data:
             continue
         val = data[key]
@@ -1499,6 +2001,10 @@ def update_coach(
         coach.full_name = data["full_name"].strip()
     if "phone" in data and data["phone"]:
         coach.phone = data["phone"].strip()
+    if "specialty" in data:
+        coach.specialty = data["specialty"].strip() if data["specialty"] else None
+    if "active" in data and data["active"] is not None:
+        coach.active = bool(data["active"])
 
     db.commit()
     db.refresh(coach)

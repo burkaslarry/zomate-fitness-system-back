@@ -87,6 +87,63 @@ class RenewalCreate(BaseModel):
     pin_code: str | None = Field(default=None, min_length=4, max_length=10)
 
 
+class MemberCreate(BaseModel):
+    full_name: str = Field(min_length=1, max_length=120)
+    hkid: str = Field(min_length=8, max_length=32)
+    phone: str = Field(min_length=8, max_length=30)
+    email: str | None = None
+    emergency_contact_name: str = Field(min_length=1, max_length=120)
+    emergency_contact_phone: str = Field(min_length=8, max_length=30)
+    parq: ParqQuestionsIn
+    medical_clearance_file_name: str | None = ""
+    cooling_off_acknowledged: bool = True
+    disclaimer_accepted: bool = True
+    digital_signature: str = Field(min_length=2, max_length=120)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        if v == "":
+            return None
+        return v
+
+    @model_validator(mode="after")
+    def validate_ack_and_clearance(self) -> "MemberCreate":
+        if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
+            raise ValueError("請確認冷靜期條款及免責聲明。")
+        if self.parq.any_yes() and not (self.medical_clearance_file_name or "").strip():
+            raise ValueError("PAR-Q 任一為「是」時請上載醫生 clearance（檔名）。")
+        return self
+
+
+class PackageOut(BaseModel):
+    id: int
+    name: str
+    sessions: int
+    price: float
+    active: bool = True
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TrialClassCreate(BaseModel):
+    member_hkid: str = Field(min_length=8, max_length=32)
+    type: Literal["TRIAL", "ADD_ON"]
+    coach_id: int | None = None
+    branch_id: int | None = None
+    class_date: date
+    note: str | None = None
+
+
+class ExpenseCreate(BaseModel):
+    date: date
+    category: Literal["rent", "salary", "supplies", "other"]
+    amount: float = Field(gt=0)
+    note: str | None = None
+
+
 class CheckinInput(BaseModel):
     """Redeem one lesson: identify by phone XOR student_id, then PIN."""
 
@@ -110,11 +167,15 @@ class FaceIdCheckinInput(BaseModel):
 class StudentOut(BaseModel):
     id: int
     full_name: str
+    hkid: str | None = None
     phone: str
     email: str | None
+    emergency_contact_name: str | None = None
+    emergency_contact_phone: str | None = None
     health_notes: str | None = None
     disclaimer_accepted: bool = False
     pin_code: str = "1234"
+    photo_path: str | None = None
     lesson_balance: int
     face_id_external: str | None
     created_at: datetime
@@ -142,6 +203,7 @@ class BranchOut(BaseModel):
     business_start_time: str = "09:00"
     business_end_time: str = "22:00"
     remarks: str | None = None
+    active: bool = True
     created_at: datetime
 
     class Config:
@@ -163,12 +225,15 @@ class BranchUpdate(BaseModel):
     business_start_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     business_end_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     remarks: str | None = None
+    active: bool | None = None
 
 
 class CoachOut(BaseModel):
     id: int
     full_name: str
     phone: str
+    specialty: str | None = None
+    active: bool = True
     branch_id: int | None
     created_at: datetime
 
@@ -179,6 +244,7 @@ class CoachOut(BaseModel):
 class CoachCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     phone: str = Field(min_length=6, max_length=30)
+    specialty: str | None = Field(default=None, max_length=160)
     branch_id: int | None = None
 
 
@@ -187,6 +253,8 @@ class CoachUpdate(BaseModel):
 
     full_name: str | None = Field(default=None, min_length=1, max_length=120)
     phone: str | None = Field(default=None, min_length=6, max_length=30)
+    specialty: str | None = Field(default=None, max_length=160)
+    active: bool | None = None
     branch_id: int | None = None
 
 

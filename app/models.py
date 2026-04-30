@@ -7,7 +7,7 @@ courses, check-ins, audits, soft-delete ledger via ``DeletedRecord``.
 
 from datetime import datetime, date
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from sqlalchemy import Date as DateColumn
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,6 +24,7 @@ class Branch(Base):
     business_start_time: Mapped[str] = mapped_column(String(5), nullable=False, default="09:00")
     business_end_time: Mapped[str] = mapped_column(String(5), nullable=False, default="22:00")
     remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     coaches: Mapped[list["Coach"]] = relationship(back_populates="branch")
@@ -36,6 +37,8 @@ class Coach(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
     phone: Mapped[str] = mapped_column(String(30), nullable=False, unique=True, index=True)
+    specialty: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     branch_id: Mapped[int | None] = mapped_column(
         ForeignKey("zomate_fs_branches.id"), nullable=True
     )
@@ -89,11 +92,15 @@ class Student(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     phone: Mapped[str] = mapped_column(String(30), nullable=False, unique=True, index=True)
     email: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    emergency_contact_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     pin_code: Mapped[str] = mapped_column(String(10), nullable=False, default="1234")
+    photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     lesson_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -104,6 +111,9 @@ class Student(Base):
         back_populates="student"
     )
     renewal_records: Mapped[list["RenewalRecord"]] = relationship(back_populates="student")
+    photos: Mapped[list["StudentPhoto"]] = relationship(back_populates="student")
+    receipts: Mapped[list["Receipt"]] = relationship(back_populates="student")
+    trial_classes: Mapped[list["TrialClass"]] = relationship(back_populates="student")
 
 
 class RenewalRecord(Base):
@@ -117,6 +127,11 @@ class RenewalRecord(Base):
     lessons: Mapped[int] = mapped_column(Integer, nullable=False)
     payment_method: Mapped[str] = mapped_column(String(80), nullable=False)
     coach_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    package_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_packages.id"), nullable=True)
+    coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True)
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    receipt_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_receipts.id"), nullable=True)
     remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     applicant_name: Mapped[str] = mapped_column(String(120), nullable=False)
     signature: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -124,6 +139,74 @@ class RenewalRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     student: Mapped["Student"] = relationship(back_populates="renewal_records")
+
+
+class Package(Base):
+    __tablename__ = "zomate_fs_packages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    sessions: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StudentPhoto(Base):
+    __tablename__ = "zomate_fs_student_photos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    student: Mapped["Student"] = relationship(back_populates="photos")
+
+
+class Receipt(Base):
+    __tablename__ = "zomate_fs_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(24), nullable=False, default="REGISTER")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    student: Mapped["Student"] = relationship(back_populates="receipts")
+
+
+class TrialClass(Base):
+    __tablename__ = "zomate_fs_trial_classes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    type: Mapped[str] = mapped_column(String(16), nullable=False)
+    coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True)
+    class_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    student: Mapped["Student"] = relationship(back_populates="trial_classes")
+    coach: Mapped["Coach | None"] = relationship()
+    branch: Mapped["Branch | None"] = relationship()
+
+
+class Expense(Base):
+    __tablename__ = "zomate_fs_expenses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    date: Mapped[date] = mapped_column(DateColumn, nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String(80), nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class CheckinLog(Base):
@@ -148,6 +231,16 @@ class WhatsAppLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     student: Mapped["Student"] = relationship(back_populates="whatsapp_logs")
+
+
+class ActivityLog(Base):
+    __tablename__ = "zomate_fs_activity_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    type: Mapped[str] = mapped_column(String(80), nullable=False)
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class AuditLog(Base):

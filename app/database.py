@@ -10,11 +10,11 @@ Exports: ``engine``, ``SessionLocal``, ``Base``, ``get_db`` dependency.
 Persistence tables use prefix ``zomate_fs_*`` (see ``models.py``).
 """
 
-import os
-
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
+
+from .config import settings
 
 load_dotenv()
 
@@ -34,17 +34,17 @@ def _normalize_database_url(url: str) -> str:
 
 def _connect_args(url: str) -> dict:
     """SSL for managed Postgres (Render, Neon, AWS RDS, etc.)."""
-    if os.getenv("DATABASE_SSLMODE"):
-        return {"sslmode": os.getenv("DATABASE_SSLMODE", "require")}
+    if settings.database_sslmode:
+        return {"sslmode": settings.database_sslmode}
     lower = url.lower()
     if "render.com" in lower or "sslmode=require" in lower:
         return {"sslmode": "require"}
-    if os.getenv("DATABASE_SSL", "").lower() in ("1", "true", "yes"):
+    if settings.database_ssl.lower() in ("1", "true", "yes"):
         return {"sslmode": "require"}
     return {}
 
 
-_raw_url = os.getenv("DATABASE_URL", "postgresql+psycopg2:///zomate_fitness_system")
+_raw_url = settings.database_url
 DATABASE_URL = _normalize_database_url(_raw_url)
 
 _ca = _connect_args(_raw_url)
