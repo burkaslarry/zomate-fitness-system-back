@@ -315,3 +315,19 @@ class CourseOut(BaseModel):
     series_start_date: date | None = None
     series_end_date: date | None = None
     enrollments: list[CourseEnrollmentOut] = Field(default_factory=list)
+
+
+class CourseCategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class StudentCategoryEnrollmentCreate(BaseModel):
+    course_category_id: int
+    total_lessons: int = Field(ge=1, le=999)
+    total_installments: int = Field(default=3, ge=1, le=5)
+
+
+class CoachTrialGrantBody(BaseModel):
+    coach_id: int | None = None
+    branch_id: int | None = None
+    class_date: date | None = None

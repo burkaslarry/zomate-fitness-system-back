@@ -100,9 +100,12 @@ class Student(Base):
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     pin_code: Mapped[str] = mapped_column(String(10), nullable=False, default="1234")
+    pin_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    hkid_prefix4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     lesson_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     checkins: Mapped[list["CheckinLog"]] = relationship(back_populates="student")
@@ -114,6 +117,105 @@ class Student(Base):
     photos: Mapped[list["StudentPhoto"]] = relationship(back_populates="student")
     receipts: Mapped[list["Receipt"]] = relationship(back_populates="student")
     trial_classes: Mapped[list["TrialClass"]] = relationship(back_populates="student")
+    category_enrollments: Mapped[list["CategoryEnrollment"]] = relationship(back_populates="student")
+
+
+class CourseCategory(Base):
+    __tablename__ = "zomate_fs_course_categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by_role: Mapped[str] = mapped_column(String(24), nullable=False, default="admin")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    enrollments: Mapped[list["CategoryEnrollment"]] = relationship(back_populates="course_category")
+
+
+class CategoryEnrollment(Base):
+    """Enrollment in a dynamic course category (Phase-1 spec), distinct from ``CourseEnrollment`` (scheduled class)."""
+
+    __tablename__ = "zomate_fs_category_enrollments"
+    __table_args__ = (
+        UniqueConstraint("student_id", "course_category_id", name="uq_zomate_fs_cat_enrollment_student_category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    course_category_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_course_categories.id"), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    started_at: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    total_lessons: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    student: Mapped["Student"] = relationship(back_populates="category_enrollments")
+    course_category: Mapped["CourseCategory"] = relationship(back_populates="enrollments")
+    installment_plans: Mapped[list["InstallmentPlan"]] = relationship(back_populates="enrollment")
+
+
+class InstallmentPlan(Base):
+    __tablename__ = "zomate_fs_installment_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    enrollment_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_category_enrollments.id", ondelete="CASCADE"), nullable=False)
+    total_installments: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    enrollment: Mapped["CategoryEnrollment"] = relationship(back_populates="installment_plans")
+    payments: Mapped[list["InstallmentPayment"]] = relationship(back_populates="plan")
+
+
+class InstallmentPayment(Base):
+    __tablename__ = "zomate_fs_installment_payments"
+    __table_args__ = (
+        UniqueConstraint("installment_plan_id", "installment_no", name="uq_zomate_fs_installment_no"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    installment_plan_id: Mapped[int] = mapped_column(
+        ForeignKey("zomate_fs_installment_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    installment_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    due_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    plan: Mapped["InstallmentPlan"] = relationship(back_populates="payments")
+
+
+class LessonLedgerEntry(Base):
+    __tablename__ = "zomate_fs_lesson_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    enrollment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_category_enrollments.id", ondelete="SET NULL"), nullable=True
+    )
+    delta_lessons: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_by_role: Mapped[str] = mapped_column(String(24), nullable=False, default="system")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class Attendance(Base):
+    __tablename__ = "zomate_fs_attendance"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False)
+    enrollment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_category_enrollments.id", ondelete="SET NULL"), nullable=True
+    )
+    coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True)
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_courses.id", ondelete="SET NULL"), nullable=True)
+    attended_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    session_calendar_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class RenewalRecord(Base):

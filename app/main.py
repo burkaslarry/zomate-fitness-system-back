@@ -1,10 +1,13 @@
+import asyncio
 import calendar
 import csv
 import io
 import json
 import hashlib
 import hmac
+import os
 import secrets
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -21,18 +24,29 @@ import qrcode
 
 from .config import settings
 from .database import Base, engine, get_db
+from .health_app import liveness_payload
+from .keepalive import keepalive_loop
+from .logutil import configure_logging, instance_id, log_event
+from .register_public import router as register_public_router
+from .timezone import HK, hk_calendar_date, now_hk
 from .models import (
-    AuditLog,
     ActivityLog,
+    AppUser,
+    Attendance,
+    AuditLog,
+    AuthSession,
     Branch,
+    CategoryEnrollment,
     CheckinLog,
     Coach,
     Course,
+    CourseCategory,
     CourseEnrollment,
     DeletedRecord,
     Expense,
-    AppUser,
-    AuthSession,
+    InstallmentPayment,
+    InstallmentPlan,
+    LessonLedgerEntry,
     Package,
     Receipt,
     RenewalRecord,
@@ -48,7 +62,9 @@ from .schemas import (
     CheckinInput,
     CoachCreate,
     CoachOut,
+    CoachTrialGrantBody,
     CoachUpdate,
+    CourseCategoryCreate,
     CourseCreate,
     CourseEnrollmentOut,
     CourseOut,
@@ -60,6 +76,7 @@ from .schemas import (
     MemberCreate,
     PackageOut,
     RenewalCreate,
+    StudentCategoryEnrollmentCreate,
     StudentOnboardCreate,
     StudentOut,
     StudentRegisterV1,
@@ -106,6 +123,8 @@ _AGENT_DEBUG_LOG = "/Users/larrylo/SourceProject/zomate-fitness/.cursor/debug-19
 
 
 def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    if os.environ.get("AGENT_DEBUG", "").lower() not in ("1", "true", "yes"):
+        return
     try:
         payload = {
             "sessionId": "195967",
@@ -119,17 +138,6 @@ def _agent_dbg(hypothesis_id: str, location: str, message: str, data: dict) -> N
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except OSError:
         pass
-
-
-@app.on_event("startup")
-def _agent_log_renewal_route_registered() -> None:
-    paths = [getattr(r, "path", "") for r in app.routes if getattr(r, "path", None)]
-    _agent_dbg(
-        "H4",
-        "main.py:startup",
-        "renewal_route_probe",
-        {"renewal_in_routes": "/api/renewal" in paths, "nroutes": len(paths)},
-    )
 
 
 @app.get("/", include_in_schema=False)
@@ -154,6 +162,7 @@ ACTIVE_MEMBER_DAYS = settings.active_member_days
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 storage_service = FileStorageService(UPLOADS_DIR)
+app.include_router(register_public_router)
 
 
 @app.exception_handler(HTTPException)
@@ -475,6 +484,12 @@ def _is_active_member(db: Session, student_id: int) -> bool:
 
 
 def student_to_member_dict(db: Session, student: Student) -> dict:
+    """Member dict: check-in PINs are **per course enrollment** only — hide legacy account PIN once enrolled."""
+    enrolled_courses = (
+        db.query(func.count(CourseEnrollment.id)).filter(CourseEnrollment.student_id == student.id).scalar() or 0
+    )
+    pin_code_display = "" if int(enrolled_courses) > 0 else student.pin_code
+    trial_q = getattr(student, "coach_trial_quota_remaining", 1)
     return {
         "id": student.id,
         "hkid": student.hkid,
@@ -483,13 +498,53 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "email": student.email,
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_phone": student.emergency_contact_phone,
-        "pin_code": student.pin_code,
+        "pin_code": pin_code_display,
         "lesson_balance": student.lesson_balance,
+        "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
         "is_active": _is_active_member(db, student.id),
         "created_at": student.created_at.isoformat(),
     }
+
+
+def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict]:
+    rows = (
+        db.query(CourseEnrollment, Course, Branch)
+        .join(Course, CourseEnrollment.course_id == Course.id)
+        .join(Branch, Course.branch_id == Branch.id)
+        .filter(CourseEnrollment.student_id == student.id)
+        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        .all()
+    )
+    return [
+        {
+            "course_id": course.id,
+            "course_title": course.title,
+            "branch_name": branch.name,
+            "checkin_pin": enr.checkin_pin,
+        }
+        for enr, course, branch in rows
+    ]
+
+
+def _installment_plan_seed_rows(db: Session, enrollment_id: int, n: int) -> None:
+    n = max(1, min(5, n))
+    plan = InstallmentPlan(enrollment_id=enrollment_id, total_installments=n, status="active")
+    db.add(plan)
+    db.flush()
+    today = datetime.utcnow().date()
+    for i in range(1, n + 1):
+        due = today + timedelta(days=30 * (i - 1))
+        db.add(
+            InstallmentPayment(
+                installment_plan_id=plan.id,
+                installment_no=i,
+                amount=0,
+                due_date=due,
+                status="pending",
+            )
+        )
 
 
 def record_activity(db: Session, student: Student, activity_type: str, ref_id: int | None = None) -> None:
@@ -656,12 +711,16 @@ def get_lesson_dates_for_course(course: Course) -> list[date]:
 
 
 def course_active_at_now(course: Course, now: datetime) -> bool:
-    d = now.date()
+    if now.tzinfo is None:
+        now_local = now.replace(tzinfo=HK)
+    else:
+        now_local = now.astimezone(HK)
+    d = now_local.date()
     if d not in get_lesson_dates_for_course(course):
         return False
     t_start = course.scheduled_start.time()
     t_end = course.scheduled_end.time()
-    t = now.time()
+    t = now_local.time()
     if t_start <= t_end:
         return t_start <= t <= t_end
     return t >= t_start or t <= t_end
@@ -671,7 +730,7 @@ def resolve_today_primary_course_for_student(
     db: Session, student: Student, now: datetime | None = None
 ) -> tuple[Course | None, Coach | None]:
     """Pick one class today when using account PIN / FaceID (not class PIN)."""
-    now = now or datetime.utcnow()
+    now = now or now_hk()
     rows = (
         db.query(Course, Coach)
         .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
@@ -703,7 +762,7 @@ def resolve_checkin_pin_context(
 ) -> tuple[Course | None, Coach | None, str] | None:
     """Class PIN → that course's coach only when today's date matches a scheduled lesson day."""
     pin = pin.strip()
-    now = datetime.utcnow()
+    now = now_hk()
     enr = (
         db.query(CourseEnrollment)
         .options(
@@ -718,9 +777,6 @@ def resolve_checkin_pin_context(
         if now.date() in get_lesson_dates_for_course(c):
             return c, c.coach, "class_pin"
         return None
-    if student.pin_code == pin:
-        c, coach = resolve_today_primary_course_for_student(db, student)
-        return c, coach, "account_pin"
     return None
 
 
@@ -774,10 +830,48 @@ async def perform_lesson_checkin(
     if student.lesson_balance <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
+    attended_at = datetime.utcnow()
+    session_day = hk_calendar_date(attended_at)
+
+    if resolved_course:
+        dup = (
+            db.query(Attendance)
+            .filter(
+                Attendance.student_id == student.id,
+                Attendance.course_id == resolved_course.id,
+                Attendance.session_calendar_date == session_day,
+            )
+            .first()
+        )
+        if dup:
+            raise HTTPException(status_code=409, detail="Already checked in for this session today.")
+
     student.lesson_balance -= 1
+    db.add(
+        LessonLedgerEntry(
+            student_id=student.id,
+            enrollment_id=None,
+            delta_lessons=-1,
+            reason="checkin_redeem",
+            created_by_role="student",
+        )
+    )
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
     db.flush()
+
+    if resolved_course:
+        db.add(
+            Attendance(
+                student_id=student.id,
+                enrollment_id=None,
+                coach_id=resolved_course.coach_id,
+                branch_id=resolved_course.branch_id,
+                course_id=resolved_course.id,
+                attended_at=attended_at,
+                session_calendar_date=session_day,
+            )
+        )
 
     log_whatsapp(
         db,
@@ -843,8 +937,7 @@ async def perform_lesson_checkin(
     }
 
 
-@app.on_event("startup")
-def on_startup() -> None:
+def _sync_startup() -> None:
     Base.metadata.create_all(bind=engine)
     db = next(get_db())
     try:
@@ -859,16 +952,55 @@ def on_startup() -> None:
         db.close()
 
 
+@app.on_event("startup")
+async def _startup_keepalive_and_db() -> None:
+    configure_logging(settings.log_level)
+    log_event("startup_begin")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _sync_startup)
+    if os.environ.get("AGENT_DEBUG", "").lower() in ("1", "true", "yes"):
+        paths = [getattr(r, "path", "") for r in app.routes if getattr(r, "path", None)]
+        _agent_dbg(
+            "H4",
+            "main.py:startup",
+            "renewal_route_probe",
+            {"renewal_in_routes": "/api/renewal" in paths, "nroutes": len(paths)},
+        )
+    if settings.keepalive_enabled and (settings.public_base_url or "").strip():
+        stop = asyncio.Event()
+        app.state._keepalive_stop = stop
+        app.state._keepalive_task = asyncio.create_task(keepalive_loop(settings, stop))
+        log_event("keepalive_task_scheduled")
+
+
+@app.on_event("shutdown")
+async def _shutdown_keepalive() -> None:
+    task = getattr(app.state, "_keepalive_task", None)
+    stop = getattr(app.state, "_keepalive_stop", None)
+    if task and stop:
+        stop.set()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 API_SERVICE_NAME = "zomate-fitness-api"
 
 
 def _health_liveness_payload() -> dict:
-    return {"status": "ok", "service": API_SERVICE_NAME}
+    return liveness_payload(instance_id())
 
 
 def _health_database_payload(db: Session) -> dict:
     db.execute(text("SELECT 1"))
-    return {"status": "ok", "database": "connected", "service": API_SERVICE_NAME}
+    return {
+        "status": "ok",
+        "database": "connected",
+        "service": API_SERVICE_NAME,
+        "instance_id": instance_id(),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -976,7 +1108,10 @@ def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> 
 
 @app.post("/api/v1/students/register")
 def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db)) -> dict:
-    """F01 multi-step wizard — persist to PostgreSQL + return PIN + membership expiry."""
+    """F01 multi-step wizard — persist to PostgreSQL + return PIN + membership expiry.
+
+    QR / kiosk **registration with SMS OTP** uses ``POST /api/register/*`` instead; keep this route for staff-assisted onboarding.
+    """
     phone = payload.phone.strip()
     hkid = normalize_hkid(payload.hkid)
     existing = db.query(Student).filter(Student.phone == phone).first()
@@ -1184,6 +1319,23 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "created_at": a.created_at.isoformat(),
             }
             for a in logs
+        ],
+        "course_checkin_pins": _course_checkin_pins_for_student(db, student),
+        "category_enrollments": [
+            {
+                "id": ce.id,
+                "course_category_id": ce.course_category_id,
+                "category_name": ce.course_category.name,
+                "status": ce.status,
+                "total_lessons": ce.total_lessons,
+                "started_at": ce.started_at.isoformat(),
+            }
+            for ce in (
+                db.query(CategoryEnrollment)
+                .options(joinedload(CategoryEnrollment.course_category))
+                .filter(CategoryEnrollment.student_id == student.id)
+                .all()
+            )
         ],
     }
 
@@ -1716,6 +1868,206 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         "coaches": coaches,
         "courses": courses,
     }
+
+
+@app.get("/api/admin/course-categories")
+def admin_list_course_categories(
+    include_deleted: bool = False,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> list[dict]:
+    q = db.query(CourseCategory).order_by(CourseCategory.id.asc())
+    if not include_deleted:
+        q = q.filter(CourseCategory.is_deleted.is_(False))
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "is_active": c.is_active,
+            "is_deleted": c.is_deleted,
+            "created_by_role": c.created_by_role,
+            "created_at": c.created_at.isoformat(),
+        }
+        for c in q.all()
+    ]
+
+
+@app.post("/api/admin/course-categories")
+def admin_create_course_category(
+    payload: CourseCategoryCreate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    name = payload.name.strip()
+    dup = (
+        db.query(CourseCategory)
+        .filter(CourseCategory.name == name, CourseCategory.is_deleted.is_(False))
+        .first()
+    )
+    if dup:
+        raise HTTPException(status_code=409, detail="Category name already exists.")
+    role = "ADMIN" if user.role == "ADMIN" else "CLERK"
+    row = CourseCategory(name=name, is_active=True, is_deleted=False, created_by_role=role.lower())
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    log_event("course_category_created", category_id=row.id, name=name)
+    return {"id": row.id, "name": row.name}
+
+
+@app.post("/api/admin/course-categories/{category_id}/hide")
+def admin_hide_course_category(
+    category_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    row = db.get(CourseCategory, category_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    row.is_deleted = True
+    db.commit()
+    log_event("course_category_hidden", category_id=category_id)
+    return {"id": category_id, "is_deleted": True}
+
+
+@app.post("/api/admin/course-categories/{category_id}/show")
+def admin_show_course_category(
+    category_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    row = db.get(CourseCategory, category_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    row.is_deleted = False
+    db.commit()
+    log_event("course_category_shown", category_id=category_id)
+    return {"id": category_id, "is_deleted": False}
+
+
+@app.post("/api/admin/students/{student_id}/category-enrollment")
+def admin_upsert_category_enrollment(
+    student_id: int,
+    payload: StudentCategoryEnrollmentCreate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    student = db.get(Student, student_id)
+    if not student or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    cat = db.get(CourseCategory, payload.course_category_id)
+    if not cat or cat.is_deleted:
+        raise HTTPException(status_code=400, detail="Invalid or hidden course category.")
+    role = user.role.lower()
+    existing = (
+        db.query(CategoryEnrollment)
+        .filter(
+            CategoryEnrollment.student_id == student_id,
+            CategoryEnrollment.course_category_id == payload.course_category_id,
+        )
+        .first()
+    )
+    if existing:
+        delta = payload.total_lessons - existing.total_lessons
+        if delta != 0:
+            existing.total_lessons = payload.total_lessons
+            student.lesson_balance += delta
+            db.add(
+                LessonLedgerEntry(
+                    student_id=student.id,
+                    enrollment_id=existing.id,
+                    delta_lessons=delta,
+                    reason="admin_category_lesson_adjust",
+                    created_by_role=role,
+                )
+            )
+        db.commit()
+        return {"enrollment_id": existing.id, "total_lessons": existing.total_lessons, "lesson_balance": student.lesson_balance}
+
+    enr = CategoryEnrollment(
+        student_id=student_id,
+        course_category_id=payload.course_category_id,
+        status="active",
+        started_at=datetime.utcnow().date(),
+        total_lessons=payload.total_lessons,
+        notes=None,
+    )
+    db.add(enr)
+    db.flush()
+    _installment_plan_seed_rows(db, enr.id, payload.total_installments)
+    student.lesson_balance += payload.total_lessons
+    db.add(
+        LessonLedgerEntry(
+            student_id=student.id,
+            enrollment_id=enr.id,
+            delta_lessons=payload.total_lessons,
+            reason="admin_category_enrollment",
+            created_by_role=role,
+        )
+    )
+    db.add(
+        AuditLog(
+            action="category_enrollment_create",
+            student_id=student.id,
+            detail=json.dumps(
+                {"enrollment_id": enr.id, "category_id": payload.course_category_id, "lessons": payload.total_lessons},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(enr)
+    return {"enrollment_id": enr.id, "total_lessons": enr.total_lessons, "lesson_balance": student.lesson_balance}
+
+
+@app.post("/api/admin/students/{student_id}/coach-trial-grant")
+def admin_grant_coach_trial_quota(
+    student_id: int,
+    payload: CoachTrialGrantBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    student = db.get(Student, student_id)
+    if not student or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    q = getattr(student, "coach_trial_quota_remaining", 1)
+    if int(q) < 1:
+        raise HTTPException(status_code=409, detail="Coach trial quota already used for this student.")
+    student.coach_trial_quota_remaining = int(q) - 1
+    student.lesson_balance += 1
+    hk = (student.hkid or "").strip() or student.phone
+    trial = TrialClass(
+        student_id=student.id,
+        member_hkid=hk,
+        type="coach_quota_1",
+        coach_id=payload.coach_id,
+        branch_id=payload.branch_id,
+        class_date=payload.class_date or datetime.utcnow().date(),
+        note="教練／後台試堂額度（每學生 1 次）",
+    )
+    db.add(trial)
+    db.add(
+        LessonLedgerEntry(
+            student_id=student.id,
+            enrollment_id=None,
+            delta_lessons=1,
+            reason="coach_trial_quota",
+            created_by_role=user.role.lower(),
+        )
+    )
+    db.flush()
+    db.add(
+        AuditLog(
+            action="coach_trial_quota_grant",
+            student_id=student.id,
+            coach_id=payload.coach_id,
+            detail=json.dumps({"trial_class_id": trial.id}, ensure_ascii=False),
+        )
+    )
+    db.commit()
+    db.refresh(student)
+    log_event("coach_trial_granted", student_id=student_id)
+    return {"lesson_balance": student.lesson_balance, "coach_trial_quota_remaining": student.coach_trial_quota_remaining}
 
 
 @app.get("/api/admin/whatsapp-logs")
@@ -2651,7 +3003,7 @@ def admin_create_course(
         msg = (
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
-            f" 你嘅課堂簽到 PIN：{pin}（亦可用帳戶 PIN 簽到）。"
+            f" 你嘅課堂簽到 PIN：{pin}（每個課程一個 PIN，請用此 PIN 簽到）。"
             f" 餘額已加 {payload.credits_on_enroll} 堂，現有 {student.lesson_balance} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
