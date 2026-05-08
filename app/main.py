@@ -88,13 +88,29 @@ from .storage import FileStorageService
 # -----------------------------------------------------------------------------
 # Zomate Fitness — FastAPI service (zomate-fitness-system-back)
 #
-# REST + WebSocket; PostgreSQL tables ``zomate_fs_*``. Admin CSV import/export
-# (students, branches, coaches), attendance CSV template. Bearer auth (ADMIN /
-# CLERK). CORS: CORS_ALLOWED_ORIGINS.
+# REST + WebSocket; PostgreSQL ``zomate_fs_*``. Bearer auth ADMIN/CLERK; CORS.
 #
-# Ops: GET /health, GET /health/db · GET /api/health, GET /api/health/db (probes & Swagger).
+# Inline feature registry (cross-reference README "Feature codes"):
 #
-# Swagger UI: GET /docs · ReDoc: GET /redoc · OpenAPI JSON: GET /openapi.json
+#   Features F001:HealthAndProbes -- ``app/health_app.py``; GET /health, /api/health (no DB);
+#                                   readiness GET /health/db, /api/health/db via SELECT 1.
+#   Features F002:StructuredLogging -- ``app/logutil.py``; JSON-ish events + instance_id.
+#   Features F003:TypedSettingsEnv -- ``app/config.py``; pydantic-settings mirrors Render/.env knobs.
+#   Features F004:RenderKeepalive -- ``app/keepalive.py``; lifespan pings PUBLIC_BASE_URL/api/health.
+#   Features F005:HongKongClock -- ``app/timezone.py``; attendances keyed on Asia/Hong_Kong date.
+#   Features F006:SmsOtpAdapterSeam -- ``app/otp_sms.py``; mock OTP; Twilio TODO behind Protocol.
+#   Features F007:QrRegistrationFlow -- ``app/register_public.py``, ``app/pin_util.py``;
+#                                       POST /api/register/* (OTP then hashed PIN).
+#   Features F008:StaffStudentOnboarding -- POST /api/v1/students/register; /api/onboarding; /api/members.
+#   Features F009:ScheduledCourseAndPins -- POST /api/admin/courses; enrollment ``checkin_pin``.
+#   Features F010:CheckInLedger -- POST /api/checkin; LessonLedger + Attendance de-dupe (HK calendar).
+#   Features F011:CourseCategoryOps -- /api/admin/course-categories (soft-hide via is_deleted).
+#   Features F012:CategoryEnrollmentFinance -- category enrollment POST + InstallmentPlan seeding hooks.
+#   Features F013:CoachTrialQuota -- POST .../coach-trial-grant; ``coach_trial_quota_remaining``.
+#   Features F014:FinanceReportsV1 -- GET /api/v1/reports/*; session-ledger payload uses ``entries``.
+#   Features F015:AdminChromeFrontend -- Next.js shell (``components/backend-shell.tsx``); sidebar + pings.
+#
+# Swagger: /docs · ReDoc: /redoc · OpenAPI: /openapi.json
 # -----------------------------------------------------------------------------
 
 app = FastAPI(

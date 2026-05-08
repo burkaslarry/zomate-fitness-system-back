@@ -1,4 +1,8 @@
-"""Structured-ish logging with instance_id and event names."""
+"""Features F002:StructuredLogging -- JSON-friendly log lines with ``event`` + ``instance_id``.
+
+StructuredLogging: One line per structured event for observability in Render/console.
+Code: ``configure_logging()``, ``log_event(name, **fields)``.
+"""
 
 from __future__ import annotations
 

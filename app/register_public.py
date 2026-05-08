@@ -1,4 +1,8 @@
-"""QR registration flow: OTP (registration only) → profile → PIN (hashed)."""
+"""Features F007:QrRegistrationFlow -- public POST /api/register/* OTP then profile + bcrypt PIN hash.
+
+QrRegistrationFlow: Phone OTP via in-memory TTL store; bridges ``otp_sms`` sends (feature F006).
+Code: Contrasts staff onboarding ``POST /api/v1/students/register`` (feature F008 in ``main.py`` hub).
+"""
 
 from __future__ import annotations
 

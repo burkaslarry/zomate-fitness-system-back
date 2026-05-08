@@ -1,4 +1,8 @@
-"""Hong Kong wall-clock helpers for attendance and scheduling."""
+"""Features F005:HongKongClock -- scheduling + "today" in Asia/Hong_Kong for attendance.
+
+HongKongClock: ``now_hk()``, naive UTC interpretation in ``hk_calendar_date`` legacy compat.
+Code: zoneinfo HK; consumed by resolve_checkin + duplicate attendance calendar date.
+"""
 
 from __future__ import annotations
 

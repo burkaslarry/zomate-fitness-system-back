@@ -1,4 +1,8 @@
-"""Background self-ping to PUBLIC_BASE_URL/api/health for Render wake-ups."""
+"""Features F004:RenderKeepalive -- async loop GET {PUBLIC_BASE_URL}/api/health with jitter.
+
+RenderKeepalive: Reduces idle spin-down on free/starter tiers; swallow errors, bounded timeout.
+Code: ``keepalive_loop()`` + ``httpx.AsyncClient`` interval from ``Settings``.
+"""
 
 from __future__ import annotations
 

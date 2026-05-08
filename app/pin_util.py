@@ -1,4 +1,7 @@
-"""PIN hashing (bcrypt) with legacy plain-text fallback."""
+"""Features F007:QrRegistrationPins -- bcrypt hash + legacy plain verify reused by kiosk check-in.
+
+QrRegistrationPins: Single ``hash_pin`` + ``verify_student_pin`` for QR flow and redemption paths.
+"""
 
 from __future__ import annotations
 

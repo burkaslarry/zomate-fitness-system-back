@@ -1,4 +1,8 @@
-"""Liveness payload for /health and /api/health (no database)."""
+"""Features F001:HealthAndProbes -- fast JSON for liveness probes (no DB, bounded work).
+
+HealthAndProbes: Uptime clock + wall ts + instance identifier for probes and keepalive pings.
+Code: ``liveness_payload()`` → ``status``, ``ts``, ``uptime_seconds``, ``instance_id``.
+"""
 
 from __future__ import annotations
 

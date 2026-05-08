@@ -1,5 +1,6 @@
-"""SMS / OTP adapter — mock in dev.
+"""Features F006:SmsOtpAdapterSeam -- Protocol + mock; production swaps to Twilio (TODO).
 
+SmsOtpAdapterSeam: ``get_otp_provider()`` returns mock logging registration codes today.
 TODO(Twilio): Replace ``MockSmsOtpProvider`` with a ``TwilioSmsOtpProvider`` that calls
 the Twilio Verify API (or Programmable SMS) using env ``TWILIO_ACCOUNT_SID``,
 ``TWILIO_AUTH_TOKEN``, ``TWILIO_MESSAGING_SERVICE_SID`` (or from number). Keep the
