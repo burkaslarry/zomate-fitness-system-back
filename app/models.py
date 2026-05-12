@@ -254,6 +254,19 @@ class Package(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class TrialClassKind(Base):
+    """試堂／加堂「學員類型 × 堂數」選項 — 後台維護 seed，前台下拉載入。"""
+
+    __tablename__ = "zomate_fs_trial_class_kinds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    label_zh: Mapped[str] = mapped_column(String(160), nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class StudentPhoto(Base):
     __tablename__ = "zomate_fs_student_photos"
 
@@ -287,8 +300,11 @@ class TrialClass(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
-    member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    member_hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     type: Mapped[str] = mapped_column(String(16), nullable=False)
+    trial_kind_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_trial_class_kinds.id"), nullable=True, index=True
+    )
     coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
     branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True)
     class_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
@@ -296,6 +312,7 @@ class TrialClass(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     student: Mapped["Student"] = relationship(back_populates="trial_classes")
+    trial_kind: Mapped["TrialClassKind | None"] = relationship()
     coach: Mapped["Coach | None"] = relationship()
     branch: Mapped["Branch | None"] = relationship()
 

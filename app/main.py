@@ -53,6 +53,7 @@ from .models import (
     Student,
     StudentPhoto,
     TrialClass,
+    TrialClassKind,
     WhatsAppLog,
 )
 from .schemas import (
@@ -82,6 +83,7 @@ from .schemas import (
     StudentOut,
     StudentRegisterV1,
     TrialClassCreate,
+    TrialClassKindOut,
     TrialPurchaseInput,
 )
 from .storage import FileStorageService
@@ -534,6 +536,55 @@ def get_student_by_hkid_or_404(db: Session, hkid: str) -> Student:
     return student
 
 
+def _trial_member_hkid_value(student: Student) -> str | None:
+    """TrialClass.member_hkid 欄位：有 HKID 則存，否則 NULL。"""
+    return student.hkid if student.hkid else None
+
+
+def _student_from_trial_class_payload(db: Session, payload: TrialClassCreate) -> Student:
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    if payload.student_id is not None:
+        st = db.query(Student).filter(~Student.id.in_(deleted_ids_sq), Student.id == payload.student_id).first()
+        if st is None:
+            raise HTTPException(status_code=404, detail="Student not found.")
+        return st
+    ph = (payload.student_phone or "").strip()
+    if ph:
+        local = normalize_hk_phone_local_eight(ph)
+        if not local:
+            raise HTTPException(
+                status_code=400,
+                detail="電話須為香港 8 位手機號碼（請填 +852xxxxxxxx 或只填八位數字）。",
+            )
+        variants = _hk_phone_lookup_variants(local)
+        st = db.query(Student).filter(~Student.id.in_(deleted_ids_sq), Student.phone.in_(variants)).first()
+        if st is None:
+            raise HTTPException(status_code=404, detail="找不到此電話的學員。")
+        return st
+    hk = (payload.member_hkid or "").strip()
+    if hk:
+        return get_student_by_hkid_or_404(db, hk)
+    raise HTTPException(status_code=400, detail="缺少學員識別。")
+
+
+def coach_row_to_out(db: Session, coach: Coach) -> CoachOut:
+    bn: str | None = None
+    if coach.branch_id is not None:
+        br = db.get(Branch, coach.branch_id)
+        if br is not None and not _is_deleted(db, "branches", br.id):
+            bn = br.name
+    return CoachOut(
+        id=coach.id,
+        full_name=coach.full_name,
+        phone=coach.phone,
+        specialty=coach.specialty,
+        active=coach.active,
+        branch_id=coach.branch_id,
+        branch_name=bn,
+        created_at=coach.created_at,
+    )
+
+
 def _file_url(relative_path: str | None) -> str | None:
     return f"/uploads/{relative_path}" if relative_path else None
 
@@ -679,6 +730,49 @@ def _migrate_management_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_trial_class_extensions(db: Session) -> None:
+    """Existing PostgreSQL DBs：補 trial_kind 外鍵、允許無 HKID 的試堂紀錄。"""
+    try:
+        db.execute(text("ALTER TABLE zomate_fs_trial_classes ADD COLUMN IF NOT EXISTS trial_kind_id INTEGER NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE zomate_fs_trial_classes ADD CONSTRAINT zomate_fs_trial_classes_trial_kind_id_fkey "
+                "FOREIGN KEY (trial_kind_id) REFERENCES zomate_fs_trial_class_kinds(id)"
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("ALTER TABLE zomate_fs_trial_classes ALTER COLUMN member_hkid DROP NOT NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _seed_trial_class_kinds(db: Session) -> None:
+    seeds = [
+        ("new_1to1", "新學生一對一", 10),
+        ("new_1to2", "新學生一對二", 20),
+        ("renew_1to1", "續會學生一對一", 30),
+        ("renew_1to2", "續會學生一對二", 40),
+        ("bring_1to1", "自帶學生一對一", 50),
+        ("bring_1to2", "自帶學生一對二", 60),
+    ]
+    for code, label, order in seeds:
+        row = db.query(TrialClassKind).filter(TrialClassKind.code == code).first()
+        if row is None:
+            db.add(TrialClassKind(code=code, label_zh=label, sort_order=order, active=True))
+        else:
+            row.label_zh = label
+            row.sort_order = order
+            row.active = True
+
+
 def _seed_default_branches(db: Session) -> None:
     branches = [
         {
@@ -735,6 +829,18 @@ def _seed_management_defaults(db: Session) -> None:
                 phone="90000001",
                 branch_id=first_branch.id,
                 specialty="Demo",
+                active=True,
+            )
+        )
+
+    tst_branch = db.query(Branch).filter(Branch.code == "TST").first() or first_branch
+    if tst_branch and not db.query(Coach).filter(Coach.phone == "90008888").first():
+        db.add(
+            Coach(
+                full_name="Fung Lo",
+                phone="90008888",
+                branch_id=tst_branch.id,
+                specialty=None,
                 active=True,
             )
         )
@@ -1027,7 +1133,9 @@ def _sync_startup() -> None:
         _migrate_branch_extended_columns(db)
         _migrate_courses_extended_columns(db)
         _migrate_management_columns(db)
+        _migrate_trial_class_extensions(db)
         _seed_default_branches(db)
+        _seed_trial_class_kinds(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
         db.commit()
@@ -1405,6 +1513,23 @@ def search_members(q: str = "", db: Session = Depends(get_db)) -> list[dict]:
     return [student_to_member_dict(db, row) for row in rows]
 
 
+@app.get("/api/members/lookup-phone")
+def lookup_member_by_phone(phone: str = Query(..., min_length=3), db: Session = Depends(get_db)) -> dict:
+    """續會 Step 1：以電話（預設 +852 八位）查找唯一學員。"""
+    local = normalize_hk_phone_local_eight(phone.strip())
+    if not local:
+        raise HTTPException(
+            status_code=400,
+            detail="電話須為香港 8 位手機號碼（請填 +852xxxxxxxx 或只填八位數字）。",
+        )
+    variants = _hk_phone_lookup_variants(local)
+    deleted_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    st = db.query(Student).filter(~Student.id.in_(deleted_ids), Student.phone.in_(variants)).first()
+    if st is None:
+        raise HTTPException(status_code=404, detail="找不到此電話的學員。")
+    return student_to_member_dict(db, st)
+
+
 @app.get("/api/members/{hkid}")
 def get_member(hkid: str, db: Session = Depends(get_db)) -> dict:
     return student_to_member_dict(db, get_student_by_hkid_or_404(db, hkid))
@@ -1539,7 +1664,9 @@ def resend_member_pin(hkid: str, db: Session = Depends(get_db)) -> dict:
 
 @app.post("/api/renewals")
 def create_renewal_multipart(
-    member_hkid: str = Form(...),
+    student_id: int | None = Form(default=None),
+    member_hkid: str | None = Form(default=None),
+    student_phone: str | None = Form(default=None),
     package_id: int = Form(...),
     coach_id: int | None = Form(default=None),
     branch_id: int | None = Form(default=None),
@@ -1549,7 +1676,24 @@ def create_renewal_multipart(
     receipt: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    student = get_student_by_hkid_or_404(db, member_hkid)
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    student: Student | None = None
+    if student_id is not None:
+        student = db.query(Student).filter(~Student.id.in_(deleted_ids_sq), Student.id == student_id).first()
+    elif member_hkid and member_hkid.strip():
+        student = get_student_by_hkid_or_404(db, member_hkid.strip())
+    elif student_phone and student_phone.strip():
+        local = normalize_hk_phone_local_eight(student_phone.strip())
+        if not local:
+            raise HTTPException(
+                status_code=400,
+                detail="電話須為香港 8 位手機號碼（請填 +852xxxxxxxx 或只填八位數字）。",
+            )
+        variants = _hk_phone_lookup_variants(local)
+        student = db.query(Student).filter(~Student.id.in_(deleted_ids_sq), Student.phone.in_(variants)).first()
+    if student is None:
+        raise HTTPException(status_code=400, detail="請提供 student_id、member_hkid 或 student_phone。")
+    receipt_tag = student.hkid or student.phone or str(student.id)
     package = db.get(Package, package_id)
     if package is None or not package.active:
         raise HTTPException(status_code=400, detail="Invalid package_id.")
@@ -1557,10 +1701,10 @@ def create_renewal_multipart(
     branch = db.get(Branch, branch_id) if branch_id else None
     receipt_row = None
     if receipt is not None and receipt.filename:
-        path = _save_upload_file(receipt, "receipts", student.hkid or member_hkid, 5 * 1024 * 1024)
+        path = _save_upload_file(receipt, "receipts", receipt_tag, 5 * 1024 * 1024)
         receipt_row = Receipt(
             student_id=student.id,
-            member_hkid=student.hkid or normalize_hkid(member_hkid),
+            member_hkid=(student.hkid or "").strip() or (student.phone or str(student.id)),
             file_path=path,
             amount=amount,
             payment_method=payment_method,
@@ -1866,32 +2010,57 @@ def update_public_branch(branch_id: int, payload: BranchUpdate, db: Session = De
 
 
 @app.get("/api/coaches", response_model=list[CoachOut])
-def list_public_coaches(active: bool | None = True, db: Session = Depends(get_db)) -> list[Coach]:
+def list_public_coaches(active: bool | None = True, db: Session = Depends(get_db)) -> list[CoachOut]:
     query = db.query(Coach).filter(~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")))
     if active is not None:
         query = query.filter(Coach.active == active)
-    return query.order_by(Coach.id).all()
+    coaches = query.order_by(Coach.id).all()
+    return [coach_row_to_out(db, c) for c in coaches]
 
 
 @app.post("/api/coaches", response_model=CoachOut)
-def create_public_coach(payload: CoachCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Coach:
+def create_public_coach(payload: CoachCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> CoachOut:
     return create_coach(payload, db, user)
 
 
 @app.patch("/api/coaches/{coach_id}", response_model=CoachOut)
-def update_public_coach(coach_id: int, payload: CoachUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Coach:
+def update_public_coach(coach_id: int, payload: CoachUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> CoachOut:
     return update_coach(coach_id, payload, db, user)
+
+
+@app.get("/api/trial-class-kinds", response_model=list[TrialClassKindOut])
+def list_trial_class_kinds_public(db: Session = Depends(get_db)) -> list[TrialClassKind]:
+    return (
+        db.query(TrialClassKind)
+        .filter(TrialClassKind.active.is_(True))
+        .order_by(TrialClassKind.sort_order, TrialClassKind.id)
+        .all()
+    )
 
 
 @app.post("/api/trial-classes")
 def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db)) -> dict:
-    student = get_student_by_hkid_or_404(db, payload.member_hkid)
+    student = _student_from_trial_class_payload(db, payload)
+    if payload.trial_kind_id is not None:
+        kind = db.get(TrialClassKind, payload.trial_kind_id)
+        if kind is None or not kind.active:
+            raise HTTPException(status_code=400, detail="Invalid trial_kind_id.")
+    else:
+        kind = (
+            db.query(TrialClassKind)
+            .filter(TrialClassKind.active.is_(True))
+            .order_by(TrialClassKind.sort_order, TrialClassKind.id)
+            .first()
+        )
+        if kind is None:
+            raise HTTPException(status_code=500, detail="trial_class_kinds 未初始化，請聯絡管理員。")
     coach = db.get(Coach, payload.coach_id) if payload.coach_id else None
     branch = db.get(Branch, payload.branch_id) if payload.branch_id else None
     row = TrialClass(
         student_id=student.id,
-        member_hkid=student.hkid or normalize_hkid(payload.member_hkid),
+        member_hkid=_trial_member_hkid_value(student),
         type=payload.type,
+        trial_kind_id=kind.id,
         coach_id=coach.id if coach else None,
         branch_id=branch.id if branch else None,
         class_date=payload.class_date,
@@ -1899,7 +2068,17 @@ def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db))
     )
     db.add(row)
     db.flush()
-    db.add(AuditLog(action="trial_class_create", student_id=student.id, coach_id=coach.id if coach else None, detail=json.dumps({"trial_class_id": row.id, "type": row.type}, ensure_ascii=False)))
+    db.add(
+        AuditLog(
+            action="trial_class_create",
+            student_id=student.id,
+            coach_id=coach.id if coach else None,
+            detail=json.dumps(
+                {"trial_class_id": row.id, "type": row.type, "trial_kind_id": kind.id},
+                ensure_ascii=False,
+            ),
+        )
+    )
     record_activity(db, student, "trial_class_create", row.id)
     db.commit()
     return {"id": row.id, "member": student_to_member_dict(db, student)}
@@ -1907,7 +2086,7 @@ def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db))
 
 @app.get("/api/trial-classes")
 def list_trial_classes(member_hkid: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
-    query = db.query(TrialClass)
+    query = db.query(TrialClass).options(joinedload(TrialClass.trial_kind))
     if member_hkid:
         query = query.filter(TrialClass.member_hkid == normalize_hkid(member_hkid))
     rows = query.order_by(TrialClass.created_at.desc()).limit(200).all()
@@ -1916,6 +2095,8 @@ def list_trial_classes(member_hkid: str | None = None, db: Session = Depends(get
             "id": row.id,
             "member_hkid": row.member_hkid,
             "type": row.type,
+            "trial_kind_id": row.trial_kind_id,
+            "trial_kind_label_zh": row.trial_kind.label_zh if row.trial_kind else None,
             "coach_id": row.coach_id,
             "branch_id": row.branch_id,
             "class_date": row.class_date.isoformat(),
@@ -2454,20 +2635,30 @@ def import_branches_csv(
 # --- Coaches ---
 
 
-@app.get("/api/admin/coaches", response_model=list[CoachOut])
-def list_coaches(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> list[Coach]:
-    return (
-        db.query(Coach)
-        .filter(~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")))
-        .order_by(Coach.id)
-        .all()
-    )
+@app.get("/api/admin/coaches")
+def list_coaches(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+    q: str | None = Query(default=None, description="搜尋關鍵字"),
+    search_by: str = Query(default="name", description="name 或 phone"),
+) -> list[CoachOut]:
+    query = db.query(Coach).filter(~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")))
+    raw_q = (q or "").strip()
+    if raw_q:
+        esc = raw_q.replace("\\", "").replace("%", "").replace("_", "")
+        pattern = f"%{esc}%"
+        if (search_by or "name").strip().lower() == "phone":
+            query = query.filter(Coach.phone.ilike(pattern))
+        else:
+            query = query.filter(Coach.full_name.ilike(pattern))
+    coaches = query.order_by(Coach.id).all()
+    return [coach_row_to_out(db, c) for c in coaches]
 
 
 @app.post("/api/admin/coaches", response_model=CoachOut)
 def create_coach(
     payload: CoachCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
-) -> Coach:
+) -> CoachOut:
     if db.query(Coach).filter(Coach.phone == payload.phone).first():
         raise HTTPException(status_code=409, detail="Coach phone already exists.")
     if payload.branch_id is not None:
@@ -2480,7 +2671,7 @@ def create_coach(
     db.add(c)
     db.commit()
     db.refresh(c)
-    return c
+    return coach_row_to_out(db, c)
 
 
 @app.patch("/api/admin/coaches/{coach_id}", response_model=CoachOut)
@@ -2489,7 +2680,7 @@ def update_coach(
     payload: CoachUpdate,
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
-) -> Coach:
+) -> CoachOut:
     coach = db.query(Coach).filter(Coach.id == coach_id).first()
     if not coach or _is_deleted(db, "coaches", coach.id):
         raise HTTPException(status_code=404, detail="Coach not found.")
@@ -2528,7 +2719,7 @@ def update_coach(
 
     db.commit()
     db.refresh(coach)
-    return coach
+    return coach_row_to_out(db, coach)
 
 
 @app.get("/api/admin/coaches/export.csv")
@@ -2600,12 +2791,14 @@ def export_students_csv(
         [
             "full_name",
             "phone",
+            "hkid",
             "email",
             "health_notes",
             "disclaimer_accepted",
             "pin_code",
             "lesson_balance",
             "face_id_external",
+            "created_at",
         ]
     )
     for s in (
@@ -2618,12 +2811,14 @@ def export_students_csv(
             [
                 s.full_name,
                 s.phone,
+                s.hkid or "",
                 s.email or "",
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
                 s.pin_code,
                 s.lesson_balance,
                 s.face_id_external or "",
+                s.created_at.isoformat(),
             ]
         )
     return PlainTextResponse(
@@ -2637,7 +2832,7 @@ def export_students_csv(
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
-    """Upsert by **full_name**: same姓名 → replace欄位；新姓名 insert（phone 必填且不可與其他人重複）。"""
+    """Batch upsert：以香港電話（八位／+852）對應學員；已存在則更新欄位。"""
     raw = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
     added = 0
@@ -2647,11 +2842,9 @@ def import_students_csv(
 
     for row in reader:
         full_name = (row.get("full_name") or "").strip()
-        if not full_name:
-            skipped += 1
-            continue
-
         phone_raw = (row.get("phone") or "").strip()
+        hkid_raw = (row.get("hkid") or "").strip()
+        hkid_norm = normalize_hkid(hkid_raw) if hkid_raw else None
         email = (row.get("email") or "").strip() or None
         health_notes = (row.get("health_notes") or "").strip() or None
         disc = (row.get("disclaimer_accepted") or "1").strip() in ("1", "true", "True", "yes")
@@ -2662,23 +2855,26 @@ def import_students_csv(
             balance = 0
         face = (row.get("face_id_external") or "").strip() or None
 
-        existing = (
-            db.query(Student)
-            .filter(active_students_sq, Student.full_name == full_name)
-            .first()
-        )
+        local_eight = normalize_hk_phone_local_eight(phone_raw) if phone_raw else None
+        variants = _hk_phone_lookup_variants(local_eight) if local_eight else []
+
+        existing: Student | None = None
+        if variants:
+            existing = db.query(Student).filter(active_students_sq, Student.phone.in_(variants)).first()
 
         if existing is not None:
-            if phone_raw:
-                other = (
+            if full_name:
+                existing.full_name = full_name
+            if hkid_norm:
+                other_hk = (
                     db.query(Student)
-                    .filter(active_students_sq, Student.phone == phone_raw, Student.id != existing.id)
+                    .filter(active_students_sq, Student.hkid == hkid_norm, Student.id != existing.id)
                     .first()
                 )
-                if other:
+                if other_hk:
                     skipped += 1
                     continue
-                existing.phone = phone_raw
+                existing.hkid = hkid_norm
             if pin_raw:
                 try:
                     existing.pin_code = allocate_student_pin(db, pin_raw)
@@ -2690,15 +2886,21 @@ def import_students_csv(
             existing.disclaimer_accepted = disc
             existing.lesson_balance = balance
             existing.face_id_external = face
+            if local_eight:
+                existing.phone = f"+852{local_eight}"
             updated += 1
             continue
 
-        if not phone_raw:
+        if not full_name or not local_eight:
             skipped += 1
             continue
-        if db.query(Student).filter(active_students_sq, Student.phone == phone_raw).first():
-            skipped += 1
-            continue
+
+        canonical = f"+852{local_eight}"
+        if hkid_norm:
+            hk_dup = db.query(Student).filter(active_students_sq, Student.hkid == hkid_norm).first()
+            if hk_dup:
+                skipped += 1
+                continue
 
         try:
             pin = allocate_student_pin(db, pin_raw if pin_raw else None)
@@ -2709,7 +2911,8 @@ def import_students_csv(
         db.add(
             Student(
                 full_name=full_name,
-                phone=phone_raw,
+                phone=canonical,
+                hkid=hkid_norm,
                 email=email,
                 health_notes=health_notes,
                 disclaimer_accepted=disc,

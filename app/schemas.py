@@ -64,10 +64,6 @@ class StudentRegisterV1(BaseModel):
     def validate_ack_and_clearance(self) -> "StudentRegisterV1":
         if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
             raise ValueError("請確認冷靜期條款及免責聲明。")
-        if self.parq.any_yes():
-            clr = (self.medical_clearance_file_name or "").strip()
-            if not clr:
-                raise ValueError("PAR-Q 任一為「是」時請上載醫生 clearance（檔名）。")
         return self
 
 
@@ -119,8 +115,6 @@ class MemberCreate(BaseModel):
     def validate_ack_and_clearance(self) -> "MemberCreate":
         if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
             raise ValueError("請確認冷靜期條款及免責聲明。")
-        if self.parq.any_yes() and not (self.medical_clearance_file_name or "").strip():
-            raise ValueError("PAR-Q 任一為「是」時請上載醫生 clearance（檔名）。")
         return self
 
 
@@ -136,13 +130,39 @@ class PackageOut(BaseModel):
         from_attributes = True
 
 
+class TrialClassKindOut(BaseModel):
+    id: int
+    code: str
+    label_zh: str
+    sort_order: int
+    active: bool = True
+
+    class Config:
+        from_attributes = True
+
+
 class TrialClassCreate(BaseModel):
-    member_hkid: str = Field(min_length=8, max_length=32)
+    """試堂／加堂 — 學員請提供其一：`student_phone`（建議）、`member_hkid` 或 `student_id`。"""
+
     type: Literal["TRIAL", "ADD_ON"]
+    trial_kind_id: int | None = None
     coach_id: int | None = None
     branch_id: int | None = None
     class_date: date
     note: str | None = None
+    member_hkid: str | None = Field(default=None, max_length=32)
+    student_phone: str | None = Field(default=None, max_length=36)
+    student_id: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def exactly_one_student_identity(self) -> "TrialClassCreate":
+        hk = (self.member_hkid or "").strip()
+        ph = (self.student_phone or "").strip()
+        sid = self.student_id
+        n = sum([bool(hk), bool(ph), sid is not None])
+        if n != 1:
+            raise ValueError("請提供其一：student_phone、member_hkid 或 student_id")
+        return self
 
 
 class ExpenseCreate(BaseModel):
@@ -243,6 +263,7 @@ class CoachOut(BaseModel):
     specialty: str | None = None
     active: bool = True
     branch_id: int | None
+    branch_name: str | None = None
     created_at: datetime
 
     class Config:
