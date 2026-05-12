@@ -42,6 +42,7 @@ class Coach(Base):
     branch_id: Mapped[int | None] = mapped_column(
         ForeignKey("zomate_fs_branches.id"), nullable=True
     )
+    hire_date: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     branch: Mapped["Branch | None"] = relationship(back_populates="coaches")
@@ -255,7 +256,7 @@ class Package(Base):
 
 
 class TrialClassKind(Base):
-    """試堂／加堂「學員類型 × 堂數」選項 — 後台維護 seed，前台下拉載入。"""
+    """試堂／開課套餐共用「課程種類」（試堂表與 Course 標題下拉）；後台維護啟用狀態。"""
 
     __tablename__ = "zomate_fs_trial_class_kinds"
 

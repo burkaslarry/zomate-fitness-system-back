@@ -83,6 +83,7 @@ from .schemas import (
     StudentOut,
     StudentRegisterV1,
     TrialClassCreate,
+    TrialClassKindAdminUpdate,
     TrialClassKindOut,
     TrialPurchaseInput,
 )
@@ -528,6 +529,11 @@ def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
     return [local_eight, f"+852{local_eight}", f"852{local_eight}"]
 
 
+def _normalize_student_csv_name(name: str | None) -> str:
+    """CSV 學員比對：去頭尾空白後 casefold，須與電話同時吻合才更新。"""
+    return (name or "").strip().casefold()
+
+
 def get_student_by_hkid_or_404(db: Session, hkid: str) -> Student:
     normalized = normalize_hkid(hkid)
     student = db.query(Student).filter(Student.hkid == normalized).first()
@@ -581,6 +587,7 @@ def coach_row_to_out(db: Session, coach: Coach) -> CoachOut:
         active=coach.active,
         branch_id=coach.branch_id,
         branch_name=bn,
+        hire_date=coach.hire_date,
         created_at=coach.created_at,
     )
 
@@ -754,6 +761,20 @@ def _migrate_trial_class_extensions(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_coach_hire_date(db: Session) -> None:
+    """教練入職日期：新欄位，並以 created_at 日期回填既有資料。"""
+    try:
+        db.execute(text("ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS hire_date DATE NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+    try:
+        db.execute(text("UPDATE zomate_fs_coaches SET hire_date = CAST(created_at AS date) WHERE hire_date IS NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _seed_trial_class_kinds(db: Session) -> None:
     seeds = [
         ("new_1to1", "新學生一對一", 10),
@@ -821,7 +842,16 @@ def _seed_management_defaults(db: Session) -> None:
 
     first_branch = db.query(Branch).order_by(Branch.id).first()
     if first_branch and db.query(Coach).count() == 0:
-        db.add(Coach(full_name="Zomate Coach", phone="00000000", branch_id=first_branch.id, specialty="General", active=True))
+        db.add(
+            Coach(
+                full_name="Zomate Coach",
+                phone="00000000",
+                branch_id=first_branch.id,
+                specialty="General",
+                active=True,
+                hire_date=date.today(),
+            )
+        )
     if first_branch and not db.query(Coach).filter(Coach.phone == "90000001").first():
         db.add(
             Coach(
@@ -830,6 +860,7 @@ def _seed_management_defaults(db: Session) -> None:
                 branch_id=first_branch.id,
                 specialty="Demo",
                 active=True,
+                hire_date=date.today(),
             )
         )
 
@@ -842,6 +873,7 @@ def _seed_management_defaults(db: Session) -> None:
                 branch_id=tst_branch.id,
                 specialty=None,
                 active=True,
+                hire_date=date.today(),
             )
         )
 
@@ -1133,6 +1165,7 @@ def _sync_startup() -> None:
         _migrate_branch_extended_columns(db)
         _migrate_courses_extended_columns(db)
         _migrate_management_columns(db)
+        _migrate_coach_hire_date(db)
         _migrate_trial_class_extensions(db)
         _seed_default_branches(db)
         _seed_trial_class_kinds(db)
@@ -2038,6 +2071,34 @@ def list_trial_class_kinds_public(db: Session = Depends(get_db)) -> list[TrialCl
     )
 
 
+@app.get("/api/admin/trial-class-kinds", response_model=list[TrialClassKindOut])
+def admin_list_trial_class_kinds(
+    db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+) -> list[TrialClassKind]:
+    """Course／試堂共用種類清單（含停用）— 「分店管理」後台維護。"""
+    return db.query(TrialClassKind).order_by(TrialClassKind.sort_order, TrialClassKind.id).all()
+
+
+@app.patch("/api/admin/trial-class-kinds/{kind_id}", response_model=TrialClassKindOut)
+def admin_patch_trial_class_kind(
+    kind_id: int,
+    payload: TrialClassKindAdminUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> TrialClassKind:
+    row = db.get(TrialClassKind, kind_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Course kind not found.")
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    if "active" in data and data["active"] is not None:
+        row.active = bool(data["active"])
+    db.commit()
+    db.refresh(row)
+    return row
+
+
 @app.post("/api/trial-classes")
 def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db)) -> dict:
     student = _student_from_trial_class_payload(db, payload)
@@ -2667,7 +2728,10 @@ def create_coach(
             ~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")),
         ).first():
             raise HTTPException(status_code=400, detail="Invalid branch_id.")
-    c = Coach(**payload.model_dump())
+    data = payload.model_dump()
+    if data.get("hire_date") is None:
+        data["hire_date"] = date.today()
+    c = Coach(**data)
     db.add(c)
     db.commit()
     db.refresh(c)
@@ -2716,6 +2780,8 @@ def update_coach(
         coach.specialty = data["specialty"].strip() if data["specialty"] else None
     if "active" in data and data["active"] is not None:
         coach.active = bool(data["active"])
+    if "hire_date" in data:
+        coach.hire_date = data["hire_date"]
 
     db.commit()
     db.refresh(coach)
@@ -2728,7 +2794,7 @@ def export_coaches_csv(
 ) -> PlainTextResponse:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["full_name", "phone", "branch_code"])
+    w.writerow(["full_name", "phone", "branch_code", "hire_date"])
     for coach in (
         db.query(Coach)
         .filter(~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")))
@@ -2739,7 +2805,8 @@ def export_coaches_csv(
         if coach.branch_id:
             br = db.query(Branch).filter(Branch.id == coach.branch_id).first()
             code = br.code if br else ""
-        w.writerow([coach.full_name, coach.phone, code])
+        hd = coach.hire_date.isoformat() if coach.hire_date else ""
+        w.writerow([coach.full_name, coach.phone, code, hd])
     return PlainTextResponse(
         buf.getvalue(),
         media_type="text/csv; charset=utf-8",
@@ -2758,6 +2825,13 @@ def import_coaches_csv(
         full_name = (row.get("full_name") or "").strip()
         phone = (row.get("phone") or "").strip()
         branch_code = (row.get("branch_code") or "").strip() or None
+        hire_raw = (row.get("hire_date") or "").strip()
+        hire_d: date | None = None
+        if hire_raw:
+            try:
+                hire_d = date.fromisoformat(hire_raw[:10])
+            except ValueError:
+                hire_d = None
         if not full_name or not phone:
             continue
         if db.query(Coach).filter(Coach.phone == phone).first():
@@ -2767,7 +2841,14 @@ def import_coaches_csv(
             br = db.query(Branch).filter(Branch.code == branch_code).first()
             if br:
                 branch_id = br.id
-        db.add(Coach(full_name=full_name, phone=phone, branch_id=branch_id))
+        db.add(
+            Coach(
+                full_name=full_name,
+                phone=phone,
+                branch_id=branch_id,
+                hire_date=hire_d if hire_d is not None else date.today(),
+            )
+        )
         added += 1
     db.commit()
     return {"imported": added}
@@ -2832,7 +2913,7 @@ def export_students_csv(
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
-    """Batch upsert：以香港電話（八位／+852）對應學員；已存在則更新欄位。"""
+    """批次新增／更新：僅當 CSV 的姓名（標準化）與電話（八位／+852 變體）皆與同一筆學員吻合時才更新；電話已存在但姓名不同則略過。"""
     raw = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
     added = 0
@@ -2863,8 +2944,15 @@ def import_students_csv(
             existing = db.query(Student).filter(active_students_sq, Student.phone.in_(variants)).first()
 
         if existing is not None:
+            csv_name_key = _normalize_student_csv_name(full_name)
+            if not csv_name_key:
+                skipped += 1
+                continue
+            if _normalize_student_csv_name(existing.full_name) != csv_name_key:
+                skipped += 1
+                continue
             if full_name:
-                existing.full_name = full_name
+                existing.full_name = full_name.strip()
             if hkid_norm:
                 other_hk = (
                     db.query(Student)
@@ -3369,13 +3457,14 @@ def admin_create_course(
         db.add(
             CourseEnrollment(course_id=course.id, student_id=student.id, checkin_pin=pin)
         )
-        if payload.credits_on_enroll > 0:
-            student.lesson_balance += payload.credits_on_enroll
+        pkg_sessions = payload.total_lessons
+        if pkg_sessions > 0:
+            student.lesson_balance += pkg_sessions
         msg = (
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
             f" 你嘅課堂簽到 PIN：{pin}（每個課程一個 PIN，請用此 PIN 簽到）。"
-            f" 餘額已加 {payload.credits_on_enroll} 堂，現有 {student.lesson_balance} 堂。"
+            f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {student.lesson_balance} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
 

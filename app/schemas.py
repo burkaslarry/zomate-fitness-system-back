@@ -141,6 +141,12 @@ class TrialClassKindOut(BaseModel):
         from_attributes = True
 
 
+class TrialClassKindAdminUpdate(BaseModel):
+    """分店後台「課程種類」維護 — 目前僅支援啟用／停用。"""
+
+    active: bool | None = None
+
+
 class TrialClassCreate(BaseModel):
     """試堂／加堂 — 學員請提供其一：`student_phone`（建議）、`member_hkid` 或 `student_id`。"""
 
@@ -264,6 +270,7 @@ class CoachOut(BaseModel):
     active: bool = True
     branch_id: int | None
     branch_name: str | None = None
+    hire_date: date | None = None
     created_at: datetime
 
     class Config:
@@ -275,6 +282,7 @@ class CoachCreate(BaseModel):
     phone: str = Field(min_length=6, max_length=30)
     specialty: str | None = Field(default=None, max_length=160)
     branch_id: int | None = None
+    hire_date: date | None = Field(default=None, description="入職日期；省略則為伺服器今日（UTC 日期）")
 
 
 class CoachUpdate(BaseModel):
@@ -285,6 +293,7 @@ class CoachUpdate(BaseModel):
     specialty: str | None = Field(default=None, max_length=160)
     active: bool | None = None
     branch_id: int | None = None
+    hire_date: date | None = None
 
 
 class CourseCreate(BaseModel):
@@ -294,7 +303,6 @@ class CourseCreate(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
     student_ids: list[int] = Field(default_factory=list)
-    credits_on_enroll: int = Field(default=10, ge=0, le=200)
     # Calendar start for the series — defaults to scheduled_start.date() if omitted.
     course_start_date: date | None = None
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
