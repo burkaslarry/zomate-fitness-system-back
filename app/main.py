@@ -74,6 +74,7 @@ from .schemas import (
     LoginSession,
     ExpenseCreate,
     MemberCreate,
+    MemberProspectDupCheck,
     PackageOut,
     RenewalCreate,
     StudentCategoryEnrollmentCreate,
@@ -507,6 +508,22 @@ def allocate_branch_code(db: Session, preferred: str | None, name: str) -> str:
 
 def normalize_hkid(raw: str) -> str:
     return "".join((raw or "").upper().split())
+
+
+def normalize_hk_phone_local_eight(raw: str | None) -> str | None:
+    """香港手機號：庫入面用 8 位數字；接受 +852 / 852 前綴或淨填 8 位。"""
+    digits = "".join(ch for ch in (raw or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("852"):
+        tail = digits[3:]
+        return tail if len(tail) == 8 else None
+    if len(digits) == 8:
+        return digits
+    return None
+
+
+def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
+    """比對資料庫內現有紀錄可能存 8 位、+852 或 852 前置。"""
+    return [local_eight, f"+852{local_eight}", f"852{local_eight}"]
 
 
 def get_student_by_hkid_or_404(db: Session, hkid: str) -> Student:
@@ -1178,10 +1195,37 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
 
     QR / kiosk **registration with SMS OTP** uses ``POST /api/register/*`` instead; keep this route for staff-assisted onboarding.
     """
-    phone = payload.phone.strip()
+    phone_raw = normalize_hk_phone_local_eight(payload.phone.strip())
+    if not phone_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="電話須為香港 8 位手機號碼（請填 +852xxxxxxxx 或只填八位數字）。",
+        )
+    phone_vars = _hk_phone_lookup_variants(phone_raw)
+
     hkid = normalize_hkid(payload.hkid)
-    existing = db.query(Student).filter(Student.phone == phone).first()
-    if hkid and db.query(Student).filter(Student.hkid == hkid, Student.phone != phone).first():
+    eco_raw = normalize_hk_phone_local_eight(payload.emergency_contact_phone.strip())
+    if not eco_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="緊急聯絡電話須為香港 8 位手機號碼。",
+        )
+    emergency_contact_phone = eco_raw
+
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+
+    existing = (
+        db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first()
+    )
+    if hkid and (
+        db.query(Student)
+        .filter(
+            Student.hkid == hkid,
+            ~Student.phone.in_(phone_vars),
+            ~Student.id.in_(deleted_ids_sq),
+        )
+        .first()
+    ):
         raise HTTPException(status_code=409, detail="HKID already registered.")
     expiry_iso = _membership_expiry_iso(payload.package_sessions)
 
@@ -1200,7 +1244,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         existing.full_name = payload.full_name.strip()
         existing.hkid = hkid
         existing.emergency_contact_name = payload.emergency_contact_name.strip()
-        existing.emergency_contact_phone = payload.emergency_contact_phone.strip()
+        existing.emergency_contact_phone = emergency_contact_phone
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
@@ -1215,7 +1259,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         log_whatsapp(
             db,
             existing,
-            phone,
+            phone_raw,
             f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {existing.lesson_balance} 堂，PIN 不變（{existing.pin_code}）。",
         )
         db.commit()
@@ -1232,10 +1276,10 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     student = Student(
         full_name=payload.full_name.strip(),
         hkid=hkid,
-        phone=phone,
+        phone=phone_raw,
         email=(payload.email or "").strip() or None,
         emergency_contact_name=payload.emergency_contact_name.strip(),
-        emergency_contact_phone=payload.emergency_contact_phone.strip(),
+        emergency_contact_phone=emergency_contact_phone,
         health_notes=_register_v1_health_notes(payload),
         disclaimer_accepted=True,
         pin_code=pin,
@@ -1256,7 +1300,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     log_whatsapp(
         db,
         student,
-        phone,
+        phone_raw,
         f"歡迎 {student.full_name}！你的簽到 PIN 是 {student.pin_code}，已存入 {payload.package_sessions} 堂。",
     )
     db.commit()
@@ -1264,19 +1308,58 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     return {"pin_code": student.pin_code, "membership_expiry_iso": expiry_iso}
 
 
+@app.post("/api/members/duplicate-check")
+def member_duplicate_check(payload: MemberProspectDupCheck, db: Session = Depends(get_db)) -> dict:
+    """Feature F008:F01 -- 第一步「下一步」前預檢；毋須 Bearer。"""
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    base = db.query(Student).filter(~Student.id.in_(deleted_ids_sq))
+    hkid_n = normalize_hkid(payload.hkid)
+    phone_local = normalize_hk_phone_local_eight(payload.phone.strip())
+    if not phone_local:
+        raise HTTPException(
+            status_code=400,
+            detail="電話須為香港 8 位手機號碼（預設 +852，只可填數字八位亦可）。",
+        )
+    variants = _hk_phone_lookup_variants(phone_local)
+    dup_hkid = base.filter(Student.hkid == hkid_n).first()
+    dup_phone = base.filter(Student.phone.in_(variants)).first()
+    if dup_hkid or dup_phone:
+        parts: list[str] = []
+        if dup_hkid:
+            parts.append("此證件號碼（HKID／簡填格式）已被登記")
+        if dup_phone:
+            parts.append("此電話號碼已被登記")
+        message = "；".join(parts) + "。請改用「續會」或聯絡櫃台。"
+        return {"blocked": True, "message": message}
+    return {"blocked": False, "message": None}
+
+
 @app.post("/api/members")
 def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     hkid = normalize_hkid(payload.hkid)
-    phone = payload.phone.strip()
-    if db.query(Student).filter(Student.hkid == hkid).first():
+    phone_raw = normalize_hk_phone_local_eight(payload.phone.strip())
+    if not phone_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="電話須為香港 8 位手機號碼（預設 +852）。",
+        )
+    phone_vars = _hk_phone_lookup_variants(phone_raw)
+    eco_raw = normalize_hk_phone_local_eight(payload.emergency_contact_phone.strip())
+    if not eco_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="緊急聯絡電話須為香港 8 位手機號碼。",
+        )
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.hkid == hkid).first():
         raise HTTPException(status_code=409, detail="HKID already registered.")
-    if db.query(Student).filter(Student.phone == phone).first():
+    if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
         raise HTTPException(status_code=409, detail="Phone already registered.")
     pin = allocate_student_pin(db, None)
     notes = "\n".join(
         [
             f"HKID: {hkid}",
-            f"Emergency: {payload.emergency_contact_name.strip()} / {payload.emergency_contact_phone.strip()}",
+            f"Emergency: {payload.emergency_contact_name.strip()} / {eco_raw}",
             f"Digital signature (step 3): {payload.digital_signature.strip()}",
             f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
             f"Medical clearance file: {(payload.medical_clearance_file_name or '').strip()}",
@@ -1285,10 +1368,10 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     student = Student(
         full_name=payload.full_name.strip(),
         hkid=hkid,
-        phone=phone,
+        phone=phone_raw,
         email=(payload.email or "").strip() or None,
         emergency_contact_name=payload.emergency_contact_name.strip(),
-        emergency_contact_phone=payload.emergency_contact_phone.strip(),
+        emergency_contact_phone=eco_raw,
         health_notes=notes,
         disclaimer_accepted=True,
         pin_code=pin,

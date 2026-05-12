@@ -39,7 +39,7 @@ class StudentRegisterV1(BaseModel):
     """``POST /api/v1/students/register`` — F01 wizard body (Zod mirror)."""
 
     full_name: str = Field(min_length=1, max_length=120)
-    hkid: str = Field(min_length=8, max_length=32)
+    hkid: str = Field(min_length=4, max_length=32)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
     emergency_contact_name: str = Field(min_length=1, max_length=120)
@@ -71,6 +71,14 @@ class StudentRegisterV1(BaseModel):
         return self
 
 
+class MemberProspectDupCheck(BaseModel):
+    """F01 步驟 1 — 未登記前預檢姓名／HKID／電話是否已有會員紀錄（無須 Bearer）。"""
+
+    full_name: str = Field(min_length=1, max_length=120)
+    hkid: str = Field(min_length=4, max_length=32)
+    phone: str = Field(min_length=3, max_length=36)
+
+
 class RenewalCreate(BaseModel):
     """續會須對應已存在學員（以 admin / student-search 揀選後帶 student_id）。"""
     student_id: int = Field(ge=1)
@@ -89,7 +97,7 @@ class RenewalCreate(BaseModel):
 
 class MemberCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
-    hkid: str = Field(min_length=8, max_length=32)
+    hkid: str = Field(min_length=4, max_length=32)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
     emergency_contact_name: str = Field(min_length=1, max_length=120)
