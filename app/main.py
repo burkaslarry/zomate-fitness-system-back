@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import distinct, func, or_, select, text
 from sqlalchemy.orm import Session, joinedload
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -88,7 +88,7 @@ from .storage import FileStorageService
 # -----------------------------------------------------------------------------
 # Zomate Fitness — FastAPI service (zomate-fitness-system-back)
 #
-# REST + WebSocket; PostgreSQL ``zomate_fs_*``. Bearer auth ADMIN/CLERK; CORS.
+# REST + WebSocket; PostgreSQL ``zomate_fs_*``. Bearer auth ADMIN / CLERK / COACH（COACH：僅自用課程曆）；CORS。
 #
 # Inline feature registry (cross-reference README "Feature codes"):
 #
@@ -226,7 +226,7 @@ manager = ConnectionManager()
 # Steps:
 # 01. 使用 PBKDF2 + secure random salt 做 password hash 與驗證
 # 02. 每次 login 建立有時效的 session token，落在 AuthSession
-# 03. get_current_user / require_* 透過依賴注入實作 ADMIN / CLERK 權限控制
+# 03. get_current_user / require_* 透過依賴注入（ADMIN／CLERK 後台全權；COACH 見 ``require_staff_for_coach_routes`` + slug 對應教練列）
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -315,9 +315,11 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
 
 
 def _seed_default_users(db: Session) -> None:
+    # CF09:CoachDemoAccount — demo 身份：coachdemo／COACH 只可用「教練曆」（前端限 /coach/calendar）；worker／CLERK 仍為後台職員。
     users = [
         ("masterzoe", "12345678", "ADMIN"),
         ("worker", "12347890", "CLERK"),
+        ("coachdemo", "12347890", "COACH"),
     ]
     for username, password, role in users:
         row = db.query(AppUser).filter(AppUser.username == username).first()
@@ -363,10 +365,44 @@ def get_current_user(
     return user
 
 
+def _alnum_slug(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _login_role_for_response(user: AppUser) -> str:
+    """Map DB ``zomate_fs_users.role`` to API contract: ADMIN | CLERK | COACH."""
+    r = (user.role or "").strip().upper()
+    if r == "ADMIN":
+        return "ADMIN"
+    if r == "COACH":
+        return "COACH"
+    return "CLERK"
+
+
 def require_admin_or_clerk(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """後台職員（不含 COACH）；COACH 帳號不可用依賴此注入的路由。"""
     if user.role not in {"ADMIN", "CLERK"}:
         raise HTTPException(status_code=403, detail="Role not allowed.")
     return user
+
+
+def require_staff_for_coach_routes(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """`/api/coach/courses*` — ADMIN／CLERK 全 coach_id；COACH 僅可查與 slug 對應之教練列。"""
+    if user.role not in {"ADMIN", "CLERK", "COACH"}:
+        raise HTTPException(status_code=403, detail="Role not allowed.")
+    return user
+
+
+def _coach_user_may_access_coach_row(db: Session, user: AppUser, coach: Coach | None) -> bool:
+    if user.role != "COACH":
+        return True
+    if not coach:
+        return False
+    us = _alnum_slug(user.username)
+    fs = _alnum_slug(coach.full_name)
+    if not us or not fs:
+        return False
+    return us in fs or fs in us
 
 
 def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
@@ -675,6 +711,16 @@ def _seed_management_defaults(db: Session) -> None:
     first_branch = db.query(Branch).order_by(Branch.id).first()
     if first_branch and db.query(Coach).count() == 0:
         db.add(Coach(full_name="Zomate Coach", phone="00000000", branch_id=first_branch.id, specialty="General", active=True))
+    if first_branch and not db.query(Coach).filter(Coach.phone == "90000001").first():
+        db.add(
+            Coach(
+                full_name="Coach Demo",
+                phone="90000001",
+                branch_id=first_branch.id,
+                specialty="Demo",
+                active=True,
+            )
+        )
 
 
 def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
@@ -932,6 +978,10 @@ async def perform_lesson_checkin(
         "lesson_balance": student.lesson_balance,
         "channel": channel,
         "created_at": checkin_log.created_at.isoformat(),
+        # Coach calendar UX：前台用 course_id／session_calendar_date 標記「已簽到扣堂」之課程格。
+        "course_id": resolved_course.id if resolved_course else None,
+        "session_calendar_date": session_day.isoformat() if resolved_course else None,
+        "course_title": resolved_course.title if resolved_course else None,
     }
     await manager.broadcast_json(event_payload)
 
@@ -1593,7 +1643,7 @@ def auth_login(payload: LoginInput, db: Session = Depends(get_db)) -> LoginSessi
         )
     )
     db.commit()
-    return LoginSession(token=token, username=user.username, role="ADMIN" if user.role == "ADMIN" else "CLERK")
+    return LoginSession(token=token, username=user.username, role=_login_role_for_response(user))
 
 
 @app.get("/api/auth/me", response_model=LoginSession)
@@ -1611,7 +1661,7 @@ def auth_me(
     if not session:
         raise HTTPException(status_code=401, detail="Invalid auth token.")
     user = session
-    return LoginSession(token=token or "", username=user.username, role="ADMIN" if user.role == "ADMIN" else "CLERK")
+    return LoginSession(token=token or "", username=user.username, role=_login_role_for_response(user))
 
 
 @app.post("/api/auth/logout")
@@ -1874,6 +1924,23 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         .scalar()
         or 0
     )
+    # Category-enrollment installments: distinct students with an active plan, and those still owing a period.
+    installment_students_total = (
+        db.query(func.count(distinct(CategoryEnrollment.student_id)))
+        .join(InstallmentPlan, InstallmentPlan.enrollment_id == CategoryEnrollment.id)
+        .filter(InstallmentPlan.status == "active")
+        .scalar()
+        or 0
+    )
+    installment_students_unpaid = (
+        db.query(func.count(distinct(CategoryEnrollment.student_id)))
+        .join(InstallmentPlan, InstallmentPlan.enrollment_id == CategoryEnrollment.id)
+        .join(InstallmentPayment, InstallmentPayment.installment_plan_id == InstallmentPlan.id)
+        .filter(InstallmentPlan.status == "active")
+        .filter(InstallmentPayment.paid_at.is_(None))
+        .scalar()
+        or 0
+    )
     return {
         "total_students": total_students,
         "active_students": active_students,
@@ -1883,6 +1950,8 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         "branches": branches,
         "coaches": coaches,
         "courses": courses,
+        "installment_students_unpaid": installment_students_unpaid,
+        "installment_students_total": installment_students_total,
     }
 
 
@@ -3041,18 +3110,20 @@ def admin_create_course(
 
 
 @app.get("/api/coach/courses", response_model=list[CourseOut])
+# CF09:CoachCalendarCourses — Bearer：ADMIN／CLERK／COACH；COACH 僅 slug 對應之 coach_id（見 ``_coach_user_may_access_coach_row``）。
 def coach_list_courses(
     coach_id: int,
     day: date | None = None,
     from_date: date | None = None,
     to_date: date | None = None,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> list[CourseOut]:
-    if not db.query(Coach).filter(Coach.id == coach_id).first():
+    coach_row = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach_row or _is_deleted(db, "coaches", coach_id):
         raise HTTPException(status_code=404, detail="Coach not found.")
-    if _is_deleted(db, "coaches", coach_id):
-        raise HTTPException(status_code=404, detail="Coach not found.")
+    if not _coach_user_may_access_coach_row(db, user, coach_row):
+        raise HTTPException(status_code=403, detail="This coach schedule is not linked to your login.")
     q = (
         db.query(Course)
         .options(
@@ -3085,13 +3156,19 @@ def coach_list_courses(
 
 
 @app.patch("/api/coach/courses/{course_id}", response_model=CourseOut)
+# CF09:CoachCalendarReschedule — 與 GET 相同：Bearer ADMIN／CLERK／COACH；COACH 僅可操作 slug 綁定之 coach_id。
 def coach_reschedule_course(
     course_id: int,
     coach_id: int,
     payload: CourseReschedule,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> CourseOut:
+    coach_row = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach_row or _is_deleted(db, "coaches", coach_id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    if not _coach_user_may_access_coach_row(db, user, coach_row):
+        raise HTTPException(status_code=403, detail="This coach schedule is not linked to your login.")
     course = db.query(Course).filter(Course.id == course_id).first()
     if not course:
         raise HTTPException(status_code=404, detail="Course not found.")
