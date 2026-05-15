@@ -1,8 +1,7 @@
-"""
-SQLAlchemy ORM models — table names prefixed ``zomate_fs_*`` (PostgreSQL).
-
-Aligned with product requirements F01–F04: students, branches, coaches,
-courses, check-ins, audits, soft-delete ledger via ``DeletedRecord``.
+"""[F007][S002]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: SQLAlchemy ORM models for zomate_fs domain tables.
 """
 
 from datetime import datetime, date
@@ -100,7 +99,6 @@ class Student(Base):
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    pin_code: Mapped[str] = mapped_column(String(10), nullable=False, default="1234")
     pin_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     hkid_prefix4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)

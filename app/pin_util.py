@@ -1,6 +1,7 @@
-"""Features F007:QrRegistrationPins -- bcrypt hash + legacy plain verify reused by kiosk check-in.
-
-QrRegistrationPins: Single ``hash_pin`` + ``verify_student_pin`` for QR flow and redemption paths.
+"""[F003][S002]
+Feature: Attendance & Today-Only QR Check-in
+Step: (see Logic)
+Logic: Student PIN generation, hashing, verification helpers.
 """
 
 from __future__ import annotations

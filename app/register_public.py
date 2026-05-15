@@ -1,7 +1,7 @@
-"""Features F007:QrRegistrationFlow -- public POST /api/register/* OTP then profile + bcrypt PIN hash.
-
-QrRegistrationFlow: Phone OTP via in-memory TTL store; bridges ``otp_sms`` sends (feature F006).
-Code: Contrasts staff onboarding ``POST /api/v1/students/register`` (feature F008 in ``main.py`` hub).
+"""[F001][S001]
+Feature: Student Onboarding
+Step: (see Logic)
+Logic: Public registration router split from main.
 """
 
 from __future__ import annotations
@@ -120,7 +120,6 @@ def register_profile(body: ProfileBody, db: Session = Depends(get_db)) -> dict:
             full_name=body.legal_name.strip(),
             phone=phone,
             hkid_prefix4=body.hkid_prefix4,
-            pin_code="0000",
             lesson_balance=0,
             coach_trial_quota_remaining=1,
             disclaimer_accepted=False,

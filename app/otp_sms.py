@@ -1,10 +1,7 @@
-"""Features F006:SmsOtpAdapterSeam -- Protocol + mock; production swaps to Twilio (TODO).
-
-SmsOtpAdapterSeam: ``get_otp_provider()`` returns mock logging registration codes today.
-TODO(Twilio): Replace ``MockSmsOtpProvider`` with a ``TwilioSmsOtpProvider`` that calls
-the Twilio Verify API (or Programmable SMS) using env ``TWILIO_ACCOUNT_SID``,
-``TWILIO_AUTH_TOKEN``, ``TWILIO_MESSAGING_SERVICE_SID`` (or from number). Keep the
-``SmsOtpProvider`` protocol so registration tests can still mock sends.
+"""[F005][S003]
+Feature: Balance Sync & Integrations
+Step: (see Logic)
+Logic: OTP / SMS hook for verification flows.
 """
 
 from __future__ import annotations

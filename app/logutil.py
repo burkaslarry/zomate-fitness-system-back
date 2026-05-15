@@ -1,7 +1,7 @@
-"""Features F002:StructuredLogging -- JSON-friendly log lines with ``event`` + ``instance_id``.
-
-StructuredLogging: One line per structured event for observability in Render/console.
-Code: ``configure_logging()``, ``log_event(name, **fields)``.
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Structured logging, instance id, log_event helper.
 """
 
 from __future__ import annotations

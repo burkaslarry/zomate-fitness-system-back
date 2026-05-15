@@ -1,8 +1,7 @@
-"""Course category soft-delete + coach trial quota on students.
-
-Revision ID: 20260509_0004
-Revises: 20260508_0003
-Create Date: 2026-05-09
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Revision: category soft-delete and trial quota migration.
 """
 
 from alembic import op

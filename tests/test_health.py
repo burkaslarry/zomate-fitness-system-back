@@ -1,3 +1,9 @@
+"""[F007][S005]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Tests for health and readiness endpoints.
+"""
+
 from fastapi.testclient import TestClient
 
 from app.health_app import liveness_payload

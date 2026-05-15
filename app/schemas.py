@@ -1,3 +1,9 @@
+"""[F007][S002]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Pydantic request and response models for HTTP routes.
+"""
+
 from datetime import date, datetime
 
 from typing import Literal
@@ -208,7 +214,7 @@ class StudentOut(BaseModel):
     emergency_contact_phone: str | None = None
     health_notes: str | None = None
     disclaimer_accepted: bool = False
-    pin_code: str = "1234"
+    pin_code: str = ""
     photo_path: str | None = None
     lesson_balance: int
     face_id_external: str | None
@@ -324,6 +330,12 @@ class CourseCreate(BaseModel):
 class CourseReschedule(BaseModel):
     scheduled_start: datetime
     scheduled_end: datetime
+
+
+class CourseAssignCoach(BaseModel):
+    """Reassign a course series to another coach (staff)."""
+
+    coach_id: int = Field(ge=1)
 
 
 class CourseEnrollmentOut(BaseModel):

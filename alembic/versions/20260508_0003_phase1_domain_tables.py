@@ -1,8 +1,7 @@
-"""Phase-1 domain: categories, category enrollments, installments, ledger, attendance.
-
-Revision ID: 20260508_0003
-Revises: 20260430_0002
-Create Date: 2026-05-08
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Revision: phase-1 domain tables migration.
 """
 
 from alembic import op

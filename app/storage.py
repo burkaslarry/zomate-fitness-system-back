@@ -1,3 +1,9 @@
+"""[F007][S002]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Upload storage paths and helpers for photos and receipts.
+"""
+
 import os
 from datetime import datetime
 from pathlib import Path

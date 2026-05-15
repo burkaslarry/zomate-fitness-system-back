@@ -1,3 +1,9 @@
+"""[F007][S001]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Uvicorn entrypoint for local development.
+"""
+
 import os
 
 import uvicorn

@@ -1,3 +1,9 @@
+"""[F003][S005]
+Feature: Attendance & Today-Only QR Check-in
+Step: (see Logic)
+Logic: Unit tests for PIN utilities.
+"""
+
 from app.pin_util import hash_pin, verify_student_pin
 
 

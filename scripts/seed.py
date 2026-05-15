@@ -1,3 +1,9 @@
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Development database seed script.
+"""
+
 from pathlib import Path
 import sys
 

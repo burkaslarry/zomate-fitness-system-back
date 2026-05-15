@@ -1,3 +1,9 @@
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Alembic runtime env; ties migrations to DATABASE_URL / metadata.
+"""
+
 from logging.config import fileConfig
 
 from alembic import context

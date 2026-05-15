@@ -1,5 +1,8 @@
-#!/usr/bin/env python3
-"""Seed CourseCategory rows (idempotent). Run after migrations."""
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Phase-1 domain seed script.
+"""
 
 from __future__ import annotations
 

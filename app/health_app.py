@@ -1,7 +1,7 @@
-"""Features F001:HealthAndProbes -- fast JSON for liveness probes (no DB, bounded work).
-
-HealthAndProbes: Uptime clock + wall ts + instance identifier for probes and keepalive pings.
-Code: ``liveness_payload()`` → ``status``, ``ts``, ``uptime_seconds``, ``instance_id``.
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Liveness payload helper for health endpoints.
 """
 
 from __future__ import annotations

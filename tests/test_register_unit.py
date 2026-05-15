@@ -1,3 +1,9 @@
+"""[F001][S005]
+Feature: Student Onboarding
+Step: (see Logic)
+Logic: Unit tests for registration helpers.
+"""
+
 import pytest
 from pydantic import ValidationError
 

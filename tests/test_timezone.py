@@ -1,3 +1,9 @@
+"""[F007][S005]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Tests for HK timezone utilities.
+"""
+
 from datetime import datetime, timezone
 
 from app.timezone import hk_calendar_date, now_hk

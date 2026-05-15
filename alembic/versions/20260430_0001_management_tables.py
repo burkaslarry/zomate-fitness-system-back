@@ -1,8 +1,7 @@
-"""management tables and member uploads
-
-Revision ID: 20260430_0001
-Revises:
-Create Date: 2026-04-30
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Revision: management tables migration.
 """
 
 from alembic import op

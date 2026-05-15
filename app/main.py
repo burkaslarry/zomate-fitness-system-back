@@ -1,3 +1,9 @@
+"""[F007][S001]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: FastAPI monolith: lifespan, CORS, REST plus WebSocket; domains F001 through F005.
+"""
+
 import asyncio
 import calendar
 import csv
@@ -66,6 +72,7 @@ from .schemas import (
     CoachTrialGrantBody,
     CoachUpdate,
     CourseCategoryCreate,
+    CourseAssignCoach,
     CourseCreate,
     CourseEnrollmentOut,
     CourseOut,
@@ -420,23 +427,14 @@ def log_whatsapp(db: Session, student: Student, recipient: str, message: str) ->
     db.add(log)
 
 
-def allocate_student_pin(db: Session, preferred: str | None) -> str:
-    if preferred:
-        taken = db.query(Student).filter(Student.pin_code == preferred).first()
-        if taken:
-            raise HTTPException(status_code=409, detail="PIN already in use. Leave blank for auto.")
-        return preferred
-    for _ in range(80):
+# [F009][S002]
+# Feature: Scheduled course & enrollment PINs
+# Step: Allocate ``checkin_pin`` unique on this course (no two students share) and
+#       unique per student across all enrollments so PIN resolution is unambiguous.
+def allocate_enrollment_pin(db: Session, course_id: int, student_id: int) -> str:
+    for _ in range(120):
         pin = f"{secrets.randbelow(90000) + 10000}"
-        if not db.query(Student).filter(Student.pin_code == pin).first():
-            return pin
-    raise HTTPException(status_code=500, detail="Could not allocate a unique PIN.")
-
-
-def allocate_enrollment_pin(db: Session, course_id: int) -> str:
-    for _ in range(80):
-        pin = f"{secrets.randbelow(90000) + 10000}"
-        taken = (
+        taken_course = (
             db.query(CourseEnrollment)
             .filter(
                 CourseEnrollment.course_id == course_id,
@@ -444,7 +442,17 @@ def allocate_enrollment_pin(db: Session, course_id: int) -> str:
             )
             .first()
         )
-        if not taken:
+        if taken_course:
+            continue
+        taken_student = (
+            db.query(CourseEnrollment)
+            .filter(
+                CourseEnrollment.student_id == student_id,
+                CourseEnrollment.checkin_pin == pin,
+            )
+            .first()
+        )
+        if not taken_student:
             return pin
     raise HTTPException(status_code=500, detail="Could not allocate class PIN.")
 
@@ -611,11 +619,7 @@ def _is_active_member(db: Session, student_id: int) -> bool:
 
 
 def student_to_member_dict(db: Session, student: Student) -> dict:
-    """Member dict: check-in PINs are **per course enrollment** only — hide legacy account PIN once enrolled."""
-    enrolled_courses = (
-        db.query(func.count(CourseEnrollment.id)).filter(CourseEnrollment.student_id == student.id).scalar() or 0
-    )
-    pin_code_display = "" if int(enrolled_courses) > 0 else student.pin_code
+    """Member dict: sign-in PINs are **per course enrollment** only (no account-level ``pin_code`` column)."""
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
     return {
         "id": student.id,
@@ -625,7 +629,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "email": student.email,
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_phone": student.emergency_contact_phone,
-        "pin_code": pin_code_display,
+        "pin_code": "",
         "lesson_balance": student.lesson_balance,
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
@@ -987,6 +991,7 @@ def resolve_checkin_pin_context(
         )
         .filter(CourseEnrollment.student_id == student.id, CourseEnrollment.checkin_pin == pin)
         .filter(~CourseEnrollment.course_id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        .order_by(CourseEnrollment.id.asc())
         .first()
     )
     if enr:
@@ -1227,8 +1232,10 @@ def _health_database_payload(db: Session) -> dict:
     }
 
 
-# -----------------------------------------------------------------------------
-# Health & DB connectivity (deploy probes, local smoke tests, Swagger · tags=health)
+# [F007][S004]
+# Feature: Backend platform (FastAPI & PostgreSQL)
+# Step: Ops & observability — health and readiness probes
+# Logic: Liveness without PostgreSQL; readiness runs SELECT 1 on DATABASE_URL (Swagger tags=health).
 # -----------------------------------------------------------------------------
 
 
@@ -1254,6 +1261,12 @@ def api_health() -> dict:
 def api_health_db(db: Session = Depends(get_db)) -> dict:
     """與 ``GET /health/db`` 相同。"""
     return _health_database_payload(db)
+
+
+# [F003][S001]
+# Feature: Attendance & Today-Only QR Check-in
+# Step: QR scan / paste — public kiosk search after scanning QR
+# Logic: Name or phone fragment lookup returning id and balance before PIN verification.
 
 
 @app.get("/api/public/student-search")
@@ -1301,6 +1314,55 @@ def public_student_search(q: str = "", db: Session = Depends(get_db)) -> list[di
     ]
 
 
+# [F003][S001]
+# Feature: Attendance & Today-Only QR Check-in
+# Step: Today's lessons for enrolled student (Hong Kong calendar day)
+# Logic: Courses where today ∈ lesson dates; omit checkin_pin from public JSON.
+
+
+@app.get("/api/public/student-today-lessons")
+def public_student_today_lessons(
+    student_id: int = Query(..., ge=1),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    today = now_hk().date()
+    rows = (
+        db.query(Course, Coach)
+        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
+        .join(Coach, Coach.id == Course.coach_id)
+        .filter(
+            CourseEnrollment.student_id == student_id,
+            ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
+            ~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")),
+        )
+        .all()
+    )
+    out: list[dict] = []
+    for course, coach in rows:
+        if today not in get_lesson_dates_for_course(course):
+            continue
+        out.append(
+            {
+                "course_id": course.id,
+                "title": course.title or "Course",
+                "coach_name": coach.full_name,
+                "scheduled_start": course.scheduled_start.isoformat(),
+                "scheduled_end": course.scheduled_end.isoformat(),
+            }
+        )
+    out.sort(key=lambda x: x["scheduled_start"])
+    return out
+
+
+# [F003][S001]
+# Feature: Attendance & Today-Only QR Check-in
+# Step: Realtime check-in broadcast channel
+# Logic: WebSocket endpoint for coach calendar and kiosk monitors (manager hub).
+
+
 @app.websocket("/ws/checkins")
 async def websocket_checkins(websocket: WebSocket) -> None:
     await manager.connect(websocket)
@@ -1314,15 +1376,20 @@ async def websocket_checkins(websocket: WebSocket) -> None:
         manager.disconnect(websocket)
 
 
+# [F001][S001]
+# Feature: Student Onboarding
+# Step: Entry form and registration HTTP (legacy / wizard payloads)
+# Logic: Persist Student rows, PAR-Q paths, WhatsApp welcome hooks.
+
+
 @app.post("/api/onboarding", response_model=StudentOut)
 def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> StudentOut:
     existing = db.query(Student).filter(Student.phone == payload.phone).first()
     if existing:
         raise HTTPException(status_code=409, detail="Phone already exists.")
 
-    pin = allocate_student_pin(db, payload.pin_code)
     data = payload.model_dump()
-    data["pin_code"] = pin
+    data.pop("pin_code", None)
     student = Student(**data)
     db.add(student)
     db.commit()
@@ -1401,11 +1468,11 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
             db,
             existing,
             phone_raw,
-            f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {existing.lesson_balance} 堂，PIN 不變（{existing.pin_code}）。",
+            f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {existing.lesson_balance} 堂。",
         )
         db.commit()
         db.refresh(existing)
-        return {"pin_code": existing.pin_code, "membership_expiry_iso": expiry_iso}
+        return {"pin_code": "", "membership_expiry_iso": expiry_iso}
 
     if payload.form_type == "renewal":
         raise HTTPException(
@@ -1413,7 +1480,6 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
             detail="找不到此電話之學籍。請改選「新人申請」或核對號碼。",
         )
 
-    pin = allocate_student_pin(db, None)
     student = Student(
         full_name=payload.full_name.strip(),
         hkid=hkid,
@@ -1423,7 +1489,6 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         emergency_contact_phone=emergency_contact_phone,
         health_notes=_register_v1_health_notes(payload),
         disclaimer_accepted=True,
-        pin_code=pin,
         lesson_balance=int(payload.package_sessions),
     )
     db.add(student)
@@ -1442,11 +1507,11 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         db,
         student,
         phone_raw,
-        f"歡迎 {student.full_name}！你的簽到 PIN 是 {student.pin_code}，已存入 {payload.package_sessions} 堂。",
+        f"歡迎 {student.full_name}！已存入 {payload.package_sessions} 堂。簽到請使用課程專屬 PIN（報名課程後將以 WhatsApp 發送）。",
     )
     db.commit()
     db.refresh(student)
-    return {"pin_code": student.pin_code, "membership_expiry_iso": expiry_iso}
+    return {"pin_code": "", "membership_expiry_iso": expiry_iso}
 
 
 @app.post("/api/members/duplicate-check")
@@ -1496,7 +1561,6 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=409, detail="HKID already registered.")
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
         raise HTTPException(status_code=409, detail="Phone already registered.")
-    pin = allocate_student_pin(db, None)
     notes = "\n".join(
         [
             f"HKID: {hkid}",
@@ -1515,7 +1579,6 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
         emergency_contact_phone=eco_raw,
         health_notes=notes,
         disclaimer_accepted=True,
-        pin_code=pin,
         lesson_balance=0,
     )
     db.add(student)
@@ -1524,7 +1587,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     record_activity(db, student, "member_create", student.id)
     db.commit()
     db.refresh(student)
-    return {"member": student_to_member_dict(db, student), "pin_code": student.pin_code}
+    return {"member": student_to_member_dict(db, student), "pin_code": ""}
 
 
 @app.get("/api/members/search")
@@ -1881,12 +1944,13 @@ def list_students(db: Session = Depends(get_db)) -> list[dict]:
     return [student_to_member_dict(db, row) for row in rows]
 
 
+# [F007][S001]
+# Feature: Backend platform (FastAPI & PostgreSQL)
+# Step: Staff session authentication (Bearer token protocol)
+# Logic: Login verifies AppUser password, issues AuthSession token; me validates; logout deletes session row.
+
+
 @app.post("/api/auth/login", response_model=LoginSession)
-# CF10: Authentication flow.
-# Steps:
-# 01. 驗證帳號密碼後建立隨機 session token
-# 02. 回傳 token, username, role 給前端儲存
-# 03. /api/auth/me 與 /api/auth/logout 使用同一 token 協議
 def auth_login(payload: LoginInput, db: Session = Depends(get_db)) -> LoginSession:
     username = payload.username.strip()
     user = db.query(AppUser).filter(AppUser.username == username).first()
@@ -1937,6 +2001,12 @@ def auth_logout(
     return {"message": "Logged out."}
 
 
+# [F002][S001]
+# Feature: Course Entry & Automation
+# Step: Trial course / credit top-up
+# Logic: Increment lesson_balance on existing student; log WhatsApp-style notification.
+
+
 @app.post("/api/trial-purchase")
 def trial_purchase(payload: TrialPurchaseInput, db: Session = Depends(get_db)) -> dict:
     student = db.query(Student).filter(Student.phone == payload.phone).first()
@@ -1955,6 +2025,12 @@ def trial_purchase(payload: TrialPurchaseInput, db: Session = Depends(get_db)) -
     db.commit()
     db.refresh(student)
     return {"message": "Credits added", "lesson_balance": student.lesson_balance}
+
+
+# [F003][S001]
+# Feature: Attendance & Today-Only QR Check-in
+# Step: Student PIN verification and lesson redeem
+# Logic: resolve_checkin_pin_context; perform_lesson_checkin; optional WS broadcast to coaches.
 
 
 @app.post("/api/checkin")
@@ -2014,6 +2090,12 @@ async def faceid_checkin(payload: FaceIdCheckinInput, db: Session = Depends(get_
         notified_coach=coach,
         pin_resolution="faceid",
     )
+
+
+# [F002][S001]
+# Feature: Course Entry & Automation
+# Step: Reference data — packages, branches, coaches, trial classes
+# Logic: CRUD and listings feeding admin course-set and coach scheduling UIs.
 
 
 @app.get("/api/packages", response_model=list[PackageOut])
@@ -2142,7 +2224,13 @@ def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db))
     )
     record_activity(db, student, "trial_class_create", row.id)
     db.commit()
-    return {"id": row.id, "member": student_to_member_dict(db, student)}
+    db.refresh(student)
+    pins = _course_checkin_pins_for_student(db, student)
+    return {
+        "id": row.id,
+        "member": student_to_member_dict(db, student),
+        "course_checkin_pins": pins,
+    }
 
 
 @app.get("/api/trial-classes")
@@ -2211,6 +2299,12 @@ def finance_summary(from_: date | None = Query(default=None, alias="from"), to: 
         "by_coach": grouped([(coach_names.get(r.coach_id, r.coach_name or "未填"), float(r.amount or 0)) for r in renewal_rows]),
         "daily_income": [{"date": k, "amount": v} for k, v in sorted(daily.items())],
     }
+
+
+# [F004][S001]
+# Feature: Admin Reports & Financials
+# Step: Admin dashboard KPIs and back-office JSON APIs
+# Logic: Summary counts, WhatsApp logs, CSV import/export, hard-delete guards for ADMIN.
 
 
 @app.get("/api/admin/summary")
@@ -2896,7 +2990,7 @@ def export_students_csv(
                 s.email or "",
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
-                s.pin_code,
+                "",
                 s.lesson_balance,
                 s.face_id_external or "",
                 s.created_at.isoformat(),
@@ -2929,7 +3023,6 @@ def import_students_csv(
         email = (row.get("email") or "").strip() or None
         health_notes = (row.get("health_notes") or "").strip() or None
         disc = (row.get("disclaimer_accepted") or "1").strip() in ("1", "true", "True", "yes")
-        pin_raw = (row.get("pin_code") or "").strip()
         try:
             balance = int((row.get("lesson_balance") or "0").strip() or 0)
         except ValueError:
@@ -2963,12 +3056,6 @@ def import_students_csv(
                     skipped += 1
                     continue
                 existing.hkid = hkid_norm
-            if pin_raw:
-                try:
-                    existing.pin_code = allocate_student_pin(db, pin_raw)
-                except HTTPException:
-                    skipped += 1
-                    continue
             existing.email = email
             existing.health_notes = health_notes
             existing.disclaimer_accepted = disc
@@ -2990,12 +3077,6 @@ def import_students_csv(
                 skipped += 1
                 continue
 
-        try:
-            pin = allocate_student_pin(db, pin_raw if pin_raw else None)
-        except HTTPException:
-            skipped += 1
-            continue
-
         db.add(
             Student(
                 full_name=full_name,
@@ -3004,7 +3085,6 @@ def import_students_csv(
                 email=email,
                 health_notes=health_notes,
                 disclaimer_accepted=disc,
-                pin_code=pin,
                 lesson_balance=balance,
                 face_id_external=face,
             )
@@ -3235,6 +3315,12 @@ _V1_LEDGER_ROWS: list[dict] = [
 ]
 
 
+# [F004][S001]
+# Feature: Admin Reports & Financials
+# Step: v1 reports — sales, expenses, coach-attendance rollups
+# Logic: JSON rows for TanStack tables; coach-attendance joins check-in audit events.
+
+
 @app.get("/api/v1/reports/sales")
 def v1_reports_sales(
     sort: str | None = None,
@@ -3355,6 +3441,12 @@ def v1_reports_coach_attendance(
     return {"rows": detail_rows, "summary": summary_rows, "month": month}
 
 
+# [F003][S005]
+# Feature: Attendance & Today-Only QR Check-in
+# Step: Session ledger — deduct reasons and admin adjustments
+# Logic: GET lists ledger rows; POST inserts adjustment entry (demo-seeded in dev).
+
+
 @app.get("/api/v1/session-ledger")
 def v1_session_ledger_get(user: AppUser = Depends(require_admin_or_clerk)) -> dict:
     return {"entries": list(_V1_LEDGER_ROWS)}
@@ -3395,6 +3487,31 @@ def admin_list_courses(db: Session = Depends(get_db), user: AppUser = Depends(re
         .all()
     )
     return [course_to_out(c) for c in courses]
+
+
+@app.get("/api/admin/courses/by-day", response_model=list[CourseOut])
+def admin_courses_by_day(
+    day: date = Query(..., description="Calendar day (Hong Kong) to match against course lesson dates."),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> list[CourseOut]:
+    # [F009][S003]
+    # Feature: Scheduled course & enrollment PINs
+    # Step: Staff lists courses that fall on ``day`` for coach assignment UI.
+    courses_raw = (
+        db.query(Course)
+        .options(
+            joinedload(Course.branch),
+            joinedload(Course.coach),
+            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
+        )
+        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        .order_by(Course.scheduled_start.asc())
+        .limit(800)
+        .all()
+    )
+    picked = [c for c in courses_raw if day in get_lesson_dates_for_course(c)]
+    return [course_to_out(c) for c in picked]
 
 
 @app.post("/api/admin/courses", response_model=CourseOut)
@@ -3453,7 +3570,7 @@ def admin_create_course(
             continue
         if _is_deleted(db, "students", student.id):
             continue
-        pin = allocate_enrollment_pin(db, course.id)
+        pin = allocate_enrollment_pin(db, course.id, student.id)
         db.add(
             CourseEnrollment(course_id=course.id, student_id=student.id, checkin_pin=pin)
         )
@@ -3478,6 +3595,41 @@ def admin_create_course(
             joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
         )
         .filter(Course.id == course.id)
+        .first()
+    )
+    assert full is not None
+    return course_to_out(full)
+
+
+@app.patch("/api/admin/courses/{course_id}/assign-coach", response_model=CourseOut)
+def admin_assign_course_coach(
+    course_id: int,
+    payload: CourseAssignCoach,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> CourseOut:
+    # [F009][S003]
+    # Feature: Scheduled course & enrollment PINs
+    # Step: Staff reassigns ``Course.coach_id`` for the coach timetable UI.
+    course = db.query(Course).filter(Course.id == course_id).first()
+    if not course or _is_deleted(db, "courses", course.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    coach = db.query(Coach).filter(
+        Coach.id == payload.coach_id,
+        ~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")),
+    ).first()
+    if not coach:
+        raise HTTPException(status_code=400, detail="Invalid coach_id.")
+    course.coach_id = payload.coach_id
+    db.commit()
+    full = (
+        db.query(Course)
+        .options(
+            joinedload(Course.branch),
+            joinedload(Course.coach),
+            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
+        )
+        .filter(Course.id == course_id)
         .first()
     )
     assert full is not None

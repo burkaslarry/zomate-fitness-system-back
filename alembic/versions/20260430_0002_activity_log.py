@@ -1,8 +1,7 @@
-"""activity log table
-
-Revision ID: 20260430_0002
-Revises: 20260430_0001
-Create Date: 2026-04-30
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Revision: activity log table migration.
 """
 
 from alembic import op

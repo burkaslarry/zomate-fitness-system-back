@@ -1,7 +1,7 @@
-"""Features F004:RenderKeepalive -- async loop GET {PUBLIC_BASE_URL}/api/health with jitter.
-
-RenderKeepalive: Reduces idle spin-down on free/starter tiers; swallow errors, bounded timeout.
-Code: ``keepalive_loop()`` + ``httpx.AsyncClient`` interval from ``Settings``.
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Optional HTTP keepalive loop to reduce cold starts.
 """
 
 from __future__ import annotations

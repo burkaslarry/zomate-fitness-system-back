@@ -1,7 +1,7 @@
-"""Features F005:HongKongClock -- scheduling + "today" in Asia/Hong_Kong for attendance.
-
-HongKongClock: ``now_hk()``, naive UTC interpretation in ``hk_calendar_date`` legacy compat.
-Code: zoneinfo HK; consumed by resolve_checkin + duplicate attendance calendar date.
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Hong Kong calendar helpers: HK, now_hk, hk_calendar_date.
 """
 
 from __future__ import annotations

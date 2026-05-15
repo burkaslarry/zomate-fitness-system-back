@@ -1,3 +1,9 @@
+"""[F007][S005]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Tests for keepalive helper behavior.
+"""
+
 import asyncio
 from unittest.mock import MagicMock, patch
 

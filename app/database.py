@@ -1,13 +1,7 @@
-"""
-SQLAlchemy database session for Zomate Fitness backend.
-
-Connection:
-- DATABASE_URL (Render / eventxp External URL); normalises ``postgres://`` to
-  ``postgresql+psycopg2://`` for SQLAlchemy 2.
-- Optional SSL: DATABASE_SSLMODE, DATABASE_SSL, or host hints (e.g. render.com).
-
-Exports: ``engine``, ``SessionLocal``, ``Base``, ``get_db`` dependency.
-Persistence tables use prefix ``zomate_fs_*`` (see ``models.py``).
+"""[F007][S002]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: SQLAlchemy engine, Base, session factory, get_db dependency.
 """
 
 from dotenv import load_dotenv

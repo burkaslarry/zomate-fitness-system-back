@@ -1,4 +1,8 @@
-"""Disable heavy DB bootstrap during pytest unless integration tests opt in."""
+"""[F007][S005]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Pytest fixtures and shared test configuration.
+"""
 
 from __future__ import annotations
 

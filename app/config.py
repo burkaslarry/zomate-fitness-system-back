@@ -1,8 +1,9 @@
-"""Features F002:TypedSettingsEnv -- pydantic-settings mirrors Render/.env knobs.
-
-TypedSettingsEnv: DATABASE_URL, CORS, keepalive interval/JITTER, PUBLIC_BASE_URL, STRICT mode.
-Code: ``Settings`` class + ``settings`` singleton consumed by lifespan, HTTPX keepalive.
+"""[F007][S004]
+Feature: Backend platform (FastAPI & PostgreSQL)
+Step: (see Logic)
+Logic: Pydantic-settings: DATABASE_URL, CORS, keepalive, logging, uploads.
 """
+
 from __future__ import annotations
 
 import os
