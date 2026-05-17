@@ -16,7 +16,6 @@ from sqlalchemy.orm import Session
 from .database import get_db
 from .models import Student
 from .otp_sms import generate_otp_code, get_otp_provider
-from .pin_util import hash_pin
 from .logutil import log_event
 
 router = APIRouter(prefix="/api/register", tags=["register"])
@@ -121,14 +120,12 @@ def register_profile(body: ProfileBody, db: Session = Depends(get_db)) -> dict:
         student = Student(
             full_name=body.legal_name.strip(),
             phone=phone,
-            hkid_prefix4=body.hkid_prefix4,
             coach_trial_quota_remaining=1,
             disclaimer_accepted=False,
         )
         db.add(student)
     else:
         student.full_name = body.legal_name.strip()
-        student.hkid_prefix4 = body.hkid_prefix4
 
     db.commit()
     db.refresh(student)
@@ -138,19 +135,19 @@ def register_profile(body: ProfileBody, db: Session = Depends(get_db)) -> dict:
 
 @router.post("/pin")
 def register_pin(body: PinBody, db: Session = Depends(get_db)) -> dict:
+    """[F001][S003]
+    Legacy step: app no longer stores an account-level PIN (``pin_code`` / ``pin_hash``).
+    Check-in uses **per-course** PINs from ``CourseEnrollment`` after staff opens a course.
+    """
     _require_verified(body.phone)
     phone = _normalize_phone(body.phone)
     student = db.query(Student).filter(Student.phone == phone).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found; save profile first.")
-    if student.pin_hash:
-        raise HTTPException(status_code=409, detail="PIN already set.")
-
-    student.pin_hash = hash_pin(body.pin)
-    db.add(student)
-    db.commit()
-    db.refresh(student)
 
     _verified_phones.pop(phone, None)
-    log_event("register_pin_set", student_id=student.id)
-    return {"message": "PIN saved.", "student_id": student.id}
+    log_event("register_pin_complete_no_account_pin", student_id=student.id)
+    return {
+        "message": "Registration step complete. Use the class PIN sent after course enrollment to check in.",
+        "student_id": student.id,
+    }

@@ -17,8 +17,6 @@ class StudentOnboardCreate(BaseModel):
     email: str | None = None
     health_notes: str | None = None
     disclaimer_accepted: bool = True
-    # Optional: if omitted, server assigns a random 5-digit PIN (less typing for students).
-    pin_code: str | None = Field(default=None, min_length=4, max_length=10)
 
 
 class TrialPurchaseInput(BaseModel):
@@ -94,7 +92,6 @@ class RenewalCreate(BaseModel):
     applicant_name: str = Field(min_length=1, max_length=120)
     signature: str = Field(min_length=1, max_length=120)
     renewal_date: date
-    pin_code: str | None = Field(default=None, min_length=4, max_length=10)
 
 
 class MemberCreate(BaseModel):
@@ -214,7 +211,6 @@ class StudentOut(BaseModel):
     emergency_contact_phone: str | None = None
     health_notes: str | None = None
     disclaimer_accepted: bool = False
-    pin_code: str = ""
     photo_path: str | None = None
     lesson_balance: int = Field(description="由 zomate_fs_lesson_ledger 加總；ORM Student 無此欄。")
     face_id_external: str | None
@@ -268,6 +264,14 @@ class BranchUpdate(BaseModel):
     active: bool | None = None
 
 
+class CoachEnrolledStudentOut(BaseModel):
+    """學員透過至少一個 ``CourseEnrollment`` 報讀該教練名下課程。"""
+
+    id: int
+    full_name: str
+    phone: str
+
+
 class CoachOut(BaseModel):
     id: int
     full_name: str
@@ -278,6 +282,7 @@ class CoachOut(BaseModel):
     branch_name: str | None = None
     hire_date: date | None = None
     created_at: datetime
+    enrolled_students: list[CoachEnrolledStudentOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -312,7 +317,10 @@ class CourseCreate(BaseModel):
     # Calendar start for the series — defaults to scheduled_start.date() if omitted.
     course_start_date: date | None = None
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
-    total_lessons: int = Field(default=1, ge=1, le=10)
+    total_lessons: int = Field(default=1, ge=1, le=120)
+    # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
+    student_first_session_at: datetime | None = None
+    coach_schedule_note: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def validate_weekdays(self) -> "CourseCreate":

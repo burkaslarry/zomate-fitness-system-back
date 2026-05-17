@@ -68,6 +68,7 @@ from .schemas import (
     BranchOut,
     CheckinInput,
     CoachCreate,
+    CoachEnrolledStudentOut,
     CoachOut,
     CoachTrialGrantBody,
     CoachUpdate,
@@ -581,7 +582,41 @@ def _student_from_trial_class_payload(db: Session, payload: TrialClassCreate) ->
     raise HTTPException(status_code=400, detail="缺少學員識別。")
 
 
-def coach_row_to_out(db: Session, coach: Coach) -> CoachOut:
+def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[int, list[CoachEnrolledStudentOut]]:
+    """[F002][S001]
+    Feature: Course Entry & Automation
+    Step: Admin coach grid — list students enrolled in any course taught by each coach.
+    Logic: Distinct (coach_id, student_id) via ``Course`` × ``CourseEnrollment`` × ``Student``.
+    """
+    if not coach_ids:
+        return {}
+    rows = (
+        db.query(Course.coach_id, Student.id, Student.full_name, Student.phone)
+        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
+        .join(Student, Student.id == CourseEnrollment.student_id)
+        .filter(Course.coach_id.in_(coach_ids))
+        .order_by(Course.coach_id, Student.full_name, Student.id)
+        .all()
+    )
+    seen: dict[int, set[int]] = {}
+    out: dict[int, list[CoachEnrolledStudentOut]] = {}
+    for cid, sid, name, phone in rows:
+        bucket = seen.setdefault(cid, set())
+        if sid in bucket:
+            continue
+        bucket.add(sid)
+        out.setdefault(cid, []).append(
+            CoachEnrolledStudentOut(id=int(sid), full_name=name, phone=phone or "")
+        )
+    return out
+
+
+def coach_row_to_out(
+    db: Session,
+    coach: Coach,
+    *,
+    enrolled_students: list[CoachEnrolledStudentOut] | None = None,
+) -> CoachOut:
     bn: str | None = None
     if coach.branch_id is not None:
         br = db.get(Branch, coach.branch_id)
@@ -597,6 +632,7 @@ def coach_row_to_out(db: Session, coach: Coach) -> CoachOut:
         branch_name=bn,
         hire_date=coach.hire_date,
         created_at=coach.created_at,
+        enrolled_students=list(enrolled_students or ()),
     )
 
 
@@ -619,7 +655,9 @@ def _is_active_member(db: Session, student_id: int) -> bool:
 
 
 def student_to_member_dict(db: Session, student: Student) -> dict:
-    """Member dict: sign-in PINs are **per course enrollment** only (no account-level ``pin_code`` column)."""
+    """[F001][S002]
+    Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
+    """
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
     return {
         "id": student.id,
@@ -629,7 +667,6 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "email": student.email,
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_phone": student.emergency_contact_phone,
-        "pin_code": "",
         "lesson_balance": _lesson_balance_sum(db, student.id),
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
@@ -651,7 +688,6 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
         emergency_contact_phone=student.emergency_contact_phone,
         health_notes=student.health_notes,
         disclaimer_accepted=student.disclaimer_accepted,
-        pin_code="",
         photo_path=student.photo_path,
         lesson_balance=_lesson_balance_sum(db, student.id),
         face_id_external=student.face_id_external,
@@ -661,9 +697,10 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
 
 def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict]:
     rows = (
-        db.query(CourseEnrollment, Course, Branch)
+        db.query(CourseEnrollment, Course, Branch, Coach)
         .join(Course, CourseEnrollment.course_id == Course.id)
         .join(Branch, Course.branch_id == Branch.id)
+        .outerjoin(Coach, Coach.id == Course.coach_id)
         .filter(CourseEnrollment.student_id == student.id)
         .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
         .all()
@@ -673,9 +710,12 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
             "course_id": course.id,
             "course_title": course.title,
             "branch_name": branch.name,
+            "coach_name": (coach.full_name if coach else None) or "—",
+            "scheduled_start": course.scheduled_start.isoformat(),
+            "series_end_date": course.series_end_date.isoformat() if course.series_end_date else None,
             "checkin_pin": enr.checkin_pin,
         }
-        for enr, course, branch in rows
+        for enr, course, branch, coach in rows
     ]
 
 
@@ -920,6 +960,11 @@ def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
 
 
 def enumerate_lesson_dates(start: date, weekdays: list[int], count: int) -> list[date]:
+    """[F009][S001]
+    Feature: Scheduled course & enrollment PINs
+    Step: Expand ``count`` lesson calendar dates from ``start`` honoring weekday set
+    Logic: Scan window scales with ``count`` so e.g. 120 weekly lessons are not truncated by a fixed 800-day cap.
+    """
     if count < 1:
         return []
     wd_set = set(w for w in weekdays if 0 <= w <= 6)
@@ -927,8 +972,10 @@ def enumerate_lesson_dates(start: date, weekdays: list[int], count: int) -> list
         wd_set = {start.weekday()}
     dates: list[date] = []
     d = start
+    # Need enough iterations for ``count`` matches when weekdays are sparse (e.g. 120 Mondays ≈ 840 days).
+    max_days = max(800, count * 14 + 60)
     guard = 0
-    while len(dates) < count and guard < 800:
+    while len(dates) < count and guard < max_days:
         if d.weekday() in wd_set:
             dates.append(d)
             if len(dates) >= count:
@@ -939,13 +986,19 @@ def enumerate_lesson_dates(start: date, weekdays: list[int], count: int) -> list
 
 
 def get_lesson_dates_for_course(course: Course) -> list[date]:
+    """[F009][S002]
+    Feature: Scheduled course & enrollment PINs
+    Step: Expand series dates for ``resolve_checkin_pin_context`` / today-lesson picker
+    Logic: Must match ``Course.total_lessons`` up to API cap (see ``CourseCreate``); old hard cap of 10 broke 40+堂週課。
+    """
     ws = parse_lesson_weekdays_str(course.lesson_weekdays)
     start = course.series_start_date or course.scheduled_start.date()
     try:
         n = int(course.total_lessons)
     except (TypeError, ValueError):
         n = 1
-    n = max(1, min(10, n))
+    # Align with CourseCreate.total_lessons upper bound (packages >10 堂)。
+    n = max(1, min(120, n))
     if n <= 1 and (not getattr(course, "lesson_weekdays", None) or course.lesson_weekdays == "0"):
         return [course.scheduled_start.date()]
     return enumerate_lesson_dates(start, ws, n)
@@ -1441,7 +1494,6 @@ def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> 
         raise HTTPException(status_code=409, detail="Phone already exists.")
 
     data = payload.model_dump()
-    data.pop("pin_code", None)
     student = Student(**data)
     db.add(student)
     db.commit()
@@ -1530,7 +1582,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         )
         db.commit()
         db.refresh(existing)
-        return {"pin_code": "", "membership_expiry_iso": expiry_iso}
+        return {"membership_expiry_iso": expiry_iso}
 
     if payload.form_type == "renewal":
         raise HTTPException(
@@ -1575,7 +1627,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     )
     db.commit()
     db.refresh(student)
-    return {"pin_code": "", "membership_expiry_iso": expiry_iso}
+    return {"membership_expiry_iso": expiry_iso}
 
 
 @app.post("/api/members/duplicate-check")
@@ -1650,7 +1702,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     record_activity(db, student, "member_create", student.id)
     db.commit()
     db.refresh(student)
-    return {"member": student_to_member_dict(db, student), "pin_code": ""}
+    return {"member": student_to_member_dict(db, student)}
 
 
 @app.get("/api/members/search")
@@ -1694,13 +1746,27 @@ def get_member(hkid: str, db: Session = Depends(get_db)) -> dict:
     return student_to_member_dict(db, get_student_by_hkid_or_404(db, hkid))
 
 
-@app.get("/api/members/{hkid}/full")
-def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
-    student = get_student_by_hkid_or_404(db, hkid)
+def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | None = None) -> dict:
+    """[F001][S002] Build student detail payload; route may lookup by id or HKID."""
     receipts = db.query(Receipt).filter(Receipt.student_id == student.id).order_by(Receipt.created_at.desc()).all()
     renewals = db.query(RenewalRecord).filter(RenewalRecord.student_id == student.id).order_by(RenewalRecord.created_at.desc()).all()
     trials = db.query(TrialClass).filter(TrialClass.student_id == student.id).order_by(TrialClass.created_at.desc()).all()
-    logs = db.query(ActivityLog).filter(ActivityLog.member_hkid == (student.hkid or normalize_hkid(hkid))).order_by(ActivityLog.created_at.desc()).limit(100).all()
+    trial_coach_ids = [t.coach_id for t in trials if t.coach_id is not None]
+    trial_branch_ids = [t.branch_id for t in trials if t.branch_id is not None]
+    trial_kind_ids = [t.trial_kind_id for t in trials if t.trial_kind_id is not None]
+    trial_coaches = {c.id: c.full_name for c in db.query(Coach).filter(Coach.id.in_(trial_coach_ids)).all()} if trial_coach_ids else {}
+    trial_branches = {b.id: b.name for b in db.query(Branch).filter(Branch.id.in_(trial_branch_ids)).all()} if trial_branch_ids else {}
+    trial_kinds = {k.id: k.label_zh for k in db.query(TrialClassKind).filter(TrialClassKind.id.in_(trial_kind_ids)).all()} if trial_kind_ids else {}
+    activity_hkid = student.hkid or (normalize_hkid(fallback_hkid) if fallback_hkid else None)
+    logs = (
+        db.query(ActivityLog)
+        .filter(ActivityLog.member_hkid == activity_hkid)
+        .order_by(ActivityLog.created_at.desc())
+        .limit(100)
+        .all()
+        if activity_hkid
+        else []
+    )
     return {
         "profile": student_to_member_dict(db, student),
         "receipts": [
@@ -1723,10 +1789,11 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "coach_id": rr.coach_id,
                 "branch_id": rr.branch_id,
                 "name": f"{rr.lessons} 堂",
+                "lessons": rr.lessons,
                 "coach": rr.coach_name,
                 "payment_method": rr.payment_method,
                 "amount": float(rr.amount) if rr.amount is not None else None,
-                "remaining": _lesson_balance_sum(db, student.id),
+                "renewal_date": rr.renewal_date.isoformat(),
                 "created_at": rr.created_at.isoformat(),
             }
             for rr in renewals
@@ -1736,7 +1803,11 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "id": t.id,
                 "type": t.type,
                 "coach_id": t.coach_id,
+                "coach_name": trial_coaches.get(t.coach_id) if t.coach_id is not None else None,
                 "branch_id": t.branch_id,
+                "branch_name": trial_branches.get(t.branch_id) if t.branch_id is not None else None,
+                "trial_kind_id": t.trial_kind_id,
+                "trial_kind_label_zh": trial_kinds.get(t.trial_kind_id) if t.trial_kind_id is not None else None,
                 "class_date": t.class_date.isoformat(),
                 "note": t.note,
                 "created_at": t.created_at.isoformat(),
@@ -1748,7 +1819,6 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "id": a.id,
                 "type": a.type,
                 "ref_id": a.ref_id,
-                "detail": None,
                 "created_at": a.created_at.isoformat(),
             }
             for a in logs
@@ -1762,15 +1832,52 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "status": ce.status,
                 "total_lessons": ce.total_lessons,
                 "started_at": ce.started_at.isoformat(),
+                "installment_plans": [
+                    {
+                        "id": plan.id,
+                        "total_installments": plan.total_installments,
+                        "status": plan.status,
+                        "created_at": plan.created_at.isoformat(),
+                        "payments": [
+                            {
+                                "id": pay.id,
+                                "installment_no": pay.installment_no,
+                                "amount": float(pay.amount),
+                                "due_date": pay.due_date.isoformat(),
+                                "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
+                                "status": pay.status,
+                            }
+                            for pay in sorted(plan.payments, key=lambda p: p.installment_no)
+                        ],
+                    }
+                    for plan in ce.installment_plans
+                ],
             }
             for ce in (
                 db.query(CategoryEnrollment)
-                .options(joinedload(CategoryEnrollment.course_category))
+                .options(
+                    joinedload(CategoryEnrollment.course_category),
+                    joinedload(CategoryEnrollment.installment_plans).joinedload(InstallmentPlan.payments),
+                )
                 .filter(CategoryEnrollment.student_id == student.id)
                 .all()
             )
         ],
     }
+
+
+@app.get("/api/members/by-id/{student_id}/full")
+def get_member_full_by_id(student_id: int, db: Session = Depends(get_db)) -> dict:
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    return _member_full_payload(db, student)
+
+
+@app.get("/api/members/{hkid}/full")
+def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
+    student = get_student_by_hkid_or_404(db, hkid)
+    return _member_full_payload(db, student, fallback_hkid=hkid)
 
 
 @app.post("/api/members/{hkid}/photo")
@@ -1810,6 +1917,45 @@ def upload_member_receipt(
     db.add(receipt)
     db.flush()
     db.add(AuditLog(action="receipt_upload", student_id=student.id, detail=json.dumps({"receipt_id": receipt.id, "source": receipt.source}, ensure_ascii=False)))
+    record_activity(db, student, "receipt_upload", receipt.id)
+    db.commit()
+    return {"id": receipt.id, "file_path": path, "file_url": _file_url(path)}
+
+
+@app.post("/api/members/by-id/{student_id}/receipts")
+def upload_member_receipt_by_id(
+    student_id: int,
+    file: UploadFile = File(...),
+    amount: float | None = Form(default=None),
+    payment_method: str | None = Form(default=None),
+    note: str | None = Form(default=None),
+    source: str = Form(default="RENEWAL"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """[F004][S002] Admin / clerk receipt upload from ID-based student detail route."""
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    key = student.hkid or f"student-{student.id}"
+    path = _save_upload_file(file, "receipts", key, 5 * 1024 * 1024)
+    receipt = Receipt(
+        student_id=student.id,
+        member_hkid=student.hkid or f"ID{student.id}",
+        file_path=path,
+        amount=amount,
+        payment_method=(payment_method or "").strip() or None,
+        note=(note or "").strip() or None,
+        source=source if source in {"REGISTER", "RENEWAL"} else "RENEWAL",
+    )
+    db.add(receipt)
+    db.flush()
+    db.add(
+        AuditLog(
+            action="receipt_upload",
+            student_id=student.id,
+            detail=json.dumps({"receipt_id": receipt.id, "source": receipt.source}, ensure_ascii=False),
+        )
+    )
     record_activity(db, student, "receipt_upload", receipt.id)
     db.commit()
     return {"id": receipt.id, "file_path": path, "file_url": _file_url(path)}
@@ -2892,7 +3038,8 @@ def list_coaches(
         else:
             query = query.filter(Coach.full_name.ilike(pattern))
     coaches = query.order_by(Coach.id).all()
-    return [coach_row_to_out(db, c) for c in coaches]
+    en_by_coach = _enrolled_students_for_coaches(db, [c.id for c in coaches])
+    return [coach_row_to_out(db, c, enrolled_students=en_by_coach.get(c.id, [])) for c in coaches]
 
 
 @app.post("/api/admin/coaches", response_model=CoachOut)
@@ -2914,7 +3061,8 @@ def create_coach(
     db.add(c)
     db.commit()
     db.refresh(c)
-    return coach_row_to_out(db, c)
+    en_map = _enrolled_students_for_coaches(db, [c.id])
+    return coach_row_to_out(db, c, enrolled_students=en_map.get(c.id, []))
 
 
 @app.patch("/api/admin/coaches/{coach_id}", response_model=CoachOut)
@@ -2964,7 +3112,8 @@ def update_coach(
 
     db.commit()
     db.refresh(coach)
-    return coach_row_to_out(db, coach)
+    en_map = _enrolled_students_for_coaches(db, [coach.id])
+    return coach_row_to_out(db, coach, enrolled_students=en_map.get(coach.id, []))
 
 
 @app.get("/api/admin/coaches/export.csv")
@@ -3055,7 +3204,6 @@ def export_students_csv(
             "email",
             "health_notes",
             "disclaimer_accepted",
-            "pin_code",
             "lesson_balance",
             "face_id_external",
             "created_at",
@@ -3075,7 +3223,6 @@ def export_students_csv(
                 s.email or "",
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
-                "",
                 _lesson_balance_sum(db, s.id),
                 s.face_id_external or "",
                 s.created_at.isoformat(),
@@ -3662,6 +3809,9 @@ def admin_create_course(
     db.flush()
 
     branch = course.branch
+    first_for_coach_notice: Student | None = None
+    enrolled_names: list[str] = []
+
     for sid in payload.student_ids:
         student = db.query(Student).filter(Student.id == sid).first()
         if not student:
@@ -3681,6 +3831,9 @@ def admin_create_course(
         db.add(
             CourseEnrollment(course_id=course.id, student_id=student.id, checkin_pin=pin)
         )
+        enrolled_names.append(student.full_name)
+        if first_for_coach_notice is None:
+            first_for_coach_notice = student
         pkg_sessions = payload.total_lessons
         if pkg_sessions > 0:
             apply_lesson_ledger_delta(
@@ -3698,6 +3851,24 @@ def admin_create_course(
             f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {bal_msg} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
+
+    if first_for_coach_notice is not None:
+        # [F002][S003] Coach WhatsApp log — baseline + optional agreed first session + confirm with students.
+        note_trim = (payload.coach_schedule_note or "").strip()
+        lines = [
+            f"【後台開課】{payload.title} · {branch.name}",
+            f"教練 {coach.full_name}：學員「{'、'.join(enrolled_names)}」已編入此課程。",
+            f"系統首課基準時段：{first_start.strftime('%Y-%m-%d %H:%M')}（請務必同學員核實實際到店／首堂時間）。",
+        ]
+        if payload.student_first_session_at is not None:
+            lines.append(
+                "櫃台記錄與學員約定首課："
+                f"{payload.student_first_session_at.strftime('%Y-%m-%d %H:%M')}。"
+            )
+        if note_trim:
+            lines.append(f"備註：{note_trim}")
+        lines.append("請主動約學員確認第一堂時間、地點及準備事項。")
+        log_whatsapp(db, first_for_coach_notice, coach.phone, "\n".join(lines))
 
     db.commit()
     db.refresh(course)
