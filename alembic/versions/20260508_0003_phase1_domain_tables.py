@@ -13,9 +13,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS pin_hash VARCHAR(128) NULL")
-    op.execute("ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS hkid_prefix4 VARCHAR(4) NULL")
-
+    
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS zomate_fs_course_categories (

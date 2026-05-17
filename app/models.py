@@ -99,11 +99,8 @@ class Student(Base):
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    pin_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    hkid_prefix4: Mapped[str | None] = mapped_column(String(4), nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
-    lesson_balance: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

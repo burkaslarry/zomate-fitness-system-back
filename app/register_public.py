@@ -71,8 +71,10 @@ def _mock_code() -> str | None:
 @router.post("/otp/request")
 def register_otp_request(body: OtpRequestBody, db: Session = Depends(get_db)) -> dict:
     phone = _normalize_phone(body.phone)
-    student = db.query(Student).filter(Student.phone == phone).first()
-    if student and student.pin_hash:
+    # [F001][S001] Block registration OTP if phone already exists on zomate_fs_students.
+    existing = db.query(Student).filter(Student.phone == phone).first()
+    if existing is not None:
+        log_event("register_otp_blocked_duplicate_phone", phone_suffix=phone[-4:])
         raise HTTPException(status_code=409, detail="Phone already registered.")
 
     code = _mock_code() or generate_otp_code()
@@ -120,7 +122,6 @@ def register_profile(body: ProfileBody, db: Session = Depends(get_db)) -> dict:
             full_name=body.legal_name.strip(),
             phone=phone,
             hkid_prefix4=body.hkid_prefix4,
-            lesson_balance=0,
             coach_trial_quota_remaining=1,
             disclaimer_accepted=False,
         )

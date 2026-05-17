@@ -216,7 +216,7 @@ class StudentOut(BaseModel):
     disclaimer_accepted: bool = False
     pin_code: str = ""
     photo_path: str | None = None
-    lesson_balance: int
+    lesson_balance: int = Field(description="由 zomate_fs_lesson_ledger 加總；ORM Student 無此欄。")
     face_id_external: str | None
     created_at: datetime
 

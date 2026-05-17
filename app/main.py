@@ -630,13 +630,33 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_phone": student.emergency_contact_phone,
         "pin_code": "",
-        "lesson_balance": student.lesson_balance,
+        "lesson_balance": _lesson_balance_sum(db, student.id),
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
         "is_active": _is_active_member(db, student.id),
         "created_at": student.created_at.isoformat(),
     }
+
+
+def student_to_student_out(db: Session, student: Student) -> StudentOut:
+    """[F007][S002] API model includes ``lesson_balance`` computed from ``zomate_fs_lesson_ledger`` (not a table column)."""
+    return StudentOut(
+        id=student.id,
+        full_name=student.full_name,
+        hkid=student.hkid,
+        phone=student.phone,
+        email=student.email,
+        emergency_contact_name=student.emergency_contact_name,
+        emergency_contact_phone=student.emergency_contact_phone,
+        health_notes=student.health_notes,
+        disclaimer_accepted=student.disclaimer_accepted,
+        pin_code="",
+        photo_path=student.photo_path,
+        lesson_balance=_lesson_balance_sum(db, student.id),
+        face_id_external=student.face_id_external,
+        created_at=student.created_at,
+    )
 
 
 def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict]:
@@ -1039,6 +1059,49 @@ def course_to_out(course: Course) -> CourseOut:
     )
 
 
+def _lesson_balance_sum(db: Session, student_id: int) -> int:
+    """[F007][S002]
+    Feature: Lesson ledger (Phase-1)
+    Step: Balance query
+    Logic: 學員剩餘堂數 = ``SUM(zomate_fs_lesson_ledger.delta_lessons)``；唔再讀 ``students.lesson_balance`` 欄位。
+    """
+    total = db.scalar(
+        select(func.coalesce(func.sum(LessonLedgerEntry.delta_lessons), 0)).where(
+            LessonLedgerEntry.student_id == student_id,
+        ),
+    )
+    return int(total or 0)
+
+
+def apply_lesson_ledger_delta(
+    db: Session,
+    student: Student,
+    delta_lessons: int,
+    reason: str,
+    *,
+    enrollment_id: int | None = None,
+    created_by_role: str = "system",
+) -> int:
+    """[F007][S002]
+    Feature: Lesson ledger (Phase-1)
+    Step: Credit / debit posting
+    Logic: 寫入一筆 ledger 後；回傳該學員 SUM(ledger)（冇 denormalized 欄位）。
+    """
+    if delta_lessons == 0:
+        return _lesson_balance_sum(db, student.id)
+    db.add(
+        LessonLedgerEntry(
+            student_id=student.id,
+            enrollment_id=enrollment_id,
+            delta_lessons=delta_lessons,
+            reason=reason,
+            created_by_role=created_by_role,
+        )
+    )
+    db.flush()
+    return _lesson_balance_sum(db, student.id)
+
+
 async def perform_lesson_checkin(
     db: Session,
     student: Student,
@@ -1049,7 +1112,7 @@ async def perform_lesson_checkin(
     notified_coach: Coach | None = None,
     pin_resolution: str = "unknown",
 ) -> dict:
-    if student.lesson_balance <= 0:
+    if _lesson_balance_sum(db, student.id) <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
     attended_at = datetime.utcnow()
@@ -1068,16 +1131,7 @@ async def perform_lesson_checkin(
         if dup:
             raise HTTPException(status_code=409, detail="Already checked in for this session today.")
 
-    student.lesson_balance -= 1
-    db.add(
-        LessonLedgerEntry(
-            student_id=student.id,
-            enrollment_id=None,
-            delta_lessons=-1,
-            reason="checkin_redeem",
-            created_by_role="student",
-        )
-    )
+    bal_after = apply_lesson_ledger_delta(db, student, -1, "checkin_redeem", created_by_role="student")
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
     db.flush()
@@ -1099,7 +1153,7 @@ async def perform_lesson_checkin(
         db,
         student,
         student.phone,
-        f"上堂通知：{student.full_name} 已簽到，剩餘堂數 {student.lesson_balance}。",
+        f"上堂通知：{student.full_name} 已簽到，剩餘堂數 {bal_after}。",
     )
     coach_msg = f"教練通知：學生 {student.full_name} 已簽到。"
     if notified_coach:
@@ -1110,7 +1164,7 @@ async def perform_lesson_checkin(
     detail_obj: dict = {
         "channel": channel,
         "pin_resolution": pin_resolution,
-        "lesson_balance_after": student.lesson_balance,
+        "lesson_balance_after": bal_after,
         "checkin_id": checkin_log.id,
         "course_title": resolved_course.title if resolved_course else None,
         "notified_coach_phone": notified_coach.phone if notified_coach else None,
@@ -1135,9 +1189,7 @@ async def perform_lesson_checkin(
         "student_id": student.id,
         "student_name": student.full_name,
         "student_phone": student.phone,
-        "lesson_balance": student.lesson_balance,
-        "channel": channel,
-        "created_at": checkin_log.created_at.isoformat(),
+        "lesson_balance": bal_after,
         # Coach calendar UX：前台用 course_id／session_calendar_date 標記「已簽到扣堂」之課程格。
         "course_id": resolved_course.id if resolved_course else None,
         "session_calendar_date": session_day.isoformat() if resolved_course else None,
@@ -1151,7 +1203,7 @@ async def perform_lesson_checkin(
             "id": student.id,
             "full_name": student.full_name,
             "phone": student.phone,
-            "lesson_balance": student.lesson_balance,
+            "lesson_balance": bal_after,
             "channel": channel,
         },
         "notified_coach": (
@@ -1308,7 +1360,7 @@ def public_student_search(q: str = "", db: Session = Depends(get_db)) -> list[di
             "id": s.id,
             "full_name": s.full_name,
             "phone": s.phone,
-            "lesson_balance": s.lesson_balance,
+            "lesson_balance": _lesson_balance_sum(db, s.id),
         }
         for s in rows
     ]
@@ -1394,7 +1446,7 @@ def onboarding(payload: StudentOnboardCreate, db: Session = Depends(get_db)) -> 
     db.add(student)
     db.commit()
     db.refresh(student)
-    return student
+    return student_to_student_out(db, student)
 
 
 @app.post("/api/v1/students/register")
@@ -1456,7 +1508,13 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
-        existing.lesson_balance = int(existing.lesson_balance) + int(payload.package_sessions)
+        apply_lesson_ledger_delta(
+            db,
+            existing,
+            int(payload.package_sessions),
+            "register_v1_renewal",
+            created_by_role="onboarding",
+        )
         db.add(
             AuditLog(
                 action="register_student_v1_renewal",
@@ -1468,7 +1526,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
             db,
             existing,
             phone_raw,
-            f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {existing.lesson_balance} 堂。",
+            f"續會登記已收到：已加 {payload.package_sessions} 堂，現有餘額 {_lesson_balance_sum(db, existing.id)} 堂。",
         )
         db.commit()
         db.refresh(existing)
@@ -1489,10 +1547,16 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         emergency_contact_phone=emergency_contact_phone,
         health_notes=_register_v1_health_notes(payload),
         disclaimer_accepted=True,
-        lesson_balance=int(payload.package_sessions),
     )
     db.add(student)
     db.flush()
+    apply_lesson_ledger_delta(
+        db,
+        student,
+        int(payload.package_sessions),
+        "register_v1_new",
+        created_by_role="onboarding",
+    )
     db.add(
         AuditLog(
             action="register_student_v1",
@@ -1579,7 +1643,6 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
         emergency_contact_phone=eco_raw,
         health_notes=notes,
         disclaimer_accepted=True,
-        lesson_balance=0,
     )
     db.add(student)
     db.flush()
@@ -1663,7 +1726,7 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
                 "coach": rr.coach_name,
                 "payment_method": rr.payment_method,
                 "amount": float(rr.amount) if rr.amount is not None else None,
-                "remaining": student.lesson_balance,
+                "remaining": _lesson_balance_sum(db, student.id),
                 "created_at": rr.created_at.isoformat(),
             }
             for rr in renewals
@@ -1809,7 +1872,13 @@ def create_renewal_multipart(
         )
         db.add(receipt_row)
         db.flush()
-    student.lesson_balance += int(package.sessions)
+    apply_lesson_ledger_delta(
+        db,
+        student,
+        int(package.sessions),
+        "renewal_package",
+        created_by_role="renewal",
+    )
     renewal_row = RenewalRecord(
         student_id=student.id,
         student_name=student.full_name,
@@ -1869,7 +1938,7 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
     if student.full_name.strip() != full_name:
         raise HTTPException(status_code=400, detail="Name does not match the selected student.")
 
-    student.lesson_balance += int(payload.lessons)
+    bal_after = apply_lesson_ledger_delta(db, student, int(payload.lessons), "renewal_package", created_by_role="renewal")
     renewal_record = RenewalRecord(
         student_id=student.id,
         student_name=full_name,
@@ -1893,7 +1962,7 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
         "payment_method": payment_method,
         "coach_name": coach_name,
         "renewal_date": payload.renewal_date.isoformat(),
-        "lesson_balance_after": student.lesson_balance,
+        "lesson_balance_after": bal_after,
     }
     db.add(
         AuditLog(
@@ -1906,7 +1975,7 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
         db,
         student,
         student.phone,
-        f"續會已確認：已加入 {payload.lessons} 堂，現有餘額 {student.lesson_balance} 堂。",
+        f"續會已確認：已加入 {payload.lessons} 堂，現有餘額 {bal_after} 堂。",
     )
 
     db.commit()
@@ -1918,7 +1987,7 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
             "id": student.id,
             "full_name": student.full_name,
             "phone": student.phone,
-            "lesson_balance": student.lesson_balance,
+            "lesson_balance": bal_after,
         },
         "renewal": {
             "id": renewal_record.id,
@@ -2004,7 +2073,7 @@ def auth_logout(
 # [F002][S001]
 # Feature: Course Entry & Automation
 # Step: Trial course / credit top-up
-# Logic: Increment lesson_balance on existing student; log WhatsApp-style notification.
+# Logic: Credits via lesson ledger; API still returns ``lesson_balance`` as SUM(ledger); WhatsApp hook.
 
 
 @app.post("/api/trial-purchase")
@@ -2015,16 +2084,22 @@ def trial_purchase(payload: TrialPurchaseInput, db: Session = Depends(get_db)) -
     if _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
 
-    student.lesson_balance += payload.credits
+    bal = apply_lesson_ledger_delta(
+        db,
+        student,
+        payload.credits,
+        "trial_purchase",
+        created_by_role="trial_purchase",
+    )
     log_whatsapp(
         db,
         student,
         student.phone,
-        f"Congrats! 你已有 {student.lesson_balance} 堂課餘額。",
+        f"Congrats! 你已有 {bal} 堂課餘額。",
     )
     db.commit()
     db.refresh(student)
-    return {"message": "Credits added", "lesson_balance": student.lesson_balance}
+    return {"message": "Credits added", "lesson_balance": bal}
 
 
 # [F003][S001]
@@ -2318,10 +2393,16 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
     total_checkins = db.query(func.count(CheckinLog.id)).scalar() or 0
     total_messages = db.query(func.count(WhatsAppLog.id)).scalar() or 0
     audit_rows = db.query(func.count(AuditLog.id)).scalar() or 0
+    ledger_positive = (
+        select(LessonLedgerEntry.student_id.label("sid"))
+        .group_by(LessonLedgerEntry.student_id)
+        .having(func.coalesce(func.sum(LessonLedgerEntry.delta_lessons), 0) > 0)
+        .subquery()
+    )
     active_students = (
         db.query(func.count(Student.id))
+        .join(ledger_positive, ledger_positive.c.sid == Student.id)
         .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
-        .filter(Student.lesson_balance > 0)
         .scalar()
         or 0
     )
@@ -2475,18 +2556,20 @@ def admin_upsert_category_enrollment(
         delta = payload.total_lessons - existing.total_lessons
         if delta != 0:
             existing.total_lessons = payload.total_lessons
-            student.lesson_balance += delta
-            db.add(
-                LessonLedgerEntry(
-                    student_id=student.id,
-                    enrollment_id=existing.id,
-                    delta_lessons=delta,
-                    reason="admin_category_lesson_adjust",
-                    created_by_role=role,
-                )
+            apply_lesson_ledger_delta(
+                db,
+                student,
+                delta,
+                "admin_category_lesson_adjust",
+                enrollment_id=existing.id,
+                created_by_role=role,
             )
         db.commit()
-        return {"enrollment_id": existing.id, "total_lessons": existing.total_lessons, "lesson_balance": student.lesson_balance}
+        return {
+            "enrollment_id": existing.id,
+            "total_lessons": existing.total_lessons,
+            "lesson_balance": _lesson_balance_sum(db, student.id),
+        }
 
     enr = CategoryEnrollment(
         student_id=student_id,
@@ -2499,15 +2582,13 @@ def admin_upsert_category_enrollment(
     db.add(enr)
     db.flush()
     _installment_plan_seed_rows(db, enr.id, payload.total_installments)
-    student.lesson_balance += payload.total_lessons
-    db.add(
-        LessonLedgerEntry(
-            student_id=student.id,
-            enrollment_id=enr.id,
-            delta_lessons=payload.total_lessons,
-            reason="admin_category_enrollment",
-            created_by_role=role,
-        )
+    apply_lesson_ledger_delta(
+        db,
+        student,
+        payload.total_lessons,
+        "admin_category_enrollment",
+        enrollment_id=enr.id,
+        created_by_role=role,
     )
     db.add(
         AuditLog(
@@ -2521,7 +2602,11 @@ def admin_upsert_category_enrollment(
     )
     db.commit()
     db.refresh(enr)
-    return {"enrollment_id": enr.id, "total_lessons": enr.total_lessons, "lesson_balance": student.lesson_balance}
+    return {
+        "enrollment_id": enr.id,
+        "total_lessons": enr.total_lessons,
+        "lesson_balance": _lesson_balance_sum(db, student.id),
+    }
 
 
 @app.post("/api/admin/students/{student_id}/coach-trial-grant")
@@ -2538,7 +2623,6 @@ def admin_grant_coach_trial_quota(
     if int(q) < 1:
         raise HTTPException(status_code=409, detail="Coach trial quota already used for this student.")
     student.coach_trial_quota_remaining = int(q) - 1
-    student.lesson_balance += 1
     hk = (student.hkid or "").strip() or student.phone
     trial = TrialClass(
         student_id=student.id,
@@ -2550,14 +2634,12 @@ def admin_grant_coach_trial_quota(
         note="教練／後台試堂額度（每學生 1 次）",
     )
     db.add(trial)
-    db.add(
-        LessonLedgerEntry(
-            student_id=student.id,
-            enrollment_id=None,
-            delta_lessons=1,
-            reason="coach_trial_quota",
-            created_by_role=user.role.lower(),
-        )
+    apply_lesson_ledger_delta(
+        db,
+        student,
+        1,
+        "coach_trial_quota",
+        created_by_role=user.role.lower(),
     )
     db.flush()
     db.add(
@@ -2571,7 +2653,10 @@ def admin_grant_coach_trial_quota(
     db.commit()
     db.refresh(student)
     log_event("coach_trial_granted", student_id=student_id)
-    return {"lesson_balance": student.lesson_balance, "coach_trial_quota_remaining": student.coach_trial_quota_remaining}
+    return {
+        "lesson_balance": _lesson_balance_sum(db, student.id),
+        "coach_trial_quota_remaining": student.coach_trial_quota_remaining,
+    }
 
 
 @app.get("/api/admin/whatsapp-logs")
@@ -2991,7 +3076,7 @@ def export_students_csv(
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
                 "",
-                s.lesson_balance,
+                _lesson_balance_sum(db, s.id),
                 s.face_id_external or "",
                 s.created_at.isoformat(),
             ]
@@ -3059,7 +3144,19 @@ def import_students_csv(
             existing.email = email
             existing.health_notes = health_notes
             existing.disclaimer_accepted = disc
-            existing.lesson_balance = balance
+            ledger_sum = _lesson_balance_sum(db, existing.id)
+            adj = int(balance) - ledger_sum
+            if adj != 0:
+                db.add(
+                    LessonLedgerEntry(
+                        student_id=existing.id,
+                        enrollment_id=None,
+                        delta_lessons=adj,
+                        reason="admin_csv_import",
+                        created_by_role=user.role.lower(),
+                    )
+                )
+                db.flush()
             existing.face_id_external = face
             if local_eight:
                 existing.phone = f"+852{local_eight}"
@@ -3077,18 +3174,28 @@ def import_students_csv(
                 skipped += 1
                 continue
 
-        db.add(
-            Student(
-                full_name=full_name,
-                phone=canonical,
-                hkid=hkid_norm,
-                email=email,
-                health_notes=health_notes,
-                disclaimer_accepted=disc,
-                lesson_balance=balance,
-                face_id_external=face,
-            )
+        st = Student(
+            full_name=full_name,
+            phone=canonical,
+            hkid=hkid_norm,
+            email=email,
+            health_notes=health_notes,
+            disclaimer_accepted=disc,
+            face_id_external=face,
         )
+        db.add(st)
+        db.flush()
+        if balance != 0:
+            db.add(
+                LessonLedgerEntry(
+                    student_id=st.id,
+                    enrollment_id=None,
+                    delta_lessons=balance,
+                    reason="admin_csv_import_new",
+                    created_by_role=user.role.lower(),
+                )
+            )
+            db.flush()
         added += 1
 
     db.commit()
@@ -3576,12 +3683,19 @@ def admin_create_course(
         )
         pkg_sessions = payload.total_lessons
         if pkg_sessions > 0:
-            student.lesson_balance += pkg_sessions
+            apply_lesson_ledger_delta(
+                db,
+                student,
+                pkg_sessions,
+                "course_open_package",
+                created_by_role=user.role.lower(),
+            )
+        bal_msg = _lesson_balance_sum(db, student.id)
         msg = (
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
             f" 你嘅課堂簽到 PIN：{pin}（每個課程一個 PIN，請用此 PIN 簽到）。"
-            f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {student.lesson_balance} 堂。"
+            f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {bal_msg} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
 
