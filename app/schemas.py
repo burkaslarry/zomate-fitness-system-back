@@ -317,7 +317,9 @@ class CourseCreate(BaseModel):
     # Calendar start for the series — defaults to scheduled_start.date() if omitted.
     course_start_date: date | None = None
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
-    total_lessons: int = Field(default=1, ge=1, le=120)
+    total_lessons: int = Field(default=1, ge=1, le=30)
+    # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
+    total_installments: int = Field(default=1, ge=1, le=5)
     # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
     student_first_session_at: datetime | None = None
     coach_schedule_note: str | None = Field(default=None, max_length=500)
@@ -334,6 +336,12 @@ class CourseCreate(BaseModel):
         object.__setattr__(self, "lesson_weekdays", u)
         return self
 
+    @model_validator(mode="after")
+    def validate_installments_vs_lessons(self) -> "CourseCreate":
+        if self.total_installments > self.total_lessons:
+            raise ValueError("total_installments cannot exceed total_lessons.")
+        return self
+
 
 class CourseReschedule(BaseModel):
     scheduled_start: datetime
@@ -346,11 +354,27 @@ class CourseAssignCoach(BaseModel):
     coach_id: int = Field(ge=1)
 
 
+class InstallmentSegmentPinOut(BaseModel):
+    installment_no: int = Field(ge=1)
+    lesson_from: int = Field(ge=1)
+    lesson_to: int = Field(ge=1)
+    pin: str = Field(min_length=1, max_length=8)
+    paid: bool = True
+
+
+class CourseInstallmentMarkPaid(BaseModel):
+    """Staff marks one scheduled-package installment segment as collected — unlocks that tranche PIN for check-in."""
+
+    student_id: int = Field(ge=1)
+    installment_no: int = Field(ge=1, le=5)
+
+
 class CourseEnrollmentOut(BaseModel):
     student_id: int
     student_name: str
     student_phone: str
     checkin_pin: str
+    installment_segments: list[InstallmentSegmentPinOut] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

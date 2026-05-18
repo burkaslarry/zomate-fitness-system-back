@@ -15,6 +15,7 @@ import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -76,8 +77,10 @@ from .schemas import (
     CourseAssignCoach,
     CourseCreate,
     CourseEnrollmentOut,
+    CourseInstallmentMarkPaid,
     CourseOut,
     CourseReschedule,
+    InstallmentSegmentPinOut,
     FaceIdCheckinInput,
     LoginInput,
     LoginSession,
@@ -428,34 +431,145 @@ def log_whatsapp(db: Session, student: Student, recipient: str, message: str) ->
     db.add(log)
 
 
+# TODO [F005][S003]
+# Feature: Balance Sync & Integrations
+# Step: WhatsApp balance / renewal reminder
+# Logic: Add a scheduled reminder job for low remaining paid lessons and upcoming
+#        installment due dates. Do not remind for unpaid future PIN tranches until
+#        staff marks that installment `paid`; use an idempotency key such as
+#        student_id + course_id + reminder_type + HK business date.
+
+
 # [F009][S002]
 # Feature: Scheduled course & enrollment PINs
 # Step: Allocate ``checkin_pin`` unique on this course (no two students share) and
 #       unique per student across all enrollments so PIN resolution is unambiguous.
-def allocate_enrollment_pin(db: Session, course_id: int, student_id: int) -> str:
-    for _ in range(120):
+def allocate_enrollment_pin(
+    db: Session,
+    course_id: int,
+    student_id: int,
+    *,
+    avoid_pins: frozenset[str] | None = None,
+) -> str:
+    """Allocate a PIN unique among this course, this student's rows, and any ``avoid_pins`` (same txn, pre-insert)."""
+    reserved = frozenset(avoid_pins or ())
+    peers_course = db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course_id).all()
+    peers_student = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == student_id).all()
+    for _ in range(200):
         pin = f"{secrets.randbelow(90000) + 10000}"
-        taken_course = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.course_id == course_id,
-                CourseEnrollment.checkin_pin == pin,
-            )
-            .first()
-        )
-        if taken_course:
+        if pin in reserved:
             continue
-        taken_student = (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.student_id == student_id,
-                CourseEnrollment.checkin_pin == pin,
-            )
-            .first()
-        )
-        if not taken_student:
-            return pin
+        if any(_enrollment_matches_class_pin(e, pin) for e in peers_course):
+            continue
+        if any(_enrollment_matches_class_pin(e, pin) for e in peers_student):
+            continue
+        return pin
     raise HTTPException(status_code=500, detail="Could not allocate class PIN.")
+
+
+def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[int, int]]:
+    """Inclusive 1-based lesson indices per installment (split remainder across first tranches)."""
+    tl = max(1, total_lessons)
+    n = max(1, min(5, n_segments))
+    if n == 1:
+        return [(1, tl)]
+    remainder = tl % n
+    base = tl // n
+    sizes = [base + (1 if i < remainder else 0) for i in range(n)]
+    out: list[tuple[int, int]] = []
+    cur = 1
+    for sz in sizes:
+        out.append((cur, cur + sz - 1))
+        cur += sz
+    return out
+
+
+def _parse_segment_pins_json(raw: str | None) -> list[InstallmentSegmentPinOut]:
+    """[F002][S001] Deserialize ``CourseEnrollment.segment_pins_json`` for API responses."""
+    if not raw:
+        return []
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    out: list[InstallmentSegmentPinOut] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            ino = int(row["installment_no"])
+            pr = row.get("paid")
+            if pr is None:
+                paid_bool = ino <= 1
+            else:
+                paid_bool = bool(pr)
+            out.append(
+                InstallmentSegmentPinOut(
+                    installment_no=ino,
+                    lesson_from=int(row["lesson_from"]),
+                    lesson_to=int(row["lesson_to"]),
+                    pin=str(row["pin"]).strip(),
+                    paid=paid_bool,
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _enrollment_matches_class_pin(enr: CourseEnrollment, pin: str) -> bool:
+    """True if ``pin`` matches primary enrollment PIN or any installment-segment PIN."""
+    p = pin.strip()
+    if enr.checkin_pin == p:
+        return True
+    raw = getattr(enr, "segment_pins_json", None)
+    if not raw:
+        return False
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(rows, list):
+        return False
+    for row in rows:
+        if isinstance(row, dict) and str(row.get("pin", "")).strip() == p:
+            return True
+    return False
+
+
+def _segment_paid_for_matched_pin(enr: CourseEnrollment, pin: str) -> bool:
+    """[F003][S002]
+    Segment PIN must belong to an installment marked paid (except legacy rows: missing paid → installment 1 only).
+    Logic: Scheduled package multi-PIN gated until staff marks installments collected via PATCH.
+    """
+    p = pin.strip()
+    raw = getattr(enr, "segment_pins_json", None)
+    if not raw:
+        return True
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return True
+    if not isinstance(rows, list) or len(rows) == 0:
+        return True
+
+    seg: dict | None = None
+    for row in rows:
+        if isinstance(row, dict) and str(row.get("pin", "")).strip() == p:
+            seg = row
+            break
+    if seg is None and enr.checkin_pin == p:
+        seg = next((r for r in rows if isinstance(r, dict) and int(r.get("installment_no") or 0) == 1), None)
+    if seg is None or not isinstance(seg, dict):
+        return False
+
+    ino = int(seg.get("installment_no") or 0)
+    pr = seg.get("paid")
+    if pr is None:
+        return ino <= 1
+    return bool(pr)
 
 
 def _add_calendar_months(d: date, months: int) -> date:
@@ -714,6 +828,7 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
             "scheduled_start": course.scheduled_start.isoformat(),
             "series_end_date": course.series_end_date.isoformat() if course.series_end_date else None,
             "checkin_pin": enr.checkin_pin,
+            "installment_segments": [s.model_dump() for s in _parse_segment_pins_json(enr.segment_pins_json)],
         }
         for enr, course, branch, coach in rows
     ]
@@ -989,7 +1104,7 @@ def get_lesson_dates_for_course(course: Course) -> list[date]:
     """[F009][S002]
     Feature: Scheduled course & enrollment PINs
     Step: Expand series dates for ``resolve_checkin_pin_context`` / today-lesson picker
-    Logic: Must match ``Course.total_lessons`` up to API cap (see ``CourseCreate``); old hard cap of 10 broke 40+堂週課。
+    Logic: Align with CourseCreate.total_lessons upper bound (currently 30 for scheduled packages).
     """
     ws = parse_lesson_weekdays_str(course.lesson_weekdays)
     start = course.series_start_date or course.scheduled_start.date()
@@ -997,8 +1112,8 @@ def get_lesson_dates_for_course(course: Course) -> list[date]:
         n = int(course.total_lessons)
     except (TypeError, ValueError):
         n = 1
-    # Align with CourseCreate.total_lessons upper bound (packages >10 堂)。
-    n = max(1, min(120, n))
+    # Align with CourseCreate.total_lessons upper bound (scheduled packages).
+    n = max(1, min(30, n))
     if n <= 1 and (not getattr(course, "lesson_weekdays", None) or course.lesson_weekdays == "0"):
         return [course.scheduled_start.date()]
     return enumerate_lesson_dates(start, ws, n)
@@ -1053,21 +1168,25 @@ def resolve_today_primary_course_for_student(
 
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
-) -> tuple[Course | None, Coach | None, str] | None:
-    """Class PIN → that course's coach only when today's date matches a scheduled lesson day."""
+) -> tuple[Course, Coach, str] | Literal["blocked_installment_unpaid"] | None:
+    """Class PIN → that course when paid segment allows check-in & today is a lesson day."""
     pin = pin.strip()
     now = now_hk()
-    enr = (
+    enrs = (
         db.query(CourseEnrollment)
         .options(
             joinedload(CourseEnrollment.course).joinedload(Course.coach),
         )
-        .filter(CourseEnrollment.student_id == student.id, CourseEnrollment.checkin_pin == pin)
+        .filter(CourseEnrollment.student_id == student.id)
         .filter(~CourseEnrollment.course_id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
         .order_by(CourseEnrollment.id.asc())
-        .first()
+        .all()
     )
-    if enr:
+    for enr in enrs:
+        if not _enrollment_matches_class_pin(enr, pin):
+            continue
+        if not _segment_paid_for_matched_pin(enr, pin):
+            return "blocked_installment_unpaid"
         c = enr.course
         if now.date() in get_lesson_dates_for_course(c):
             return c, c.coach, "class_pin"
@@ -1081,12 +1200,14 @@ def course_to_out(course: Course) -> CourseOut:
     enrollments: list[CourseEnrollmentOut] = []
     for e in course.enrollments:
         st = e.student
+        segs = _parse_segment_pins_json(getattr(e, "segment_pins_json", None))
         enrollments.append(
             CourseEnrollmentOut(
                 student_id=st.id,
                 student_name=st.full_name,
                 student_phone=st.phone,
                 checkin_pin=e.checkin_pin,
+                installment_segments=segs,
             )
         )
     ws = parse_lesson_weekdays_str(getattr(course, "lesson_weekdays", None))
@@ -2265,6 +2386,11 @@ async def checkin(payload: CheckinInput, db: Session = Depends(get_db)) -> dict:
     if not student:
         raise HTTPException(status_code=404, detail="Student not found.")
     ctx = resolve_checkin_pin_context(db, student, payload.pin_code)
+    if ctx == "blocked_installment_unpaid":
+        raise HTTPException(
+            status_code=403,
+            detail="此方分期 PIN 尚未啟用 — 請先完成該期付款或由櫃台標記已找數後再試。",
+        )
     if ctx is None:
         raise HTTPException(status_code=400, detail="Invalid PIN.")
     course, coach, pin_kind = ctx
@@ -3811,6 +3937,8 @@ def admin_create_course(
     branch = course.branch
     first_for_coach_notice: Student | None = None
     enrolled_names: list[str] = []
+    n_inst = max(1, min(5, getattr(payload, "total_installments", 1)))
+    segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
 
     for sid in payload.student_ids:
         student = db.query(Student).filter(Student.id == sid).first()
@@ -3827,9 +3955,33 @@ def admin_create_course(
             continue
         if _is_deleted(db, "students", student.id):
             continue
-        pin = allocate_enrollment_pin(db, course.id, student.id)
+        seg_payload: list[dict] = []
+        seg_json: str | None = None
+        if n_inst <= 1:
+            primary_pin = allocate_enrollment_pin(db, course.id, student.id)
+        else:
+            batch_reserved: set[str] = set()
+            for idx, (lo, hi) in enumerate(segment_ranges):
+                p = allocate_enrollment_pin(db, course.id, student.id, avoid_pins=frozenset(batch_reserved))
+                batch_reserved.add(p)
+                seg_payload.append(
+                    {
+                        "installment_no": idx + 1,
+                        "lesson_from": lo,
+                        "lesson_to": hi,
+                        "pin": p,
+                        "paid": idx == 0,
+                    }
+                )
+            seg_json = json.dumps(seg_payload, ensure_ascii=False)
+            primary_pin = str(seg_payload[0]["pin"])
         db.add(
-            CourseEnrollment(course_id=course.id, student_id=student.id, checkin_pin=pin)
+            CourseEnrollment(
+                course_id=course.id,
+                student_id=student.id,
+                checkin_pin=primary_pin,
+                segment_pins_json=seg_json,
+            )
         )
         enrolled_names.append(student.full_name)
         if first_for_coach_notice is None:
@@ -3844,10 +3996,24 @@ def admin_create_course(
                 created_by_role=user.role.lower(),
             )
         bal_msg = _lesson_balance_sum(db, student.id)
+        if n_inst <= 1:
+            pin_txt = (
+                f" 你嘅課堂簽到 PIN：{primary_pin}"
+                "（一次付款此等套餐為一個 PIN；續約／新一筆過數會派新 PIN）。"
+            )
+        else:
+            pin_txt = (
+                " 分期簽到 PIN："
+                + "；".join(
+                    f"第{r['installment_no']}個分期（第{r['lesson_from']}–{r['lesson_to']}堂）PIN {r['pin']}"
+                    for r in seg_payload
+                )
+                + "。（首期預設可簽到；第2期起需先確認收款，並由櫃台 PATCH 或使用後台標記為已付先有得簽該 PIN。）"
+            )
         msg = (
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
-            f" 你嘅課堂簽到 PIN：{pin}（每個課程一個 PIN，請用此 PIN 簽到）。"
+            f"{pin_txt}"
             f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {bal_msg} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
@@ -3883,6 +4049,64 @@ def admin_create_course(
         .first()
     )
     assert full is not None
+    return course_to_out(full)
+
+
+@app.patch("/api/admin/courses/{course_id}/installment-paid", response_model=CourseOut)
+def admin_course_mark_installment_paid(
+    course_id: int,
+    payload: CourseInstallmentMarkPaid,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> CourseOut:
+    """[F002][S002]
+    Feature: Course Entry & Automation
+    Step: Unlock scheduled-package installment PIN after staff confirms payment
+    Logic: Sets ``paid: true`` on matching segment in ``segment_pins_json`` — check-in rejects unpaid segments.
+    """
+    if _is_deleted(db, "courses", course_id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    enr = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.course_id == course_id,
+            CourseEnrollment.student_id == payload.student_id,
+        )
+        .first()
+    )
+    if not enr:
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    raw = getattr(enr, "segment_pins_json", None)
+    if not raw:
+        raise HTTPException(status_code=400, detail="This enrollment has no installment PIN segments.")
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="Corrupt installment segment payload.") from exc
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=500, detail="Invalid installment segment payload.")
+    touched = False
+    for row in rows:
+        if isinstance(row, dict) and int(row.get("installment_no") or 0) == payload.installment_no:
+            row["paid"] = True
+            touched = True
+            break
+    if not touched:
+        raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")
+    enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
+    db.commit()
+    full = (
+        db.query(Course)
+        .options(
+            joinedload(Course.branch),
+            joinedload(Course.coach),
+            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
+        )
+        .filter(Course.id == course_id)
+        .first()
+    )
+    if full is None or _is_deleted(db, "courses", full.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
     return course_to_out(full)
 
 

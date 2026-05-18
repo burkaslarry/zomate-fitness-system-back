@@ -81,6 +81,8 @@ class CourseEnrollment(Base):
     course_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_courses.id"), nullable=False)
     student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False)
     checkin_pin: Mapped[str] = mapped_column(String(5), nullable=False, index=True)
+    #: JSON array: [{"installment_no":1,"lesson_from":1,"lesson_to":10,"pin":"12345"}, ...] — each payment tranche PIN.
+    segment_pins_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     course: Mapped["Course"] = relationship(back_populates="enrollments")
