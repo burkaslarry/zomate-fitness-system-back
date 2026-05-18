@@ -15,6 +15,7 @@ class StudentOnboardCreate(BaseModel):
     full_name: str = Field(min_length=2, max_length=120)
     phone: str = Field(min_length=6, max_length=30)
     email: str | None = None
+    date_of_birth: date
     health_notes: str | None = None
     disclaimer_accepted: bool = True
 
@@ -46,6 +47,7 @@ class StudentRegisterV1(BaseModel):
     hkid: str = Field(min_length=4, max_length=32)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
+    date_of_birth: date
     emergency_contact_name: str = Field(min_length=1, max_length=120)
     emergency_contact_phone: str = Field(min_length=8, max_length=30)
     form_type: Literal["new", "renewal"]
@@ -99,6 +101,7 @@ class MemberCreate(BaseModel):
     hkid: str = Field(min_length=4, max_length=32)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
+    date_of_birth: date
     emergency_contact_name: str = Field(min_length=1, max_length=120)
     emergency_contact_phone: str = Field(min_length=8, max_length=30)
     parq: ParqQuestionsIn
@@ -215,6 +218,7 @@ class StudentOut(BaseModel):
     hkid: str | None = None
     phone: str
     email: str | None
+    date_of_birth: date | None = None
     emergency_contact_name: str | None = None
     emergency_contact_phone: str | None = None
     health_notes: str | None = None

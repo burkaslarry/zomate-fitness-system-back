@@ -769,8 +769,45 @@ def _is_active_member(db: Session, student_id: int) -> bool:
     )
 
 
+def _member_package_status(db: Session, student_id: int) -> str:
+    """[F001][S003]
+    Feature: Student Onboarding
+    Step: Admin member list package status
+    Logic: Summarize category/course enrollments into a compact roster label.
+    """
+    active_category_count = (
+        db.query(func.count(CategoryEnrollment.id))
+        .filter(CategoryEnrollment.student_id == student_id, CategoryEnrollment.status == "active")
+        .scalar()
+        or 0
+    )
+    scheduled_course_count = (
+        db.query(func.count(CourseEnrollment.id))
+        .filter(CourseEnrollment.student_id == student_id)
+        .scalar()
+        or 0
+    )
+    if active_category_count and scheduled_course_count:
+        return f"Active package + {scheduled_course_count} scheduled course(s)"
+    if active_category_count:
+        return "Active package"
+    if scheduled_course_count:
+        return f"{scheduled_course_count} scheduled course(s)"
+    return "No active package"
+
+
+def _student_last_checkin_iso(db: Session, student_id: int) -> str | None:
+    """[F001][S003] Latest check-in timestamp for admin roster context."""
+    last_at = (
+        db.query(func.max(CheckinLog.created_at))
+        .filter(CheckinLog.student_id == student_id)
+        .scalar()
+    )
+    return last_at.isoformat() if last_at else None
+
+
 def student_to_member_dict(db: Session, student: Student) -> dict:
-    """[F001][S002]
+    """[F001][S003]
     Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
     """
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
@@ -780,6 +817,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "full_name": student.full_name,
         "phone": student.phone,
         "email": student.email,
+        "date_of_birth": student.date_of_birth.isoformat() if student.date_of_birth else None,
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_phone": student.emergency_contact_phone,
         "lesson_balance": _lesson_balance_sum(db, student.id),
@@ -787,6 +825,8 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
         "is_active": _is_active_member(db, student.id),
+        "current_course_package_status": _member_package_status(db, student.id),
+        "last_checkin_at": _student_last_checkin_iso(db, student.id),
         "created_at": student.created_at.isoformat(),
     }
 
@@ -799,6 +839,7 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
         hkid=student.hkid,
         phone=student.phone,
         email=student.email,
+        date_of_birth=student.date_of_birth,
         emergency_contact_name=student.emergency_contact_name,
         emergency_contact_phone=student.emergency_contact_phone,
         health_notes=student.health_notes,
@@ -892,6 +933,7 @@ def _migrate_branch_extended_columns(db: Session) -> None:
 def _migrate_management_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS hkid VARCHAR(32) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS date_of_birth DATE NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR(120) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR(30) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS photo_path VARCHAR(512) NULL",
@@ -1688,6 +1730,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         existing.health_notes = (merged_notes + "\n\n--- renewal registration ---\n" + block)[-120_000:]
         existing.full_name = payload.full_name.strip()
         existing.hkid = hkid
+        existing.date_of_birth = payload.date_of_birth
         existing.emergency_contact_name = payload.emergency_contact_name.strip()
         existing.emergency_contact_phone = emergency_contact_phone
         if payload.email is not None:
@@ -1728,6 +1771,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         hkid=hkid,
         phone=phone_raw,
         email=(payload.email or "").strip() or None,
+        date_of_birth=payload.date_of_birth,
         emergency_contact_name=payload.emergency_contact_name.strip(),
         emergency_contact_phone=emergency_contact_phone,
         health_notes=_register_v1_health_notes(payload),
@@ -1813,6 +1857,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     notes = "\n".join(
         [
             f"HKID: {hkid}",
+            f"Date of birth: {payload.date_of_birth.isoformat()}",
             f"Emergency: {payload.emergency_contact_name.strip()} / {eco_raw}",
             f"Digital signature (step 3): {payload.digital_signature.strip()}",
             f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
@@ -1824,6 +1869,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
         hkid=hkid,
         phone=phone_raw,
         email=(payload.email or "").strip() or None,
+        date_of_birth=payload.date_of_birth,
         emergency_contact_name=payload.emergency_contact_name.strip(),
         emergency_contact_phone=eco_raw,
         health_notes=notes,
@@ -2105,11 +2151,15 @@ def create_renewal_multipart(
     student_id: int | None = Form(default=None),
     member_hkid: str | None = Form(default=None),
     student_phone: str | None = Form(default=None),
-    package_id: int = Form(...),
+    total_lessons: int = Form(...),
+    package_id: int | None = Form(default=None),
     coach_id: int | None = Form(default=None),
     branch_id: int | None = Form(default=None),
     amount: float = Form(...),
     payment_method: str = Form(...),
+    transaction_type: str = Form(default="renewal"),
+    course_package_type_code: str | None = Form(default=None),
+    course_package_type_label: str | None = Form(default=None),
     note: str | None = Form(default=None),
     receipt: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
@@ -2132,9 +2182,14 @@ def create_renewal_multipart(
     if student is None:
         raise HTTPException(status_code=400, detail="請提供 student_id、member_hkid 或 student_phone。")
     receipt_tag = student.hkid or student.phone or str(student.id)
-    package = db.get(Package, package_id)
-    if package is None or not package.active:
+    if total_lessons < 1 or total_lessons > 30:
+        raise HTTPException(status_code=400, detail="total_lessons must be between 1 and 30.")
+    package = db.get(Package, package_id) if package_id else None
+    if package_id is not None and (package is None or not package.active):
         raise HTTPException(status_code=400, detail="Invalid package_id.")
+    tx_type = transaction_type if transaction_type in {"trial", "new_package", "renewal"} else "renewal"
+    kind_code = (course_package_type_code or "").strip() or None
+    kind_label = (course_package_type_label or "").strip() or None
     coach = db.get(Coach, coach_id) if coach_id else None
     branch = db.get(Branch, branch_id) if branch_id else None
     receipt_row = None
@@ -2151,10 +2206,10 @@ def create_renewal_multipart(
         )
         db.add(receipt_row)
         db.flush()
-    apply_lesson_ledger_delta(
+    bal_after = apply_lesson_ledger_delta(
         db,
         student,
-        int(package.sessions),
+        int(total_lessons),
         "renewal_package",
         created_by_role="renewal",
     )
@@ -2163,10 +2218,10 @@ def create_renewal_multipart(
         student_name=student.full_name,
         phone=student.phone,
         course_ratio="1:1",
-        lessons=int(package.sessions),
+        lessons=int(total_lessons),
         payment_method=payment_method,
         coach_name=coach.full_name if coach else None,
-        package_id=package.id,
+        package_id=package.id if package else None,
         coach_id=coach.id if coach else None,
         branch_id=branch.id if branch else None,
         amount=amount,
@@ -2178,10 +2233,45 @@ def create_renewal_multipart(
     )
     db.add(renewal_row)
     db.flush()
-    db.add(AuditLog(action="renewal_create", student_id=student.id, detail=json.dumps({"renewal_id": renewal_row.id, "package_id": package.id}, ensure_ascii=False)))
+    detail_obj = {
+        "renewal_id": renewal_row.id,
+        "package_id": package.id if package else None,
+        "total_lessons": int(total_lessons),
+        "transaction_type": tx_type,
+        "course_package_type_code": kind_code,
+        "course_package_type_label": kind_label,
+        "amount": amount,
+        "payment_method": payment_method,
+        "lesson_balance_after": bal_after,
+    }
+    db.add(AuditLog(action="renewal_create", student_id=student.id, detail=json.dumps(detail_obj, ensure_ascii=False)))
     record_activity(db, student, "renewal_create", renewal_row.id)
+    log_whatsapp(
+        db,
+        student,
+        student.phone,
+        f"付款已確認（{kind_label or tx_type}）：HKD {amount:g}，已加入 {total_lessons} 堂。PIN 跟 payment/package；請安排第一堂後使用 Course PIN 簽到，剩餘堂數 {bal_after}。",
+    )
+    log_event(
+        "[F002][S003] checkout_summary_created",
+        student_id=student.id,
+        transaction_type=tx_type,
+        course_package_type_code=kind_code,
+        amount=amount,
+    )
     db.commit()
-    return {"renewal_id": renewal_row.id, "receipt_id": receipt_row.id if receipt_row else None, "member": student_to_member_dict(db, student)}
+    return {
+        "renewal_id": renewal_row.id,
+        "receipt_id": receipt_row.id if receipt_row else None,
+        "transaction_type": tx_type,
+        "course_package_type_code": kind_code,
+        "course_package_type_label": kind_label,
+        "total_lessons": int(total_lessons),
+        "amount": amount,
+        "payment_method": payment_method,
+        "lesson_balance_after": bal_after,
+        "member": student_to_member_dict(db, student),
+    }
 
 
 @app.post("/api/renewal")
@@ -3410,6 +3500,7 @@ def export_students_csv(
             "full_name",
             "phone",
             "hkid",
+            "date_of_birth",
             "email",
             "health_notes",
             "disclaimer_accepted",
@@ -3429,6 +3520,7 @@ def export_students_csv(
                 s.full_name,
                 s.phone,
                 s.hkid or "",
+                s.date_of_birth.isoformat() if s.date_of_birth else "",
                 s.email or "",
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
@@ -3461,6 +3553,12 @@ def import_students_csv(
         phone_raw = (row.get("phone") or "").strip()
         hkid_raw = (row.get("hkid") or "").strip()
         hkid_norm = normalize_hkid(hkid_raw) if hkid_raw else None
+        dob_raw = (row.get("date_of_birth") or "").strip()
+        try:
+            dob = date.fromisoformat(dob_raw) if dob_raw else None
+        except ValueError:
+            skipped += 1
+            continue
         email = (row.get("email") or "").strip() or None
         health_notes = (row.get("health_notes") or "").strip() or None
         disc = (row.get("disclaimer_accepted") or "1").strip() in ("1", "true", "True", "yes")
@@ -3497,6 +3595,8 @@ def import_students_csv(
                     skipped += 1
                     continue
                 existing.hkid = hkid_norm
+            if dob is not None:
+                existing.date_of_birth = dob
             existing.email = email
             existing.health_notes = health_notes
             existing.disclaimer_accepted = disc
@@ -3534,6 +3634,7 @@ def import_students_csv(
             full_name=full_name,
             phone=canonical,
             hkid=hkid_norm,
+            date_of_birth=dob,
             email=email,
             health_notes=health_notes,
             disclaimer_accepted=disc,

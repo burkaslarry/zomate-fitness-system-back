@@ -97,6 +97,8 @@ class Student(Base):
     hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     phone: Mapped[str] = mapped_column(String(30), nullable=False, unique=True, index=True)
     email: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # [F001][S001] Required client onboarding identity field; nullable keeps existing records deployable.
+    date_of_birth: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
     emergency_contact_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
