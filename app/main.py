@@ -1169,7 +1169,7 @@ def resolve_today_primary_course_for_student(
 
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
-) -> tuple[Course, Coach, str] | Literal["blocked_installment_unpaid"] | None:
+) -> tuple[CourseEnrollment, Course, Coach, str] | Literal["blocked_installment_unpaid"] | None:
     """Class PIN → that course when paid segment allows check-in & today is a lesson day."""
     pin = pin.strip()
     now = now_hk()
@@ -1190,7 +1190,7 @@ def resolve_checkin_pin_context(
             return "blocked_installment_unpaid"
         c = enr.course
         if now.date() in get_lesson_dates_for_course(c):
-            return c, c.coach, "class_pin"
+            return enr, c, c.coach, "class_pin"
         return None
     return None
 
@@ -1283,6 +1283,7 @@ async def perform_lesson_checkin(
     channel: str,
     remarks: str | None = None,
     *,
+    resolved_course_enrollment: CourseEnrollment | None = None,
     resolved_course: Course | None = None,
     notified_coach: Coach | None = None,
     pin_resolution: str = "unknown",
@@ -1306,6 +1307,11 @@ async def perform_lesson_checkin(
         if dup:
             raise HTTPException(status_code=409, detail="Already checked in for this session today.")
 
+    # TODO [F003][S006] True course-enrollment redeem:
+    # `zomate_fs_lesson_ledger.enrollment_id` and `zomate_fs_attendance.enrollment_id`
+    # currently point to `zomate_fs_category_enrollments`, not `zomate_fs_course_enrollments`.
+    # Add `course_enrollment_id` nullable FKs in a migration, then persist
+    # `resolved_course_enrollment.id` here for exact course package traceability.
     bal_after = apply_lesson_ledger_delta(db, student, -1, "checkin_redeem", created_by_role="student")
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
@@ -1330,6 +1336,10 @@ async def perform_lesson_checkin(
         student.phone,
         f"上堂通知：{student.full_name} 已簽到，剩餘堂數 {bal_after}。",
     )
+    # TODO [F005][S003] WhatsApp reminder hook:
+    # Replace this local log with provider/webhook delivery after check-in redeem.
+    # Payload should include student name, phone, course title, course_enrollment_id,
+    # installment PIN segment, balance after redeem, and low-balance reminder threshold.
     coach_msg = f"教練通知：學生 {student.full_name} 已簽到。"
     if notified_coach:
         log_whatsapp(db, student, notified_coach.phone, coach_msg)
@@ -1342,6 +1352,7 @@ async def perform_lesson_checkin(
         "lesson_balance_after": bal_after,
         "checkin_id": checkin_log.id,
         "course_title": resolved_course.title if resolved_course else None,
+        "course_enrollment_id": resolved_course_enrollment.id if resolved_course_enrollment else None,
         "notified_coach_phone": notified_coach.phone if notified_coach else None,
     }
     db.add(
@@ -2394,11 +2405,12 @@ async def checkin(payload: CheckinInput, db: Session = Depends(get_db)) -> dict:
         )
     if ctx is None:
         raise HTTPException(status_code=400, detail="Invalid PIN.")
-    course, coach, pin_kind = ctx
+    enrollment, course, coach, pin_kind = ctx
     return await perform_lesson_checkin(
         db,
         student,
         channel="qr_pin",
+        resolved_course_enrollment=enrollment,
         resolved_course=course,
         notified_coach=coach,
         pin_resolution=pin_kind,
