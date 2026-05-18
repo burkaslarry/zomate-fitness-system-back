@@ -84,6 +84,7 @@ from .schemas import (
     FaceIdCheckinInput,
     LoginInput,
     LoginSession,
+    ManualLessonRedeemInput,
     ExpenseCreate,
     MemberCreate,
     MemberProspectDupCheck,
@@ -2402,6 +2403,76 @@ async def checkin(payload: CheckinInput, db: Session = Depends(get_db)) -> dict:
         notified_coach=coach,
         pin_resolution=pin_kind,
     )
+
+
+@app.post("/api/admin/students/{student_id}/manual-redeem")
+def admin_manual_redeem_lessons(
+    student_id: int,
+    payload: ManualLessonRedeemInput,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F003][S005]
+    Feature: Attendance & Today-Only QR Check-in
+    Step: Staff manual session ledger redeem
+    Logic: Deduct lessons without creating Attendance rows, so staff can settle manual/legacy corrections
+           while QR check-in remains protected by same-day duplicate guards.
+    """
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None or _is_deleted(db, "students", student_id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    before = _lesson_balance_sum(db, student.id)
+    if before < payload.lessons:
+        raise HTTPException(status_code=400, detail="Student has insufficient remaining lessons.")
+    note = (payload.remarks or "").strip() or f"Manual redeem by {user.username}"
+    after = before
+    for i in range(payload.lessons):
+        after = apply_lesson_ledger_delta(
+            db,
+            student,
+            -1,
+            payload.reason,
+            created_by_role=user.role.lower(),
+        )
+        db.add(
+            CheckinLog(
+                student_id=student.id,
+                channel="admin_manual_redeem",
+                remarks=f"{note} ({i + 1}/{payload.lessons})",
+            )
+        )
+    log_whatsapp(
+        db,
+        student,
+        student.phone,
+        f"手動扣堂通知：已扣 {payload.lessons} 堂，剩餘堂數 {after}。",
+    )
+    db.add(
+        AuditLog(
+            action="admin_manual_redeem",
+            student_id=student.id,
+            detail=json.dumps(
+                {
+                    "lessons": payload.lessons,
+                    "before": before,
+                    "after": after,
+                    "reason": payload.reason,
+                    "remarks": payload.remarks,
+                    "user": user.username,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(student)
+    return {
+        "ok": True,
+        "student": student_to_student_out(db, student).model_dump(mode="json"),
+        "redeemed_lessons": payload.lessons,
+        "lesson_balance_before": before,
+        "lesson_balance_after": after,
+    }
 
 
 @app.post("/api/students/{student_id}/bind-face")

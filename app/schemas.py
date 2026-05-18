@@ -197,6 +197,14 @@ class CheckinInput(BaseModel):
         return self
 
 
+class ManualLessonRedeemInput(BaseModel):
+    """Staff-only ledger redeem that intentionally bypasses same-day QR attendance duplicate guards."""
+
+    lessons: int = Field(default=1, ge=1, le=30)
+    reason: str = Field(default="admin_manual_redeem", min_length=1, max_length=160)
+    remarks: str | None = Field(default=None, max_length=255)
+
+
 class FaceIdCheckinInput(BaseModel):
     face_id_external: str
 
