@@ -13,5 +13,7 @@ services:
         sync: false
       - key: PUBLIC_BASE_URL
         value: https://zomate-fitness-system-back.onrender.com
+      - key: UPLOADS_DIR
+        value: /app/uploads
       - key: KEEPALIVE_ENABLED
         value: "true"

@@ -99,11 +99,13 @@ class Student(Base):
     email: Mapped[str | None] = mapped_column(String(120), nullable=True)
     # [F001][S001] Required client onboarding identity field; nullable keeps existing records deployable.
     date_of_birth: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
+    used_mobile_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
     emergency_contact_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    signature_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

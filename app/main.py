@@ -5,6 +5,7 @@ Logic: FastAPI monolith: lifespan, CORS, REST plus WebSocket; domains F001 throu
 """
 
 import asyncio
+import base64
 import calendar
 import csv
 import io
@@ -88,6 +89,7 @@ from .schemas import (
     ExpenseCreate,
     MemberCreate,
     MemberProspectDupCheck,
+    MemberUpdate,
     PackageOut,
     RenewalCreate,
     StudentCategoryEnrollmentCreate,
@@ -599,7 +601,7 @@ def _register_v1_health_notes(payload: StudentRegisterV1) -> str:
         f"HKID: {payload.hkid.strip()}",
         f"Emergency: {payload.emergency_contact_name.strip()} / {payload.emergency_contact_phone.strip()}",
         f"Form type: {payload.form_type}",
-        f"Digital signature (step 3): {payload.digital_signature.strip()}",
+        "Digital signature (step 3): canvas image saved",
         f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
     ]
     em = (payload.email or "").strip()
@@ -752,7 +754,32 @@ def coach_row_to_out(
 
 
 def _file_url(relative_path: str | None) -> str | None:
-    return f"/uploads/{relative_path}" if relative_path else None
+    if not relative_path:
+        return None
+    path = f"/uploads/{relative_path}"
+    public_base = settings.public_base_url.strip().rstrip("/")
+    return f"{public_base}{path}" if public_base else path
+
+
+def _save_signature_image(data_url: str, student_id: int) -> str:
+    """[F001][S004] Persist canvas signature PNG and return public upload URL path."""
+    prefix = "data:image/png;base64,"
+    raw = data_url.strip()
+    if not raw.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Signature must be a PNG canvas data URL.")
+    try:
+        payload = base64.b64decode(raw[len(prefix):], validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
+    if len(payload) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Signature image is too large.")
+    relative_dir = f"signatures/{student_id}"
+    out_dir = UPLOADS_DIR / relative_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"sig_{student_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.png"
+    relative_path = f"{relative_dir}/{filename}"
+    (UPLOADS_DIR / relative_path).write_bytes(payload)
+    return _file_url(relative_path) or ""
 
 
 def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
@@ -824,6 +851,8 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
+        "signature_image_url": student.signature_image_url,
+        "used_mobile_number": student.used_mobile_number,
         "is_active": _is_active_member(db, student.id),
         "current_course_package_status": _member_package_status(db, student.id),
         "last_checkin_at": _student_last_checkin_iso(db, student.id),
@@ -845,6 +874,7 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
         health_notes=student.health_notes,
         disclaimer_accepted=student.disclaimer_accepted,
         photo_path=student.photo_path,
+        signature_image_url=student.signature_image_url,
         lesson_balance=_lesson_balance_sum(db, student.id),
         face_id_external=student.face_id_external,
         created_at=student.created_at,
@@ -934,9 +964,11 @@ def _migrate_management_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS hkid VARCHAR(32) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS date_of_birth DATE NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS used_mobile_number VARCHAR(30) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR(120) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR(30) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS photo_path VARCHAR(512) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS signature_image_url VARCHAR(512) NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS specialty VARCHAR(160) NULL",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
@@ -1061,6 +1093,14 @@ def _seed_management_defaults(db: Session) -> None:
             row.sessions = item["sessions"]
             row.price = item["price"]
             row.active = True
+
+    for category_name in ["Yoga 瑜珈", "Stretching 拉伸", "Pilates 普拉提"]:
+        category = db.query(CourseCategory).filter(CourseCategory.name == category_name).first()
+        if category is None:
+            db.add(CourseCategory(name=category_name, is_active=True, is_deleted=False, created_by_role="seed"))
+        else:
+            category.is_active = True
+            category.is_deleted = False
 
     first_branch = db.query(Branch).order_by(Branch.id).first()
     if first_branch and db.query(Coach).count() == 0:
@@ -1736,6 +1776,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
+        existing.signature_image_url = _save_signature_image(payload.digital_signature, existing.id)
         apply_lesson_ledger_delta(
             db,
             existing,
@@ -1779,6 +1820,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     )
     db.add(student)
     db.flush()
+    student.signature_image_url = _save_signature_image(payload.digital_signature, student.id)
     apply_lesson_ledger_delta(
         db,
         student,
@@ -1859,7 +1901,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
             f"HKID: {hkid}",
             f"Date of birth: {payload.date_of_birth.isoformat()}",
             f"Emergency: {payload.emergency_contact_name.strip()} / {eco_raw}",
-            f"Digital signature (step 3): {payload.digital_signature.strip()}",
+            "Digital signature (step 3): canvas image saved",
             f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
             f"Medical clearance file: {(payload.medical_clearance_file_name or '').strip()}",
         ]
@@ -1877,6 +1919,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     )
     db.add(student)
     db.flush()
+    student.signature_image_url = _save_signature_image(payload.digital_signature, student.id)
     db.add(AuditLog(action="member_create", student_id=student.id, detail=json.dumps({"hkid": hkid}, ensure_ascii=False)))
     record_activity(db, student, "member_create", student.id)
     db.commit()
@@ -2053,6 +2096,70 @@ def get_member_full_by_id(student_id: int, db: Session = Depends(get_db)) -> dic
     return _member_full_payload(db, student)
 
 
+@app.patch("/api/members/by-id/{student_id}")
+def update_member_by_id(
+    student_id: int,
+    payload: MemberUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F001][S003] Staff profile edit; mobile changes retain previous number for traceability."""
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if payload.full_name is not None:
+        student.full_name = payload.full_name.strip()
+    if payload.email is not None:
+        student.email = payload.email.strip() or None
+    if payload.date_of_birth is not None:
+        student.date_of_birth = payload.date_of_birth
+    if payload.emergency_contact_name is not None:
+        student.emergency_contact_name = payload.emergency_contact_name.strip() or None
+    if payload.emergency_contact_phone is not None:
+        raw_emergency = payload.emergency_contact_phone.strip()
+        if raw_emergency:
+            emergency_phone = normalize_hk_phone_local_eight(raw_emergency)
+            if not emergency_phone:
+                raise HTTPException(status_code=400, detail="緊急聯絡電話須為香港 8 位手機號碼。")
+            student.emergency_contact_phone = emergency_phone
+        else:
+            student.emergency_contact_phone = None
+    if payload.phone is not None:
+        phone_raw = normalize_hk_phone_local_eight(payload.phone.strip())
+        if not phone_raw:
+            raise HTTPException(status_code=400, detail="電話須為香港 8 位手機號碼。")
+        if phone_raw != student.phone:
+            variants = _hk_phone_lookup_variants(phone_raw)
+            active_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+            other = (
+                db.query(Student)
+                .filter(~Student.id.in_(active_ids_sq), Student.id != student.id, Student.phone.in_(variants))
+                .first()
+            )
+            if other:
+                raise HTTPException(status_code=409, detail="Phone already registered.")
+            previous = student.phone
+            if student.used_mobile_number:
+                used = [x.strip() for x in student.used_mobile_number.split(",") if x.strip()]
+                if previous not in used:
+                    used.append(previous)
+                student.used_mobile_number = ",".join(used)[-30:]
+            else:
+                student.used_mobile_number = previous
+            student.phone = phone_raw
+    db.add(
+        AuditLog(
+            action="member_profile_update",
+            student_id=student.id,
+            detail=json.dumps({"updated_by": user.username}, ensure_ascii=False),
+        )
+    )
+    record_activity(db, student, "member_profile_update", student.id)
+    db.commit()
+    db.refresh(student)
+    return {"member": student_to_member_dict(db, student)}
+
+
 @app.get("/api/members/{hkid}/full")
 def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
     student = get_student_by_hkid_or_404(db, hkid)
@@ -2079,18 +2186,23 @@ def upload_member_receipt(
     amount: float | None = Form(default=None),
     payment_method: str | None = Form(default=None),
     note: str | None = Form(default=None),
+    context: str | None = Form(default=None),
     source: str = Form(default="REGISTER"),
     db: Session = Depends(get_db),
 ) -> dict:
     student = get_student_by_hkid_or_404(db, hkid)
     path = _save_upload_file(file, "receipts", student.hkid or hkid, 5 * 1024 * 1024)
+    note_text = (note or "").strip()
+    context_text = (context or "").strip()
+    if context_text:
+        note_text = f"[{context_text}] {note_text}".strip()
     receipt = Receipt(
         student_id=student.id,
         member_hkid=student.hkid or normalize_hkid(hkid),
         file_path=path,
         amount=amount,
         payment_method=(payment_method or "").strip() or None,
-        note=(note or "").strip() or None,
+        note=note_text or None,
         source=source if source in {"REGISTER", "RENEWAL"} else "REGISTER",
     )
     db.add(receipt)
@@ -2108,6 +2220,7 @@ def upload_member_receipt_by_id(
     amount: float | None = Form(default=None),
     payment_method: str | None = Form(default=None),
     note: str | None = Form(default=None),
+    context: str | None = Form(default=None),
     source: str = Form(default="RENEWAL"),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -2117,13 +2230,17 @@ def upload_member_receipt_by_id(
         raise HTTPException(status_code=404, detail="Student not found.")
     key = student.hkid or f"student-{student.id}"
     path = _save_upload_file(file, "receipts", key, 5 * 1024 * 1024)
+    note_text = (note or "").strip()
+    context_text = (context or "").strip()
+    if context_text:
+        note_text = f"[{context_text}] {note_text}".strip()
     receipt = Receipt(
         student_id=student.id,
         member_hkid=student.hkid or f"ID{student.id}",
         file_path=path,
         amount=amount,
         payment_method=(payment_method or "").strip() or None,
-        note=(note or "").strip() or None,
+        note=note_text or None,
         source=source if source in {"REGISTER", "RENEWAL"} else "RENEWAL",
     )
     db.add(receipt)
@@ -2413,17 +2530,27 @@ def auth_me(
     Authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> LoginSession:
+    """[F006][S002] Validate the active Bearer session using the same expiry rules as protected routes."""
     token = _parse_auth_header(Authorization)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Missing auth token.")
     session = (
-        db.query(AppUser)
+        db.query(AuthSession, AppUser)
         .join(AuthSession, AuthSession.user_id == AppUser.id)
         .filter(AuthSession.token == token)
         .first()
     )
     if not session:
         raise HTTPException(status_code=401, detail="Invalid auth token.")
-    user = session
-    return LoginSession(token=token or "", username=user.username, role=_login_role_for_response(user))
+    auth_session = session[0]
+    user = session[1]
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account disabled.")
+    if auth_session.expires_at <= datetime.utcnow():
+        db.delete(auth_session)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Session expired.")
+    return LoginSession(token=token, username=user.username, role=_login_role_for_response(user))
 
 
 @app.post("/api/auth/logout")

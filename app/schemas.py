@@ -55,7 +55,7 @@ class StudentRegisterV1(BaseModel):
     medical_clearance_file_name: str | None = ""
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
-    digital_signature: str = Field(min_length=2, max_length=120)
+    digital_signature: str = Field(min_length=20, max_length=400_000)
     package_sessions: Literal[10, 30]
     renewal_notes: str | None = None
 
@@ -108,7 +108,7 @@ class MemberCreate(BaseModel):
     medical_clearance_file_name: str | None = ""
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
-    digital_signature: str = Field(min_length=2, max_length=120)
+    digital_signature: str = Field(min_length=20, max_length=400_000)
 
     @field_validator("email", mode="before")
     @classmethod
@@ -122,6 +122,24 @@ class MemberCreate(BaseModel):
         if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
             raise ValueError("請確認冷靜期條款及免責聲明。")
         return self
+
+
+class MemberUpdate(BaseModel):
+    """[F001][S003] Staff profile edit from admin student detail."""
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=120)
+    phone: str | None = Field(default=None, min_length=8, max_length=30)
+    email: str | None = None
+    date_of_birth: date | None = None
+    emergency_contact_name: str | None = Field(default=None, max_length=120)
+    emergency_contact_phone: str | None = Field(default=None, max_length=30)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_update_email(cls, v: object) -> object:
+        if v == "":
+            return None
+        return v
 
 
 class PackageOut(BaseModel):
@@ -219,11 +237,13 @@ class StudentOut(BaseModel):
     phone: str
     email: str | None
     date_of_birth: date | None = None
+    used_mobile_number: str | None = None
     emergency_contact_name: str | None = None
     emergency_contact_phone: str | None = None
     health_notes: str | None = None
     disclaimer_accepted: bool = False
     photo_path: str | None = None
+    signature_image_url: str | None = None
     lesson_balance: int = Field(description="由 zomate_fs_lesson_ledger 加總；ORM Student 無此欄。")
     face_id_external: str | None
     created_at: datetime
