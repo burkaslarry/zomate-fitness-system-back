@@ -60,8 +60,6 @@ from .models import (
     RenewalRecord,
     Student,
     StudentPhoto,
-    TrialClass,
-    TrialClassKind,
     WhatsAppLog,
 )
 from .schemas import (
@@ -75,6 +73,7 @@ from .schemas import (
     CoachTrialGrantBody,
     CoachUpdate,
     CourseCategoryCreate,
+    CourseCategoryAdminUpdate,
     CourseAssignCoach,
     CourseCreate,
     CourseEnrollmentOut,
@@ -97,8 +96,6 @@ from .schemas import (
     StudentOut,
     StudentRegisterV1,
     TrialClassCreate,
-    TrialClassKindAdminUpdate,
-    TrialClassKindOut,
     TrialPurchaseInput,
 )
 from .storage import FileStorageService
@@ -668,11 +665,6 @@ def get_student_by_hkid_or_404(db: Session, hkid: str) -> Student:
     return student
 
 
-def _trial_member_hkid_value(student: Student) -> str | None:
-    """TrialClass.member_hkid 欄位：有 HKID 則存，否則 NULL。"""
-    return student.hkid if student.hkid else None
-
-
 def _student_from_trial_class_payload(db: Session, payload: TrialClassCreate) -> Student:
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     if payload.student_id is not None:
@@ -697,6 +689,83 @@ def _student_from_trial_class_payload(db: Session, payload: TrialClassCreate) ->
     if hk:
         return get_student_by_hkid_or_404(db, hk)
     raise HTTPException(status_code=400, detail="缺少學員識別。")
+
+
+def _resolve_active_course_category(db: Session, category_id: int | None) -> CourseCategory:
+    """[F011][S001] Resolve an enabled course category for trial / renewal flows."""
+    if category_id is not None:
+        row = db.get(CourseCategory, category_id)
+        if row is None or row.is_deleted or not row.is_active:
+            raise HTTPException(status_code=400, detail="Invalid course_category_id.")
+        return row
+    row = (
+        db.query(CourseCategory)
+        .filter(CourseCategory.is_active.is_(True), CourseCategory.is_deleted.is_(False))
+        .order_by(CourseCategory.id.asc())
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=500, detail="course_categories 未初始化，請聯絡管理員。")
+    return row
+
+
+def _trial_records_from_audit(db: Session, student_id: int) -> list[dict]:
+    """[F002][S001] Trial history stored in audit logs after dropping zomate_fs_trial_classes."""
+    rows = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.student_id == student_id,
+            AuditLog.action.in_(("trial_class_create", "coach_trial_quota_grant")),
+        )
+        .order_by(AuditLog.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    coach_ids = [r.coach_id for r in rows if r.coach_id is not None]
+    coaches = {c.id: c.full_name for c in db.query(Coach).filter(Coach.id.in_(coach_ids)).all()} if coach_ids else {}
+    branch_ids: list[int] = []
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except json.JSONDecodeError:
+            detail = {}
+        bid = detail.get("branch_id")
+        if isinstance(bid, int):
+            branch_ids.append(bid)
+    branches = {b.id: b.name for b in db.query(Branch).filter(Branch.id.in_(branch_ids)).all()} if branch_ids else {}
+    out: list[dict] = []
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except json.JSONDecodeError:
+            detail = {}
+        cat_id = detail.get("course_category_id")
+        cat_name = detail.get("course_category_name")
+        if cat_id and not cat_name:
+            cat = db.get(CourseCategory, cat_id)
+            cat_name = cat.name if cat else None
+        branch_id = detail.get("branch_id")
+        out.append(
+            {
+                "id": row.id,
+                "type": detail.get(
+                    "type",
+                    "coach_quota_1" if row.action == "coach_trial_quota_grant" else "TRIAL",
+                ),
+                "coach_id": row.coach_id or detail.get("coach_id"),
+                "coach_name": coaches.get(row.coach_id) if row.coach_id is not None else None,
+                "branch_id": branch_id,
+                "branch_name": branches.get(branch_id) if isinstance(branch_id, int) else None,
+                "course_category_id": cat_id,
+                "course_category_name": cat_name,
+                "trial_kind_id": cat_id,
+                "trial_kind_label_zh": cat_name,
+                "class_date": detail.get("class_date"),
+                "note": detail.get("note"),
+                "created_at": row.created_at.isoformat(),
+            }
+        )
+    return out
 
 
 def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[int, list[CoachEnrolledStudentOut]]:
@@ -991,30 +1060,6 @@ def _migrate_management_columns(db: Session) -> None:
         db.rollback()
 
 
-def _migrate_trial_class_extensions(db: Session) -> None:
-    """Existing PostgreSQL DBs：補 trial_kind 外鍵、允許無 HKID 的試堂紀錄。"""
-    try:
-        db.execute(text("ALTER TABLE zomate_fs_trial_classes ADD COLUMN IF NOT EXISTS trial_kind_id INTEGER NULL"))
-        db.commit()
-    except Exception:
-        db.rollback()
-    try:
-        db.execute(
-            text(
-                "ALTER TABLE zomate_fs_trial_classes ADD CONSTRAINT zomate_fs_trial_classes_trial_kind_id_fkey "
-                "FOREIGN KEY (trial_kind_id) REFERENCES zomate_fs_trial_class_kinds(id)"
-            )
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
-    try:
-        db.execute(text("ALTER TABLE zomate_fs_trial_classes ALTER COLUMN member_hkid DROP NOT NULL"))
-        db.commit()
-    except Exception:
-        db.rollback()
-
-
 def _migrate_coach_hire_date(db: Session) -> None:
     """教練入職日期：新欄位，並以 created_at 日期回填既有資料。"""
     try:
@@ -1027,25 +1072,6 @@ def _migrate_coach_hire_date(db: Session) -> None:
         db.commit()
     except Exception:
         db.rollback()
-
-
-def _seed_trial_class_kinds(db: Session) -> None:
-    seeds = [
-        ("new_1to1", "新學生一對一", 10),
-        ("new_1to2", "新學生一對二", 20),
-        ("renew_1to1", "續會學生一對一", 30),
-        ("renew_1to2", "續會學生一對二", 40),
-        ("bring_1to1", "自帶學生一對一", 50),
-        ("bring_1to2", "自帶學生一對二", 60),
-    ]
-    for code, label, order in seeds:
-        row = db.query(TrialClassKind).filter(TrialClassKind.code == code).first()
-        if row is None:
-            db.add(TrialClassKind(code=code, label_zh=label, sort_order=order, active=True))
-        else:
-            row.label_zh = label
-            row.sort_order = order
-            row.active = True
 
 
 def _seed_default_branches(db: Session) -> None:
@@ -1094,7 +1120,17 @@ def _seed_management_defaults(db: Session) -> None:
             row.price = item["price"]
             row.active = True
 
-    for category_name in ["Yoga 瑜珈", "Stretching 拉伸", "Pilates 普拉提"]:
+    for category_name in [
+        "新學生一對一",
+        "新學生一對二",
+        "續會學生一對一",
+        "續會學生一對二",
+        "自帶學生一對一",
+        "自帶學生一對二",
+        "Yoga 瑜珈",
+        "Stretching 拉伸",
+        "Pilates 普拉提",
+    ]:
         category = db.query(CourseCategory).filter(CourseCategory.name == category_name).first()
         if category is None:
             db.add(CourseCategory(name=category_name, is_active=True, is_deleted=False, created_by_role="seed"))
@@ -1491,9 +1527,7 @@ def _sync_startup() -> None:
         _migrate_courses_extended_columns(db)
         _migrate_management_columns(db)
         _migrate_coach_hire_date(db)
-        _migrate_trial_class_extensions(db)
         _seed_default_branches(db)
-        _seed_trial_class_kinds(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
         db.commit()
@@ -1972,13 +2006,11 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
     """[F001][S002] Build student detail payload; route may lookup by id or HKID."""
     receipts = db.query(Receipt).filter(Receipt.student_id == student.id).order_by(Receipt.created_at.desc()).all()
     renewals = db.query(RenewalRecord).filter(RenewalRecord.student_id == student.id).order_by(RenewalRecord.created_at.desc()).all()
-    trials = db.query(TrialClass).filter(TrialClass.student_id == student.id).order_by(TrialClass.created_at.desc()).all()
-    trial_coach_ids = [t.coach_id for t in trials if t.coach_id is not None]
-    trial_branch_ids = [t.branch_id for t in trials if t.branch_id is not None]
-    trial_kind_ids = [t.trial_kind_id for t in trials if t.trial_kind_id is not None]
+    trials = _trial_records_from_audit(db, student.id)
+    trial_coach_ids = [t["coach_id"] for t in trials if t.get("coach_id") is not None]
+    trial_branch_ids = [t["branch_id"] for t in trials if t.get("branch_id") is not None]
     trial_coaches = {c.id: c.full_name for c in db.query(Coach).filter(Coach.id.in_(trial_coach_ids)).all()} if trial_coach_ids else {}
     trial_branches = {b.id: b.name for b in db.query(Branch).filter(Branch.id.in_(trial_branch_ids)).all()} if trial_branch_ids else {}
-    trial_kinds = {k.id: k.label_zh for k in db.query(TrialClassKind).filter(TrialClassKind.id.in_(trial_kind_ids)).all()} if trial_kind_ids else {}
     activity_hkid = student.hkid or (normalize_hkid(fallback_hkid) if fallback_hkid else None)
     logs = (
         db.query(ActivityLog)
@@ -2022,17 +2054,19 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
         ],
         "trial_classes": [
             {
-                "id": t.id,
-                "type": t.type,
-                "coach_id": t.coach_id,
-                "coach_name": trial_coaches.get(t.coach_id) if t.coach_id is not None else None,
-                "branch_id": t.branch_id,
-                "branch_name": trial_branches.get(t.branch_id) if t.branch_id is not None else None,
-                "trial_kind_id": t.trial_kind_id,
-                "trial_kind_label_zh": trial_kinds.get(t.trial_kind_id) if t.trial_kind_id is not None else None,
-                "class_date": t.class_date.isoformat(),
-                "note": t.note,
-                "created_at": t.created_at.isoformat(),
+                "id": t["id"],
+                "type": t["type"],
+                "coach_id": t.get("coach_id"),
+                "coach_name": t.get("coach_name") or (trial_coaches.get(t["coach_id"]) if t.get("coach_id") is not None else None),
+                "branch_id": t.get("branch_id"),
+                "branch_name": t.get("branch_name") or (trial_branches.get(t["branch_id"]) if t.get("branch_id") is not None else None),
+                "course_category_id": t.get("course_category_id"),
+                "course_category_name": t.get("course_category_name"),
+                "trial_kind_id": t.get("trial_kind_id"),
+                "trial_kind_label_zh": t.get("trial_kind_label_zh"),
+                "class_date": t.get("class_date"),
+                "note": t.get("note"),
+                "created_at": t["created_at"],
             }
             for t in trials
         ],
@@ -2790,91 +2824,48 @@ def update_public_coach(coach_id: int, payload: CoachUpdate, db: Session = Depen
     return update_coach(coach_id, payload, db, user)
 
 
-@app.get("/api/trial-class-kinds", response_model=list[TrialClassKindOut])
-def list_trial_class_kinds_public(db: Session = Depends(get_db)) -> list[TrialClassKind]:
-    return (
-        db.query(TrialClassKind)
-        .filter(TrialClassKind.active.is_(True))
-        .order_by(TrialClassKind.sort_order, TrialClassKind.id)
+@app.get("/api/course-categories")
+def list_course_categories_public(db: Session = Depends(get_db)) -> list[dict]:
+    """[F011][S001] 報 Course / 試堂 — 只回傳啟用中的 course category。"""
+    rows = (
+        db.query(CourseCategory)
+        .filter(CourseCategory.is_active.is_(True), CourseCategory.is_deleted.is_(False))
+        .order_by(CourseCategory.id.asc())
         .all()
     )
-
-
-@app.get("/api/admin/trial-class-kinds", response_model=list[TrialClassKindOut])
-def admin_list_trial_class_kinds(
-    db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
-) -> list[TrialClassKind]:
-    """Course／試堂共用種類清單（含停用）— 「分店管理」後台維護。"""
-    return db.query(TrialClassKind).order_by(TrialClassKind.sort_order, TrialClassKind.id).all()
-
-
-@app.patch("/api/admin/trial-class-kinds/{kind_id}", response_model=TrialClassKindOut)
-def admin_patch_trial_class_kind(
-    kind_id: int,
-    payload: TrialClassKindAdminUpdate,
-    db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
-) -> TrialClassKind:
-    row = db.get(TrialClassKind, kind_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="Course kind not found.")
-    data = payload.model_dump(exclude_unset=True)
-    if not data:
-        raise HTTPException(status_code=400, detail="No fields to update.")
-    if "active" in data and data["active"] is not None:
-        row.active = bool(data["active"])
-    db.commit()
-    db.refresh(row)
-    return row
+    return [{"id": c.id, "name": c.name, "is_active": c.is_active} for c in rows]
 
 
 @app.post("/api/trial-classes")
 def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db)) -> dict:
     student = _student_from_trial_class_payload(db, payload)
-    if payload.trial_kind_id is not None:
-        kind = db.get(TrialClassKind, payload.trial_kind_id)
-        if kind is None or not kind.active:
-            raise HTTPException(status_code=400, detail="Invalid trial_kind_id.")
-    else:
-        kind = (
-            db.query(TrialClassKind)
-            .filter(TrialClassKind.active.is_(True))
-            .order_by(TrialClassKind.sort_order, TrialClassKind.id)
-            .first()
-        )
-        if kind is None:
-            raise HTTPException(status_code=500, detail="trial_class_kinds 未初始化，請聯絡管理員。")
+    category = _resolve_active_course_category(db, payload.course_category_id)
     coach = db.get(Coach, payload.coach_id) if payload.coach_id else None
     branch = db.get(Branch, payload.branch_id) if payload.branch_id else None
-    row = TrialClass(
+    audit = AuditLog(
+        action="trial_class_create",
         student_id=student.id,
-        member_hkid=_trial_member_hkid_value(student),
-        type=payload.type,
-        trial_kind_id=kind.id,
         coach_id=coach.id if coach else None,
-        branch_id=branch.id if branch else None,
-        class_date=payload.class_date,
-        note=(payload.note or "").strip() or None,
+        detail=json.dumps(
+            {
+                "type": payload.type,
+                "course_category_id": category.id,
+                "course_category_name": category.name,
+                "branch_id": branch.id if branch else None,
+                "class_date": payload.class_date.isoformat(),
+                "note": (payload.note or "").strip() or None,
+            },
+            ensure_ascii=False,
+        ),
     )
-    db.add(row)
+    db.add(audit)
     db.flush()
-    db.add(
-        AuditLog(
-            action="trial_class_create",
-            student_id=student.id,
-            coach_id=coach.id if coach else None,
-            detail=json.dumps(
-                {"trial_class_id": row.id, "type": row.type, "trial_kind_id": kind.id},
-                ensure_ascii=False,
-            ),
-        )
-    )
-    record_activity(db, student, "trial_class_create", row.id)
+    record_activity(db, student, "trial_class_create", audit.id)
     db.commit()
     db.refresh(student)
     pins = _course_checkin_pins_for_student(db, student)
     return {
-        "id": row.id,
+        "id": audit.id,
         "member": student_to_member_dict(db, student),
         "course_checkin_pins": pins,
     }
@@ -2882,25 +2873,31 @@ def create_trial_class(payload: TrialClassCreate, db: Session = Depends(get_db))
 
 @app.get("/api/trial-classes")
 def list_trial_classes(member_hkid: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
-    query = db.query(TrialClass).options(joinedload(TrialClass.trial_kind))
     if member_hkid:
-        query = query.filter(TrialClass.member_hkid == normalize_hkid(member_hkid))
-    rows = query.order_by(TrialClass.created_at.desc()).limit(200).all()
-    return [
-        {
-            "id": row.id,
-            "member_hkid": row.member_hkid,
-            "type": row.type,
-            "trial_kind_id": row.trial_kind_id,
-            "trial_kind_label_zh": row.trial_kind.label_zh if row.trial_kind else None,
-            "coach_id": row.coach_id,
-            "branch_id": row.branch_id,
-            "class_date": row.class_date.isoformat(),
-            "note": row.note,
-            "created_at": row.created_at.isoformat(),
-        }
-        for row in rows
-    ]
+        student = get_student_by_hkid_or_404(db, member_hkid)
+        return _trial_records_from_audit(db, student.id)
+    rows = (
+        db.query(AuditLog)
+        .filter(AuditLog.action.in_(("trial_class_create", "coach_trial_quota_grant")))
+        .order_by(AuditLog.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    if not rows:
+        return []
+    student_ids = list({r.student_id for r in rows})
+    by_student = {sid: _trial_records_from_audit(db, sid) for sid in student_ids}
+    out: list[dict] = []
+    seen: set[int] = set()
+    for row in rows:
+        if row.id in seen:
+            continue
+        seen.add(row.id)
+        for item in by_student.get(row.student_id, []):
+            if item["id"] == row.id:
+                out.append(item)
+                break
+    return out
 
 
 @app.post("/api/expenses")
@@ -3102,6 +3099,35 @@ def admin_show_course_category(
     return {"id": category_id, "is_deleted": False}
 
 
+@app.patch("/api/admin/course-categories/{category_id}")
+def admin_patch_course_category(
+    category_id: int,
+    payload: CourseCategoryAdminUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F011][S001] 課堂和分店管理 — toggle is_active on course category."""
+    row = db.get(CourseCategory, category_id)
+    if not row or row.is_deleted:
+        raise HTTPException(status_code=404, detail="Category not found.")
+    data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    if "is_active" in data and data["is_active"] is not None:
+        row.is_active = bool(data["is_active"])
+    db.commit()
+    db.refresh(row)
+    log_event("course_category_patched", category_id=category_id, is_active=row.is_active)
+    return {
+        "id": row.id,
+        "name": row.name,
+        "is_active": row.is_active,
+        "is_deleted": row.is_deleted,
+        "created_by_role": row.created_by_role,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
 @app.post("/api/admin/students/{student_id}/category-enrollment")
 def admin_upsert_category_enrollment(
     student_id: int,
@@ -3195,17 +3221,6 @@ def admin_grant_coach_trial_quota(
     if int(q) < 1:
         raise HTTPException(status_code=409, detail="Coach trial quota already used for this student.")
     student.coach_trial_quota_remaining = int(q) - 1
-    hk = (student.hkid or "").strip() or student.phone
-    trial = TrialClass(
-        student_id=student.id,
-        member_hkid=hk,
-        type="coach_quota_1",
-        coach_id=payload.coach_id,
-        branch_id=payload.branch_id,
-        class_date=payload.class_date or datetime.utcnow().date(),
-        note="教練／後台試堂額度（每學生 1 次）",
-    )
-    db.add(trial)
     apply_lesson_ledger_delta(
         db,
         student,
@@ -3213,13 +3228,21 @@ def admin_grant_coach_trial_quota(
         "coach_trial_quota",
         created_by_role=user.role.lower(),
     )
-    db.flush()
+    class_date = payload.class_date or datetime.utcnow().date()
     db.add(
         AuditLog(
             action="coach_trial_quota_grant",
             student_id=student.id,
             coach_id=payload.coach_id,
-            detail=json.dumps({"trial_class_id": trial.id}, ensure_ascii=False),
+            detail=json.dumps(
+                {
+                    "type": "coach_quota_1",
+                    "branch_id": payload.branch_id,
+                    "class_date": class_date.isoformat(),
+                    "note": "教練／後台試堂額度（每學生 1 次）",
+                },
+                ensure_ascii=False,
+            ),
         )
     )
     db.commit()

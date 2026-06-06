@@ -154,28 +154,17 @@ class PackageOut(BaseModel):
         from_attributes = True
 
 
-class TrialClassKindOut(BaseModel):
-    id: int
-    code: str
-    label_zh: str
-    sort_order: int
-    active: bool = True
+class CourseCategoryAdminUpdate(BaseModel):
+    """[F011][S001] 課堂和分店管理 — 啟用／停用 course category。"""
 
-    class Config:
-        from_attributes = True
-
-
-class TrialClassKindAdminUpdate(BaseModel):
-    """分店後台「課程種類」維護 — 目前僅支援啟用／停用。"""
-
-    active: bool | None = None
+    is_active: bool | None = None
 
 
 class TrialClassCreate(BaseModel):
     """試堂／加堂 — 學員請提供其一：`student_phone`（建議）、`member_hkid` 或 `student_id`。"""
 
     type: Literal["TRIAL", "ADD_ON"]
-    trial_kind_id: int | None = None
+    course_category_id: int | None = None
     coach_id: int | None = None
     branch_id: int | None = None
     class_date: date
