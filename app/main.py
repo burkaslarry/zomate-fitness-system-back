@@ -830,14 +830,38 @@ def _file_url(relative_path: str | None) -> str | None:
     return f"{public_base}{path}" if public_base else path
 
 
-def _save_signature_image(data_url: str, student_id: int) -> str:
-    """[F001][S004] Persist canvas signature PNG and return public upload URL path."""
+def _signature_relative_path(stored: str | None) -> str | None:
+    """Normalize legacy ``/uploads/...`` values to storage-relative paths."""
+    if not stored:
+        return None
+    value = stored.strip()
+    if value.startswith("/uploads/"):
+        return value[len("/uploads/") :]
+    if value.startswith("uploads/"):
+        return value[len("uploads/") :]
+    return value or None
+
+
+def _signature_image_for_member(student: Student) -> str | None:
+    """[F001][S004] Prefer PostgreSQL blob; fall back to local disk for dev uploads."""
+    blob = getattr(student, "signature_image_blob", None)
+    if blob:
+        encoded = base64.b64encode(blob).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    relative_path = _signature_relative_path(student.signature_image_url)
+    if relative_path and (UPLOADS_DIR / relative_path).is_file():
+        return _file_url(relative_path)
+    return None
+
+
+def _save_signature_image(data_url: str, student_id: int) -> tuple[str, bytes]:
+    """[F001][S004] Persist canvas signature PNG; return relative path + raw bytes for DB blob."""
     prefix = "data:image/png;base64,"
     raw = data_url.strip()
     if not raw.startswith(prefix):
         raise HTTPException(status_code=400, detail="Signature must be a PNG canvas data URL.")
     try:
-        payload = base64.b64decode(raw[len(prefix):], validate=True)
+        payload = base64.b64decode(raw[len(prefix) :], validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
     if len(payload) > 1_000_000:
@@ -847,8 +871,17 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     filename = f"sig_{student_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.png"
     relative_path = f"{relative_dir}/{filename}"
-    (UPLOADS_DIR / relative_path).write_bytes(payload)
-    return _file_url(relative_path) or ""
+    try:
+        (UPLOADS_DIR / relative_path).write_bytes(payload)
+    except OSError:
+        pass
+    return relative_path, payload
+
+
+def _apply_signature_image(student: Student, data_url: str) -> None:
+    relative_path, payload = _save_signature_image(data_url, student.id)
+    student.signature_image_url = relative_path
+    student.signature_image_blob = payload
 
 
 def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
@@ -920,7 +953,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
-        "signature_image_url": student.signature_image_url,
+        "signature_image_url": _signature_image_for_member(student),
         "used_mobile_number": student.used_mobile_number,
         "is_active": _is_active_member(db, student.id),
         "current_course_package_status": _member_package_status(db, student.id),
@@ -943,7 +976,7 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
         health_notes=student.health_notes,
         disclaimer_accepted=student.disclaimer_accepted,
         photo_path=student.photo_path,
-        signature_image_url=student.signature_image_url,
+        signature_image_url=_signature_image_for_member(student),
         lesson_balance=_lesson_balance_sum(db, student.id),
         face_id_external=student.face_id_external,
         created_at=student.created_at,
@@ -1038,6 +1071,7 @@ def _migrate_management_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_phone VARCHAR(30) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS photo_path VARCHAR(512) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS signature_image_url VARCHAR(512) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS signature_image_blob BYTEA NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS specialty VARCHAR(160) NULL",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
@@ -1047,7 +1081,6 @@ def _migrate_management_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2) NULL",
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS receipt_id INTEGER NULL REFERENCES zomate_fs_receipts(id)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_receipts_member_hkid ON zomate_fs_receipts (member_hkid)",
-        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_trial_classes_member_hkid ON zomate_fs_trial_classes (member_hkid)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_expenses_date ON zomate_fs_expenses (date)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_activity_log_member_hkid ON zomate_fs_activity_log (member_hkid)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_activity_log_created_at ON zomate_fs_activity_log (created_at)",
@@ -1810,7 +1843,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
-        existing.signature_image_url = _save_signature_image(payload.digital_signature, existing.id)
+        _apply_signature_image(existing, payload.digital_signature)
         apply_lesson_ledger_delta(
             db,
             existing,
@@ -1854,7 +1887,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     )
     db.add(student)
     db.flush()
-    student.signature_image_url = _save_signature_image(payload.digital_signature, student.id)
+    _apply_signature_image(student, payload.digital_signature)
     apply_lesson_ledger_delta(
         db,
         student,
@@ -1953,7 +1986,7 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     )
     db.add(student)
     db.flush()
-    student.signature_image_url = _save_signature_image(payload.digital_signature, student.id)
+    _apply_signature_image(student, payload.digital_signature)
     db.add(AuditLog(action="member_create", student_id=student.id, detail=json.dumps({"hkid": hkid}, ensure_ascii=False)))
     record_activity(db, student, "member_create", student.id)
     db.commit()

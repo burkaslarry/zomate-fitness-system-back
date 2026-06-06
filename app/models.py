@@ -6,7 +6,7 @@ Logic: SQLAlchemy ORM models for zomate_fs domain tables.
 
 from datetime import datetime, date
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint
 from sqlalchemy import Date as DateColumn
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -106,6 +106,7 @@ class Student(Base):
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     signature_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    signature_image_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
