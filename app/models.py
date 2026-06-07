@@ -83,6 +83,8 @@ class CourseEnrollment(Base):
     checkin_pin: Mapped[str] = mapped_column(String(5), nullable=False, index=True)
     #: JSON array: [{"installment_no":1,"lesson_from":1,"lesson_to":10,"pin":"12345"}, ...] — each payment tranche PIN.
     segment_pins_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: False until coach assigns this student a calendar slot on the coach dashboard.
+    coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     course: Mapped["Course"] = relationship(back_populates="enrollments")

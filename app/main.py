@@ -15,7 +15,7 @@ import hmac
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, time, timezone
 from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -69,7 +69,12 @@ from .schemas import (
     CheckinInput,
     CoachCreate,
     CoachEnrolledStudentOut,
+    CoachMeOut,
     CoachOut,
+    CoachPendingStudentOut,
+    CoachScheduleConfirm,
+    CoachSignatureUpdate,
+    CoachStudentPaymentOut,
     CoachTrialGrantBody,
     CoachUpdate,
     CourseCategoryCreate,
@@ -418,6 +423,112 @@ def _coach_user_may_access_coach_row(db: Session, user: AppUser, coach: Coach | 
     if not us or not fs:
         return False
     return us in fs or fs in us
+
+
+def _coach_row_for_user(db: Session, user: AppUser) -> Coach | None:
+    """[F003][S001] Map COACH login to a single ``Coach`` row via username slug match."""
+    if user.role != "COACH":
+        return None
+    deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+    rows = (
+        db.query(Coach)
+        .filter(Coach.active.is_(True), ~Coach.id.in_(deleted))
+        .order_by(Coach.id.asc())
+        .all()
+    )
+    for coach in rows:
+        if _coach_user_may_access_coach_row(db, user, coach):
+            return coach
+    return None
+
+
+def _require_coach_access(db: Session, user: AppUser, coach_id: int) -> Coach:
+    coach = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach or _is_deleted(db, "coaches", coach_id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    if not _coach_user_may_access_coach_row(db, user, coach):
+        raise HTTPException(status_code=403, detail="This coach schedule is not linked to your login.")
+    return coach
+
+
+def _resolve_coach_id_param(db: Session, user: AppUser, coach_id: int | None) -> int:
+    if user.role == "COACH":
+        row = _coach_row_for_user(db, user)
+        if row is None:
+            raise HTTPException(status_code=403, detail="Coach login is not linked to a coach profile.")
+        if coach_id is not None and coach_id != row.id:
+            raise HTTPException(status_code=403, detail="Coach may only access their own schedule.")
+        return row.id
+    if coach_id is None:
+        raise HTTPException(status_code=400, detail="coach_id is required.")
+    _require_coach_access(db, user, coach_id)
+    return coach_id
+
+
+def _course_interval_on_date(course: Course, day: date) -> tuple[datetime, datetime] | None:
+    if day not in get_lesson_dates_for_course(course):
+        return None
+    start = datetime.combine(day, course.scheduled_start.time())
+    end = datetime.combine(day, course.scheduled_end.time())
+    if end <= start:
+        end = start + timedelta(hours=1)
+    return start, end
+
+
+def _coach_confirmed_intervals_on_day(
+    db: Session, coach_id: int, day: date, *, exclude_course_id: int | None = None
+) -> list[tuple[datetime, datetime]]:
+    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    rows = (
+        db.query(Course)
+        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
+        .filter(
+            Course.coach_id == coach_id,
+            CourseEnrollment.coach_time_confirmed.is_(True),
+            ~Course.id.in_(deleted_c),
+        )
+        .distinct()
+        .all()
+    )
+    out: list[tuple[datetime, datetime]] = []
+    for course in rows:
+        if exclude_course_id is not None and course.id == exclude_course_id:
+            continue
+        slot = _course_interval_on_date(course, day)
+        if slot:
+            out.append(slot)
+    return out
+
+
+def _assert_coach_slot_available(
+    db: Session,
+    coach_id: int,
+    day: date,
+    start: datetime,
+    end: datetime,
+    *,
+    exclude_course_id: int | None = None,
+) -> None:
+    for a0, a1 in _coach_confirmed_intervals_on_day(db, coach_id, day, exclude_course_id=exclude_course_id):
+        if start < a1 and a0 < end:
+            raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
+
+
+def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
+    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    hit = (
+        db.query(CourseEnrollment.id)
+        .join(Course, Course.id == CourseEnrollment.course_id)
+        .filter(
+            Course.coach_id == coach_id,
+            CourseEnrollment.student_id == student_id,
+            ~Course.id.in_(deleted_c),
+            ~CourseEnrollment.student_id.in_(deleted_s),
+        )
+        .first()
+    )
+    return hit is not None
 
 
 def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
@@ -1047,6 +1158,20 @@ def _migrate_courses_extended_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_enrollment_extended_columns(db: Session) -> None:
+    """[F003][S001] Pending coach schedule flag lives on enrollments, not courses."""
+    stmts = [
+        "ALTER TABLE zomate_fs_courses DROP COLUMN IF EXISTS coach_time_confirmed",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS coach_time_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _migrate_branch_extended_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_branches ADD COLUMN IF NOT EXISTS business_start_time VARCHAR(5) NOT NULL DEFAULT '09:00'",
@@ -1558,6 +1683,7 @@ def _sync_startup() -> None:
     try:
         _migrate_branch_extended_columns(db)
         _migrate_courses_extended_columns(db)
+        _migrate_enrollment_extended_columns(db)
         _migrate_management_columns(db)
         _migrate_coach_hire_date(db)
         _seed_default_branches(db)
@@ -4304,6 +4430,8 @@ def admin_create_course(
     branch = course.branch
     first_for_coach_notice: Student | None = None
     enrolled_names: list[str] = []
+    note_trim = (payload.coach_schedule_note or "").strip()
+    needs_coach_schedule = bool(note_trim)
     n_inst = max(1, min(5, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
 
@@ -4348,6 +4476,7 @@ def admin_create_course(
                 student_id=student.id,
                 checkin_pin=primary_pin,
                 segment_pins_json=seg_json,
+                coach_time_confirmed=not needs_coach_schedule,
             )
         )
         enrolled_names.append(student.full_name)
@@ -4387,7 +4516,6 @@ def admin_create_course(
 
     if first_for_coach_notice is not None:
         # [F002][S003] Coach WhatsApp log — baseline + optional agreed first session + confirm with students.
-        note_trim = (payload.coach_schedule_note or "").strip()
         lines = [
             f"【後台開課】{payload.title} · {branch.name}",
             f"教練 {coach.full_name}：學員「{'、'.join(enrolled_names)}」已編入此課程。",
@@ -4497,6 +4625,8 @@ def admin_assign_course_coach(
     if not coach:
         raise HTTPException(status_code=400, detail="Invalid coach_id.")
     course.coach_id = payload.coach_id
+    for enr in db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course.id).all():
+        enr.coach_time_confirmed = False
     db.commit()
     full = (
         db.query(Course)
@@ -4594,3 +4724,206 @@ def coach_reschedule_course(
     )
     assert full is not None
     return course_to_out(full)
+
+
+def _coach_payment_summary(enr: CourseEnrollment, student: Student) -> tuple[str, str, float | None, float | None]:
+    """[F003][S003] Derive payment + installment labels for coach finance tab."""
+    segments = _parse_segment_pins_json(enr.segment_pins_json)
+    if len(segments) <= 1:
+        if not segments or segments[0].paid:
+            return "Paid", "全數已付", None, None
+        return "Pending", "待付款", None, None
+    paid_n = sum(1 for s in segments if s.paid)
+    total_n = len(segments)
+    inst = f"第{paid_n}/{total_n}期已付"
+    if paid_n >= total_n:
+        return "Paid", "全數已付", None, None
+    if paid_n == 0:
+        return "Pending", inst, None, None
+    return "Pending", inst, None, None
+
+
+@app.get("/api/coach/me", response_model=CoachMeOut)
+def coach_me(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CoachMeOut:
+    """[F003][S001] Resolve logged-in COACH to their profile row."""
+    if user.role != "COACH":
+        raise HTTPException(status_code=400, detail="Only COACH role may call /api/coach/me.")
+    row = _coach_row_for_user(db, user)
+    if row is None:
+        raise HTTPException(status_code=403, detail="Coach login is not linked to a coach profile.")
+    loaded = (
+        db.query(Coach)
+        .options(joinedload(Coach.branch))
+        .filter(Coach.id == row.id)
+        .first()
+    )
+    assert loaded is not None
+    branch_name = loaded.branch.name if loaded.branch else None
+    return CoachMeOut(
+        id=loaded.id,
+        full_name=loaded.full_name,
+        phone=loaded.phone,
+        branch_id=loaded.branch_id,
+        branch_name=branch_name,
+    )
+
+
+@app.get("/api/coach/pending-students", response_model=list[CoachPendingStudentOut])
+def coach_pending_students(
+    coach_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> list[CoachPendingStudentOut]:
+    """[F003][S001] Enrollments assigned to this coach awaiting calendar slot."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    rows = (
+        db.query(CourseEnrollment, Course, Student, Branch)
+        .join(Course, CourseEnrollment.course_id == Course.id)
+        .join(Student, CourseEnrollment.student_id == Student.id)
+        .join(Branch, Course.branch_id == Branch.id)
+        .filter(
+            Course.coach_id == cid,
+            CourseEnrollment.coach_time_confirmed.is_(False),
+            ~Course.id.in_(deleted_c),
+            ~Student.id.in_(deleted_s),
+        )
+        .order_by(CourseEnrollment.created_at.asc())
+        .all()
+    )
+    return [
+        CoachPendingStudentOut(
+            enrollment_id=enr.id,
+            course_id=course.id,
+            student_id=student.id,
+            student_name=student.full_name,
+            student_phone=student.phone,
+            course_title=course.title,
+            branch_name=branch.name,
+            total_lessons=course.total_lessons,
+            placeholder_start=course.scheduled_start,
+        )
+        for enr, course, student, branch in rows
+    ]
+
+
+@app.get("/api/coach/student-payments", response_model=list[CoachStudentPaymentOut])
+def coach_student_payments(
+    coach_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> list[CoachStudentPaymentOut]:
+    """[F003][S003] Payment / installment overview for students on this coach's courses."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    rows = (
+        db.query(CourseEnrollment, Course, Student)
+        .join(Course, CourseEnrollment.course_id == Course.id)
+        .join(Student, CourseEnrollment.student_id == Student.id)
+        .filter(
+            Course.coach_id == cid,
+            ~Course.id.in_(deleted_c),
+            ~Student.id.in_(deleted_s),
+        )
+        .order_by(Student.full_name.asc(), Course.id.desc())
+        .all()
+    )
+    out: list[CoachStudentPaymentOut] = []
+    for enr, course, student in rows:
+        pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(enr, student)
+        out.append(
+            CoachStudentPaymentOut(
+                student_id=student.id,
+                student_name=student.full_name,
+                student_phone=student.phone,
+                course_id=course.id,
+                course_title=course.title,
+                payment_status=pay_st,
+                installment_status=inst_st,
+                amount_paid=paid_amt,
+                amount_total=total_amt,
+                signature_image_url=_signature_image_for_member(student),
+            )
+        )
+    return out
+
+
+@app.post("/api/coach/enrollments/{enrollment_id}/confirm-schedule", response_model=CourseOut)
+def coach_confirm_enrollment_schedule(
+    enrollment_id: int,
+    payload: CoachScheduleConfirm,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CourseOut:
+    """[F003][S002] Coach assigns 1–2h slot; blocks double-booking via confirmed enrollments."""
+    cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    enr = (
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.course).joinedload(Course.branch))
+        .filter(CourseEnrollment.id == enrollment_id)
+        .first()
+    )
+    if not enr:
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    if payload.enrollment_id != enrollment_id:
+        raise HTTPException(status_code=400, detail="enrollment_id mismatch.")
+    course = enr.course
+    if not course or _is_deleted(db, "courses", course.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    if course.coach_id != cid:
+        raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    start = datetime.combine(payload.day, time(payload.start_hour, 0))
+    end = start + timedelta(hours=payload.duration_hours)
+    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_course_id=course.id)
+    ws_raw = [int(x) for x in (course.lesson_weekdays or "0").split(",") if x.strip()]
+    lesson_dates = enumerate_lesson_dates(payload.day, ws_raw, course.total_lessons)
+    if not lesson_dates:
+        raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
+    course.series_start_date = lesson_dates[0]
+    course.series_end_date = lesson_dates[-1]
+    course.scheduled_start = datetime.combine(lesson_dates[0], start.time())
+    course.scheduled_end = datetime.combine(lesson_dates[0], end.time())
+    enr.coach_time_confirmed = True
+    db.commit()
+    full = (
+        db.query(Course)
+        .options(
+            joinedload(Course.branch),
+            joinedload(Course.coach),
+            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
+        )
+        .filter(Course.id == course.id)
+        .first()
+    )
+    assert full is not None
+    return course_to_out(full)
+
+
+@app.patch("/api/coach/students/{student_id}/signature")
+def coach_update_student_signature(
+    student_id: int,
+    payload: CoachSignatureUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F003][S004] Coach updates assigned student's digital signature (canvas PNG data URL)."""
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if not student or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if user.role == "COACH":
+        row = _coach_row_for_user(db, user)
+        if row is None or not _coach_teaches_student(db, row.id, student_id):
+            raise HTTPException(status_code=403, detail="You may only update signatures for your assigned students.")
+    _apply_signature_image(student, payload.digital_signature)
+    record_activity(db, student, "coach_signature_update", student_id)
+    db.commit()
+    return {
+        "ok": True,
+        "student_id": student_id,
+        "signature_image_url": _signature_image_for_member(student),
+    }

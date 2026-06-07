@@ -369,6 +369,59 @@ class CourseReschedule(BaseModel):
     scheduled_end: datetime
 
 
+class CoachScheduleConfirm(BaseModel):
+    """[F003][S001] Coach assigns 1–2 hour slot on a calendar day for one enrollment."""
+
+    coach_id: int | None = None
+    enrollment_id: int = Field(ge=1)
+    day: date
+    start_hour: int = Field(ge=9, le=18)
+    duration_hours: int = Field(ge=1, le=2)
+
+    @model_validator(mode="after")
+    def validate_slot_within_business_hours(self) -> "CoachScheduleConfirm":
+        if self.start_hour + self.duration_hours > 19:
+            raise ValueError("Time slot must end by 19:00 (7pm).")
+        return self
+
+
+class CoachSignatureUpdate(BaseModel):
+    digital_signature: str = Field(min_length=20, max_length=400_000)
+
+
+class CoachMeOut(BaseModel):
+    id: int
+    full_name: str
+    phone: str
+    branch_id: int | None = None
+    branch_name: str | None = None
+
+
+class CoachPendingStudentOut(BaseModel):
+    enrollment_id: int
+    course_id: int
+    student_id: int
+    student_name: str
+    student_phone: str
+    course_title: str
+    branch_name: str
+    total_lessons: int
+    placeholder_start: datetime
+
+
+class CoachStudentPaymentOut(BaseModel):
+    student_id: int
+    student_name: str
+    student_phone: str
+    course_id: int
+    course_title: str
+    payment_status: str
+    installment_status: str
+    amount_paid: float | None = None
+    amount_total: float | None = None
+    signature_image_url: str | None = None
+
+
 class CourseAssignCoach(BaseModel):
     """Reassign a course series to another coach (staff)."""
 
