@@ -1134,7 +1134,7 @@ def record_activity(db: Session, student: Student, activity_type: str, ref_id: i
 
 
 def _migrate_enrollment_merged_columns(db: Session) -> None:
-    """[F009][S004] Dev bootstrap: merged course fields on enrollments (alembic 20260606_0012)."""
+    """[F009][S004] Bootstrap + production: merge courses into enrollments (alembic 20260606_0012)."""
     stmts = [
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS title VARCHAR(200)",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS branch_id INTEGER",
@@ -1146,6 +1146,106 @@ def _migrate_enrollment_merged_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_start_date DATE NULL",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_end_date DATE NULL",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS coach_time_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'zomate_fs_courses'
+            ) THEN
+                UPDATE zomate_fs_course_enrollments e
+                SET
+                    title = c.title,
+                    branch_id = c.branch_id,
+                    coach_id = c.coach_id,
+                    scheduled_start = c.scheduled_start,
+                    scheduled_end = c.scheduled_end,
+                    total_lessons = c.total_lessons,
+                    lesson_weekdays = c.lesson_weekdays,
+                    series_start_date = c.series_start_date,
+                    series_end_date = c.series_end_date
+                FROM zomate_fs_courses c
+                WHERE e.course_id = c.id;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'zomate_fs_course_enrollments' AND column_name = 'course_id'
+            ) THEN
+                UPDATE zomate_fs_attendance a
+                SET course_id = e.id
+                FROM zomate_fs_course_enrollments e
+                WHERE a.course_id IS NOT NULL
+                  AND a.course_id = e.course_id
+                  AND a.student_id = e.student_id;
+            END IF;
+        END $$;
+        """,
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'zomate_fs_course_enrollments' AND column_name = 'course_id'
+            ) THEN
+                UPDATE zomate_fs_audit_logs al
+                SET course_id = e.id
+                FROM zomate_fs_course_enrollments e
+                WHERE al.course_id IS NOT NULL
+                  AND al.course_id = e.course_id
+                  AND al.student_id = e.student_id;
+            END IF;
+        END $$;
+        """,
+        "ALTER TABLE zomate_fs_course_enrollments DROP CONSTRAINT IF EXISTS uq_zomate_fs_enrollment_course_student",
+        "ALTER TABLE zomate_fs_course_enrollments DROP CONSTRAINT IF EXISTS zomate_fs_course_enrollments_course_id_fkey",
+        "ALTER TABLE zomate_fs_course_enrollments DROP COLUMN IF EXISTS course_id",
+        """
+        UPDATE zomate_fs_course_enrollments
+        SET title = COALESCE(title, 'Legacy enrollment'),
+            branch_id = COALESCE(branch_id, 1),
+            coach_id = COALESCE(coach_id, 1),
+            scheduled_start = COALESCE(scheduled_start, created_at),
+            scheduled_end = COALESCE(scheduled_end, created_at + interval '1 hour')
+        WHERE title IS NULL OR branch_id IS NULL OR coach_id IS NULL
+           OR scheduled_start IS NULL OR scheduled_end IS NULL
+        """,
+        "ALTER TABLE zomate_fs_course_enrollments ALTER COLUMN title SET NOT NULL",
+        "ALTER TABLE zomate_fs_course_enrollments ALTER COLUMN branch_id SET NOT NULL",
+        "ALTER TABLE zomate_fs_course_enrollments ALTER COLUMN coach_id SET NOT NULL",
+        "ALTER TABLE zomate_fs_course_enrollments ALTER COLUMN scheduled_start SET NOT NULL",
+        "ALTER TABLE zomate_fs_course_enrollments ALTER COLUMN scheduled_end SET NOT NULL",
+        "ALTER TABLE zomate_fs_attendance DROP CONSTRAINT IF EXISTS zomate_fs_attendance_course_id_fkey",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'zomate_fs_attendance_course_id_fkey'
+            ) THEN
+                ALTER TABLE zomate_fs_attendance
+                ADD CONSTRAINT zomate_fs_attendance_course_id_fkey
+                FOREIGN KEY (course_id) REFERENCES zomate_fs_course_enrollments(id) ON DELETE SET NULL;
+            END IF;
+        END $$;
+        """,
+        "ALTER TABLE zomate_fs_audit_logs DROP CONSTRAINT IF EXISTS zomate_fs_audit_logs_course_id_fkey",
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'zomate_fs_audit_logs_course_id_fkey'
+            ) THEN
+                ALTER TABLE zomate_fs_audit_logs
+                ADD CONSTRAINT zomate_fs_audit_logs_course_id_fkey
+                FOREIGN KEY (course_id) REFERENCES zomate_fs_course_enrollments(id);
+            END IF;
+        END $$;
+        """,
+        "DROP TABLE IF EXISTS zomate_fs_courses CASCADE",
     ]
     try:
         for s in stmts:
