@@ -27,7 +27,7 @@ class Branch(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     coaches: Mapped[list["Coach"]] = relationship(back_populates="branch")
-    courses: Mapped[list["Course"]] = relationship(back_populates="branch")
+    course_enrollments: Mapped[list["CourseEnrollment"]] = relationship(back_populates="branch")
 
 
 class Coach(Base):
@@ -45,11 +45,13 @@ class Coach(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     branch: Mapped["Branch | None"] = relationship(back_populates="coaches")
-    courses: Mapped[list["Course"]] = relationship(back_populates="coach")
+    course_enrollments: Mapped[list["CourseEnrollment"]] = relationship(back_populates="coach")
 
 
-class Course(Base):
-    __tablename__ = "zomate_fs_courses"
+class CourseEnrollment(Base):
+    """Scheduled class package: one row per student (merged former ``Course`` + enrollment fields)."""
+
+    __tablename__ = "zomate_fs_course_enrollments"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
@@ -57,28 +59,10 @@ class Course(Base):
     coach_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=False)
     scheduled_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     scheduled_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    # Course set: 1–10 lessons, up to 3 weekdays (0=Mon … 6=Sun), comma-separated in DB.
     total_lessons: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     lesson_weekdays: Mapped[str] = mapped_column(String(32), nullable=False, default="0")
     series_start_date: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
     series_end_date: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
-
-    branch: Mapped["Branch"] = relationship(back_populates="courses")
-    coach: Mapped["Coach"] = relationship(back_populates="courses")
-    enrollments: Mapped[list["CourseEnrollment"]] = relationship(
-        back_populates="course", cascade="all, delete-orphan"
-    )
-
-
-class CourseEnrollment(Base):
-    __tablename__ = "zomate_fs_course_enrollments"
-    __table_args__ = (
-        UniqueConstraint("course_id", "student_id", name="uq_zomate_fs_enrollment_course_student"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    course_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_courses.id"), nullable=False)
     student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False)
     checkin_pin: Mapped[str] = mapped_column(String(5), nullable=False, index=True)
     #: JSON array: [{"installment_no":1,"lesson_from":1,"lesson_to":10,"pin":"12345"}, ...] — each payment tranche PIN.
@@ -87,7 +71,8 @@ class CourseEnrollment(Base):
     coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-    course: Mapped["Course"] = relationship(back_populates="enrollments")
+    branch: Mapped["Branch"] = relationship(back_populates="course_enrollments")
+    coach: Mapped["Coach"] = relationship(back_populates="course_enrollments")
     student: Mapped["Student"] = relationship(back_populates="course_enrollments")
 
 
@@ -216,7 +201,9 @@ class Attendance(Base):
     )
     coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
     branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True)
-    course_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_courses.id", ondelete="SET NULL"), nullable=True)
+    course_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_course_enrollments.id", ondelete="SET NULL"), nullable=True
+    )
     attended_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     session_calendar_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -338,7 +325,9 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     action: Mapped[str] = mapped_column(String(48), nullable=False)
     student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False)
-    course_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_courses.id"), nullable=True)
+    course_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_course_enrollments.id"), nullable=True
+    )
     coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 

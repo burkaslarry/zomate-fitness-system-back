@@ -47,7 +47,6 @@ from .models import (
     CategoryEnrollment,
     CheckinLog,
     Coach,
-    Course,
     CourseCategory,
     CourseEnrollment,
     DeletedRecord,
@@ -81,11 +80,9 @@ from .schemas import (
     CourseCategoryAdminUpdate,
     CourseAssignCoach,
     CourseCreate,
-    CourseEnrollmentOut,
     CourseInstallmentMarkPaid,
     CourseOut,
     CourseReschedule,
-    InstallmentSegmentPinOut,
     FaceIdCheckinInput,
     LoginInput,
     LoginSession,
@@ -102,6 +99,14 @@ from .schemas import (
     StudentRegisterV1,
     TrialClassCreate,
     TrialPurchaseInput,
+)
+from .enrollment_schedule import (
+    enrollment_active_at_now,
+    enrollment_to_out,
+    enumerate_lesson_dates,
+    get_lesson_dates_for_enrollment,
+    parse_lesson_weekdays_str,
+    parse_segment_pins_json,
 )
 from .storage import FileStorageService
 
@@ -465,36 +470,46 @@ def _resolve_coach_id_param(db: Session, user: AppUser, coach_id: int | None) ->
     return coach_id
 
 
-def _course_interval_on_date(course: Course, day: date) -> tuple[datetime, datetime] | None:
-    if day not in get_lesson_dates_for_course(course):
+def _deleted_course_enrollment_ids():
+    return select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "course_enrollments")
+
+
+def _enrollment_load_options():
+    return (
+        joinedload(CourseEnrollment.branch),
+        joinedload(CourseEnrollment.coach),
+        joinedload(CourseEnrollment.student),
+    )
+
+
+def _enrollment_interval_on_date(enr: CourseEnrollment, day: date) -> tuple[datetime, datetime] | None:
+    if day not in get_lesson_dates_for_enrollment(enr):
         return None
-    start = datetime.combine(day, course.scheduled_start.time())
-    end = datetime.combine(day, course.scheduled_end.time())
+    start = datetime.combine(day, enr.scheduled_start.time())
+    end = datetime.combine(day, enr.scheduled_end.time())
     if end <= start:
         end = start + timedelta(hours=1)
     return start, end
 
 
 def _coach_confirmed_intervals_on_day(
-    db: Session, coach_id: int, day: date, *, exclude_course_id: int | None = None
+    db: Session, coach_id: int, day: date, *, exclude_enrollment_id: int | None = None
 ) -> list[tuple[datetime, datetime]]:
-    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_e = _deleted_course_enrollment_ids()
     rows = (
-        db.query(Course)
-        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
+        db.query(CourseEnrollment)
         .filter(
-            Course.coach_id == coach_id,
+            CourseEnrollment.coach_id == coach_id,
             CourseEnrollment.coach_time_confirmed.is_(True),
-            ~Course.id.in_(deleted_c),
+            ~CourseEnrollment.id.in_(deleted_e),
         )
-        .distinct()
         .all()
     )
     out: list[tuple[datetime, datetime]] = []
-    for course in rows:
-        if exclude_course_id is not None and course.id == exclude_course_id:
+    for enr in rows:
+        if exclude_enrollment_id is not None and enr.id == exclude_enrollment_id:
             continue
-        slot = _course_interval_on_date(course, day)
+        slot = _enrollment_interval_on_date(enr, day)
         if slot:
             out.append(slot)
     return out
@@ -507,23 +522,24 @@ def _assert_coach_slot_available(
     start: datetime,
     end: datetime,
     *,
-    exclude_course_id: int | None = None,
+    exclude_enrollment_id: int | None = None,
 ) -> None:
-    for a0, a1 in _coach_confirmed_intervals_on_day(db, coach_id, day, exclude_course_id=exclude_course_id):
+    for a0, a1 in _coach_confirmed_intervals_on_day(
+        db, coach_id, day, exclude_enrollment_id=exclude_enrollment_id
+    ):
         if start < a1 and a0 < end:
             raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
 
 
 def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
-    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     hit = (
         db.query(CourseEnrollment.id)
-        .join(Course, Course.id == CourseEnrollment.course_id)
         .filter(
-            Course.coach_id == coach_id,
+            CourseEnrollment.coach_id == coach_id,
             CourseEnrollment.student_id == student_id,
-            ~Course.id.in_(deleted_c),
+            ~CourseEnrollment.id.in_(deleted_e),
             ~CourseEnrollment.student_id.in_(deleted_s),
         )
         .first()
@@ -557,14 +573,26 @@ def log_whatsapp(db: Session, student: Student, recipient: str, message: str) ->
 #       unique per student across all enrollments so PIN resolution is unambiguous.
 def allocate_enrollment_pin(
     db: Session,
-    course_id: int,
+    enrollment_id: int | None,
     student_id: int,
     *,
+    peer_branch_id: int,
+    peer_coach_id: int,
+    peer_title: str,
+    peer_series_start: date | None,
     avoid_pins: frozenset[str] | None = None,
 ) -> str:
-    """Allocate a PIN unique among this course, this student's rows, and any ``avoid_pins`` (same txn, pre-insert)."""
+    """Allocate a PIN unique among same-class peers, this student's rows, and any ``avoid_pins``."""
     reserved = frozenset(avoid_pins or ())
-    peers_course = db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course_id).all()
+    peers_q = db.query(CourseEnrollment).filter(
+        CourseEnrollment.branch_id == peer_branch_id,
+        CourseEnrollment.coach_id == peer_coach_id,
+        CourseEnrollment.title == peer_title,
+        CourseEnrollment.series_start_date == peer_series_start,
+    )
+    if enrollment_id is not None:
+        peers_q = peers_q.filter(CourseEnrollment.id != enrollment_id)
+    peers_course = peers_q.all()
     peers_student = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == student_id).all()
     for _ in range(200):
         pin = f"{secrets.randbelow(90000) + 10000}"
@@ -592,41 +620,6 @@ def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[in
     for sz in sizes:
         out.append((cur, cur + sz - 1))
         cur += sz
-    return out
-
-
-def _parse_segment_pins_json(raw: str | None) -> list[InstallmentSegmentPinOut]:
-    """[F002][S001] Deserialize ``CourseEnrollment.segment_pins_json`` for API responses."""
-    if not raw:
-        return []
-    try:
-        rows = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(rows, list):
-        return []
-    out: list[InstallmentSegmentPinOut] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        try:
-            ino = int(row["installment_no"])
-            pr = row.get("paid")
-            if pr is None:
-                paid_bool = ino <= 1
-            else:
-                paid_bool = bool(pr)
-            out.append(
-                InstallmentSegmentPinOut(
-                    installment_no=ino,
-                    lesson_from=int(row["lesson_from"]),
-                    lesson_to=int(row["lesson_to"]),
-                    pin=str(row["pin"]).strip(),
-                    paid=paid_bool,
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
     return out
 
 
@@ -888,11 +881,10 @@ def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[in
     if not coach_ids:
         return {}
     rows = (
-        db.query(Course.coach_id, Student.id, Student.full_name, Student.phone)
-        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
+        db.query(CourseEnrollment.coach_id, Student.id, Student.full_name, Student.phone)
         .join(Student, Student.id == CourseEnrollment.student_id)
-        .filter(Course.coach_id.in_(coach_ids))
-        .order_by(Course.coach_id, Student.full_name, Student.id)
+        .filter(CourseEnrollment.coach_id.in_(coach_ids))
+        .order_by(CourseEnrollment.coach_id, Student.full_name, Student.id)
         .all()
     )
     seen: dict[int, set[int]] = {}
@@ -1096,26 +1088,24 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
 
 def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict]:
     rows = (
-        db.query(CourseEnrollment, Course, Branch, Coach)
-        .join(Course, CourseEnrollment.course_id == Course.id)
-        .join(Branch, Course.branch_id == Branch.id)
-        .outerjoin(Coach, Coach.id == Course.coach_id)
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.branch), joinedload(CourseEnrollment.coach))
         .filter(CourseEnrollment.student_id == student.id)
-        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
         .all()
     )
     return [
         {
-            "course_id": course.id,
-            "course_title": course.title,
-            "branch_name": branch.name,
-            "coach_name": (coach.full_name if coach else None) or "—",
-            "scheduled_start": course.scheduled_start.isoformat(),
-            "series_end_date": course.series_end_date.isoformat() if course.series_end_date else None,
+            "course_id": enr.id,
+            "course_title": enr.title,
+            "branch_name": enr.branch.name,
+            "coach_name": (enr.coach.full_name if enr.coach else None) or "—",
+            "scheduled_start": enr.scheduled_start.isoformat(),
+            "series_end_date": enr.series_end_date.isoformat() if enr.series_end_date else None,
             "checkin_pin": enr.checkin_pin,
-            "installment_segments": [s.model_dump() for s in _parse_segment_pins_json(enr.segment_pins_json)],
+            "installment_segments": [s.model_dump() for s in parse_segment_pins_json(enr.segment_pins_json)],
         }
-        for enr, course, branch, coach in rows
+        for enr in rows
     ]
 
 
@@ -1143,25 +1133,18 @@ def record_activity(db: Session, student: Student, activity_type: str, ref_id: i
         db.add(ActivityLog(member_hkid=student.hkid, type=activity_type, ref_id=ref_id))
 
 
-def _migrate_courses_extended_columns(db: Session) -> None:
+def _migrate_enrollment_merged_columns(db: Session) -> None:
+    """[F009][S004] Dev bootstrap: merged course fields on enrollments (alembic 20260606_0012)."""
     stmts = [
-        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS total_lessons INTEGER NOT NULL DEFAULT 1",
-        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS lesson_weekdays VARCHAR(32) NOT NULL DEFAULT '0'",
-        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS series_start_date DATE NULL",
-        "ALTER TABLE zomate_fs_courses ADD COLUMN IF NOT EXISTS series_end_date DATE NULL",
-    ]
-    try:
-        for s in stmts:
-            db.execute(text(s))
-        db.commit()
-    except Exception:
-        db.rollback()
-
-
-def _migrate_enrollment_extended_columns(db: Session) -> None:
-    """[F003][S001] Pending coach schedule flag lives on enrollments, not courses."""
-    stmts = [
-        "ALTER TABLE zomate_fs_courses DROP COLUMN IF EXISTS coach_time_confirmed",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS title VARCHAR(200)",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS branch_id INTEGER",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS coach_id INTEGER",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS scheduled_start TIMESTAMP",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS scheduled_end TIMESTAMP",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS total_lessons INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS lesson_weekdays VARCHAR(32) NOT NULL DEFAULT '0'",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_start_date DATE NULL",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_end_date DATE NULL",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS coach_time_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
     ]
     try:
@@ -1334,128 +1317,50 @@ def _seed_management_defaults(db: Session) -> None:
         )
 
 
-def parse_lesson_weekdays_str(raw: str | None) -> list[int]:
-    if not raw or not str(raw).strip():
-        return [0]
-    out: list[int] = []
-    for part in str(raw).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            v = int(part)
-        except ValueError:
-            continue
-        if 0 <= v <= 6:
-            out.append(v)
-    return sorted(set(out)) if out else [0]
-
-
-def enumerate_lesson_dates(start: date, weekdays: list[int], count: int) -> list[date]:
-    """[F009][S001]
-    Feature: Scheduled course & enrollment PINs
-    Step: Expand ``count`` lesson calendar dates from ``start`` honoring weekday set
-    Logic: Scan window scales with ``count`` so e.g. 120 weekly lessons are not truncated by a fixed 800-day cap.
-    """
-    if count < 1:
-        return []
-    wd_set = set(w for w in weekdays if 0 <= w <= 6)
-    if not wd_set:
-        wd_set = {start.weekday()}
-    dates: list[date] = []
-    d = start
-    # Need enough iterations for ``count`` matches when weekdays are sparse (e.g. 120 Mondays ≈ 840 days).
-    max_days = max(800, count * 14 + 60)
-    guard = 0
-    while len(dates) < count and guard < max_days:
-        if d.weekday() in wd_set:
-            dates.append(d)
-            if len(dates) >= count:
-                break
-        d += timedelta(days=1)
-        guard += 1
-    return dates
-
-
-def get_lesson_dates_for_course(course: Course) -> list[date]:
-    """[F009][S002]
-    Feature: Scheduled course & enrollment PINs
-    Step: Expand series dates for ``resolve_checkin_pin_context`` / today-lesson picker
-    Logic: Align with CourseCreate.total_lessons upper bound (currently 30 for scheduled packages).
-    """
-    ws = parse_lesson_weekdays_str(course.lesson_weekdays)
-    start = course.series_start_date or course.scheduled_start.date()
-    try:
-        n = int(course.total_lessons)
-    except (TypeError, ValueError):
-        n = 1
-    # Align with CourseCreate.total_lessons upper bound (scheduled packages).
-    n = max(1, min(30, n))
-    if n <= 1 and (not getattr(course, "lesson_weekdays", None) or course.lesson_weekdays == "0"):
-        return [course.scheduled_start.date()]
-    return enumerate_lesson_dates(start, ws, n)
-
-
-def course_active_at_now(course: Course, now: datetime) -> bool:
-    if now.tzinfo is None:
-        now_local = now.replace(tzinfo=HK)
-    else:
-        now_local = now.astimezone(HK)
-    d = now_local.date()
-    if d not in get_lesson_dates_for_course(course):
-        return False
-    t_start = course.scheduled_start.time()
-    t_end = course.scheduled_end.time()
-    t = now_local.time()
-    if t_start <= t_end:
-        return t_start <= t <= t_end
-    return t >= t_start or t <= t_end
-
-
-def resolve_today_primary_course_for_student(
+def resolve_today_primary_enrollment_for_student(
     db: Session, student: Student, now: datetime | None = None
-) -> tuple[Course | None, Coach | None]:
+) -> tuple[CourseEnrollment | None, Coach | None]:
     """Pick one class today when using account PIN / FaceID (not class PIN)."""
     now = now or now_hk()
     rows = (
-        db.query(Course, Coach)
-        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
-        .join(Coach, Coach.id == Course.coach_id)
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.coach))
         .filter(
             CourseEnrollment.student_id == student.id,
-            ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
-            ~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")),
+            ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+            ~CourseEnrollment.coach_id.in_(
+                select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+            ),
         )
         .all()
     )
-    candidates: list[tuple[Course, Coach]] = []
-    for course, coach in rows:
-        if course_active_at_now(course, now):
-            candidates.append((course, coach))
+    candidates: list[tuple[CourseEnrollment, Coach]] = []
+    for enr in rows:
+        coach = enr.coach
+        if coach and enrollment_active_at_now(enr, now):
+            candidates.append((enr, coach))
     if not candidates:
         return None, None
     if len(candidates) == 1:
         return candidates[0][0], candidates[0][1]
-    for course, coach in candidates:
-        if course.scheduled_start <= now <= course.scheduled_end:
-            return course, coach
+    for enr, coach in candidates:
+        if enr.scheduled_start <= now <= enr.scheduled_end:
+            return enr, coach
     best = min(candidates, key=lambda r: abs((r[0].scheduled_start - now).total_seconds()))
     return best[0], best[1]
 
 
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
-) -> tuple[CourseEnrollment, Course, Coach, str] | Literal["blocked_installment_unpaid"] | None:
-    """Class PIN → that course when paid segment allows check-in & today is a lesson day."""
+) -> tuple[CourseEnrollment, Coach, str] | Literal["blocked_installment_unpaid"] | None:
+    """Class PIN → enrollment when paid segment allows check-in & today is a lesson day."""
     pin = pin.strip()
     now = now_hk()
     enrs = (
         db.query(CourseEnrollment)
-        .options(
-            joinedload(CourseEnrollment.course).joinedload(Course.coach),
-        )
+        .options(joinedload(CourseEnrollment.coach))
         .filter(CourseEnrollment.student_id == student.id)
-        .filter(~CourseEnrollment.course_id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
         .order_by(CourseEnrollment.id.asc())
         .all()
     )
@@ -1464,50 +1369,10 @@ def resolve_checkin_pin_context(
             continue
         if not _segment_paid_for_matched_pin(enr, pin):
             return "blocked_installment_unpaid"
-        c = enr.course
-        if now.date() in get_lesson_dates_for_course(c):
-            return enr, c, c.coach, "class_pin"
+        if now.date() in get_lesson_dates_for_enrollment(enr):
+            return enr, enr.coach, "class_pin"
         return None
     return None
-
-
-def course_to_out(course: Course) -> CourseOut:
-    branch = course.branch
-    coach = course.coach
-    enrollments: list[CourseEnrollmentOut] = []
-    for e in course.enrollments:
-        st = e.student
-        segs = _parse_segment_pins_json(getattr(e, "segment_pins_json", None))
-        enrollments.append(
-            CourseEnrollmentOut(
-                student_id=st.id,
-                student_name=st.full_name,
-                student_phone=st.phone,
-                checkin_pin=e.checkin_pin,
-                installment_segments=segs,
-            )
-        )
-    ws = parse_lesson_weekdays_str(getattr(course, "lesson_weekdays", None))
-    total = getattr(course, "total_lessons", None) or 1
-    s_start = getattr(course, "series_start_date", None)
-    s_end = getattr(course, "series_end_date", None)
-    return CourseOut(
-        id=course.id,
-        title=course.title,
-        branch_id=course.branch_id,
-        branch_name=branch.name,
-        branch_address=branch.address,
-        coach_id=course.coach_id,
-        coach_name=coach.full_name,
-        scheduled_start=course.scheduled_start,
-        scheduled_end=course.scheduled_end,
-        created_at=course.created_at,
-        total_lessons=int(total),
-        lesson_weekdays=ws,
-        series_start_date=s_start,
-        series_end_date=s_end,
-        enrollments=enrollments,
-    )
 
 
 def _lesson_balance_sum(db: Session, student_id: int) -> int:
@@ -1559,8 +1424,7 @@ async def perform_lesson_checkin(
     channel: str,
     remarks: str | None = None,
     *,
-    resolved_course_enrollment: CourseEnrollment | None = None,
-    resolved_course: Course | None = None,
+    resolved_enrollment: CourseEnrollment | None = None,
     notified_coach: Coach | None = None,
     pin_resolution: str = "unknown",
 ) -> dict:
@@ -1570,12 +1434,12 @@ async def perform_lesson_checkin(
     attended_at = datetime.utcnow()
     session_day = hk_calendar_date(attended_at)
 
-    if resolved_course:
+    if resolved_enrollment:
         dup = (
             db.query(Attendance)
             .filter(
                 Attendance.student_id == student.id,
-                Attendance.course_id == resolved_course.id,
+                Attendance.course_id == resolved_enrollment.id,
                 Attendance.session_calendar_date == session_day,
             )
             .first()
@@ -1587,20 +1451,20 @@ async def perform_lesson_checkin(
     # `zomate_fs_lesson_ledger.enrollment_id` and `zomate_fs_attendance.enrollment_id`
     # currently point to `zomate_fs_category_enrollments`, not `zomate_fs_course_enrollments`.
     # Add `course_enrollment_id` nullable FKs in a migration, then persist
-    # `resolved_course_enrollment.id` here for exact course package traceability.
+    # `resolved_enrollment.id` here for exact course package traceability.
     bal_after = apply_lesson_ledger_delta(db, student, -1, "checkin_redeem", created_by_role="student")
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
     db.flush()
 
-    if resolved_course:
+    if resolved_enrollment:
         db.add(
             Attendance(
                 student_id=student.id,
                 enrollment_id=None,
-                coach_id=resolved_course.coach_id,
-                branch_id=resolved_course.branch_id,
-                course_id=resolved_course.id,
+                coach_id=resolved_enrollment.coach_id,
+                branch_id=resolved_enrollment.branch_id,
+                course_id=resolved_enrollment.id,
                 attended_at=attended_at,
                 session_calendar_date=session_day,
             )
@@ -1627,15 +1491,15 @@ async def perform_lesson_checkin(
         "pin_resolution": pin_resolution,
         "lesson_balance_after": bal_after,
         "checkin_id": checkin_log.id,
-        "course_title": resolved_course.title if resolved_course else None,
-        "course_enrollment_id": resolved_course_enrollment.id if resolved_course_enrollment else None,
+        "course_title": resolved_enrollment.title if resolved_enrollment else None,
+        "course_enrollment_id": resolved_enrollment.id if resolved_enrollment else None,
         "notified_coach_phone": notified_coach.phone if notified_coach else None,
     }
     db.add(
         AuditLog(
             action="checkin_redeem",
             student_id=student.id,
-            course_id=resolved_course.id if resolved_course else None,
+            course_id=resolved_enrollment.id if resolved_enrollment else None,
             coach_id=notified_coach.id if notified_coach else None,
             detail=json.dumps(detail_obj, ensure_ascii=False),
         )
@@ -1653,9 +1517,9 @@ async def perform_lesson_checkin(
         "student_phone": student.phone,
         "lesson_balance": bal_after,
         # Coach calendar UX：前台用 course_id／session_calendar_date 標記「已簽到扣堂」之課程格。
-        "course_id": resolved_course.id if resolved_course else None,
-        "session_calendar_date": session_day.isoformat() if resolved_course else None,
-        "course_title": resolved_course.title if resolved_course else None,
+        "course_id": resolved_enrollment.id if resolved_enrollment else None,
+        "session_calendar_date": session_day.isoformat() if resolved_enrollment else None,
+        "course_title": resolved_enrollment.title if resolved_enrollment else None,
     }
     await manager.broadcast_json(event_payload)
 
@@ -1673,7 +1537,7 @@ async def perform_lesson_checkin(
             if notified_coach
             else None
         ),
-        "resolved_course_id": resolved_course.id if resolved_course else None,
+        "resolved_course_id": resolved_enrollment.id if resolved_enrollment else None,
     }
 
 
@@ -1682,8 +1546,7 @@ def _sync_startup() -> None:
     db = next(get_db())
     try:
         _migrate_branch_extended_columns(db)
-        _migrate_courses_extended_columns(db)
-        _migrate_enrollment_extended_columns(db)
+        _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
         _migrate_coach_hire_date(db)
         _seed_default_branches(db)
@@ -1843,27 +1706,29 @@ def public_student_today_lessons(
         raise HTTPException(status_code=404, detail="Student not found.")
     today = now_hk().date()
     rows = (
-        db.query(Course, Coach)
-        .join(CourseEnrollment, CourseEnrollment.course_id == Course.id)
-        .join(Coach, Coach.id == Course.coach_id)
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.coach))
         .filter(
             CourseEnrollment.student_id == student_id,
-            ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
-            ~Coach.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")),
+            ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+            ~CourseEnrollment.coach_id.in_(
+                select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+            ),
         )
         .all()
     )
     out: list[dict] = []
-    for course, coach in rows:
-        if today not in get_lesson_dates_for_course(course):
+    for enr in rows:
+        if today not in get_lesson_dates_for_enrollment(enr):
             continue
+        coach = enr.coach
         out.append(
             {
-                "course_id": course.id,
-                "title": course.title or "Course",
-                "coach_name": coach.full_name,
-                "scheduled_start": course.scheduled_start.isoformat(),
-                "scheduled_end": course.scheduled_end.isoformat(),
+                "course_id": enr.id,
+                "title": enr.title or "Course",
+                "coach_name": coach.full_name if coach else "—",
+                "scheduled_start": enr.scheduled_start.isoformat(),
+                "scheduled_end": enr.scheduled_end.isoformat(),
             }
         )
     out.sort(key=lambda x: x["scheduled_start"])
@@ -2815,13 +2680,12 @@ async def checkin(payload: CheckinInput, db: Session = Depends(get_db)) -> dict:
         )
     if ctx is None:
         raise HTTPException(status_code=400, detail="Invalid PIN.")
-    enrollment, course, coach, pin_kind = ctx
+    enrollment, coach, pin_kind = ctx
     return await perform_lesson_checkin(
         db,
         student,
         channel="qr_pin",
-        resolved_course_enrollment=enrollment,
-        resolved_course=course,
+        resolved_enrollment=enrollment,
         notified_coach=coach,
         pin_resolution=pin_kind,
     )
@@ -2920,13 +2784,13 @@ async def faceid_checkin(payload: FaceIdCheckinInput, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Face not recognized.")
     if _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
-    course, coach = resolve_today_primary_course_for_student(db, student)
+    enrollment, coach = resolve_today_primary_enrollment_for_student(db, student)
     return await perform_lesson_checkin(
         db,
         student,
         channel="hikvision_faceid",
         remarks="simulated",
-        resolved_course=course,
+        resolved_enrollment=enrollment,
         notified_coach=coach,
         pin_resolution="faceid",
     )
@@ -3147,8 +3011,8 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         or 0
     )
     courses = (
-        db.query(func.count(Course.id))
-        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
+        db.query(func.count(CourseEnrollment.id))
+        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
         .scalar()
         or 0
     )
@@ -3433,16 +3297,16 @@ def list_audit_logs(
 ) -> list[dict]:
     limit = min(max(limit, 1), 200)
     rows = (
-        db.query(AuditLog, Student, Course, Coach)
+        db.query(AuditLog, Student, CourseEnrollment, Coach)
         .join(Student, AuditLog.student_id == Student.id)
-        .outerjoin(Course, AuditLog.course_id == Course.id)
+        .outerjoin(CourseEnrollment, AuditLog.course_id == CourseEnrollment.id)
         .outerjoin(Coach, AuditLog.coach_id == Coach.id)
         .order_by(AuditLog.id.desc())
         .limit(limit)
         .all()
     )
     out: list[dict] = []
-    for a, st, c, ch in rows:
+    for a, st, enr, ch in rows:
         detail_parsed: dict | None = None
         if a.detail:
             try:
@@ -3457,7 +3321,7 @@ def list_audit_logs(
                 "student_id": a.student_id,
                 "student_name": st.full_name,
                 "course_id": a.course_id,
-                "course_title": c.title if c else None,
+                "course_title": enr.title if enr else None,
                 "coach_id": a.coach_id,
                 "coach_name": ch.full_name if ch else None,
                 "coach_phone": ch.phone if ch else None,
@@ -4009,7 +3873,7 @@ def delete_branch(
         raise HTTPException(status_code=403, detail="Only ADMIN can hard delete.")
 
     if hard:
-        if db.query(Course).filter(Course.branch_id == branch.id).first():
+        if db.query(CourseEnrollment).filter(CourseEnrollment.branch_id == branch.id).first():
             raise HTTPException(
                 status_code=409,
                 detail="Cannot hard delete: this branch has linked courses. Soft delete or remove courses first.",
@@ -4036,7 +3900,7 @@ def delete_coach(
         raise HTTPException(status_code=403, detail="Only ADMIN can hard delete.")
 
     if hard:
-        if db.query(Course).filter(Course.coach_id == coach.id).first():
+        if db.query(CourseEnrollment).filter(CourseEnrollment.coach_id == coach.id).first():
             raise HTTPException(
                 status_code=409,
                 detail="Cannot hard delete: this coach has linked courses. Soft delete or reassign courses first.",
@@ -4055,20 +3919,19 @@ def delete_course(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    course = db.query(Course).filter(Course.id == course_id).first()
-    if not course or _is_deleted(db, "courses", course.id):
+    enr = db.query(CourseEnrollment).filter(CourseEnrollment.id == course_id).first()
+    if not enr or _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course not found.")
 
     if hard and user.role != "ADMIN":
         raise HTTPException(status_code=403, detail="Only ADMIN can hard delete.")
 
     if hard:
-        db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course.id).delete(synchronize_session=False)
-        db.delete(course)
+        db.delete(enr)
     else:
-        _record_soft_delete(db, "courses", course.id, user)
+        _record_soft_delete(db, "course_enrollments", enr.id, user)
     db.commit()
-    return {"ok": True, "course_id": course.id, "hard": bool(hard)}
+    return {"ok": True, "course_id": enr.id, "hard": bool(hard)}
 
 
 @app.get("/api/admin/qrcode-pdf")
@@ -4249,9 +4112,9 @@ def v1_reports_coach_attendance(
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
     q = (
-        db.query(AuditLog, Student, Course, Coach)
+        db.query(AuditLog, Student, CourseEnrollment, Coach)
         .join(Student, AuditLog.student_id == Student.id)
-        .outerjoin(Course, AuditLog.course_id == Course.id)
+        .outerjoin(CourseEnrollment, AuditLog.course_id == CourseEnrollment.id)
         .outerjoin(Coach, AuditLog.coach_id == Coach.id)
         .filter(AuditLog.action == "checkin_redeem")
     )
@@ -4267,18 +4130,18 @@ def v1_reports_coach_attendance(
     tuples = q.order_by(AuditLog.created_at.desc()).limit(2000).all()
     detail_rows: list[dict[str, object]] = []
     coach_buckets: dict[tuple[str, str], dict[str, float]] = {}
-    for a, st, course, coach in tuples:
+    for a, st, enr, coach in tuples:
         coach_name = coach.full_name if coach else ""
         st_d = ""
         ed = ""
         ctitle = ""
-        if course:
-            ctitle = course.title or ""
-            st_d = course.series_start_date.isoformat() if course.series_start_date else course.scheduled_start.date().isoformat()
-            ed = course.series_end_date.isoformat() if course.series_end_date else course.scheduled_end.date().isoformat()
+        if enr:
+            ctitle = enr.title or ""
+            st_d = enr.series_start_date.isoformat() if enr.series_start_date else enr.scheduled_start.date().isoformat()
+            ed = enr.series_end_date.isoformat() if enr.series_end_date else enr.scheduled_end.date().isoformat()
             dur_h = max(
                 0.25,
-                (course.scheduled_end - course.scheduled_start).total_seconds() / 3600.0,
+                (enr.scheduled_end - enr.scheduled_start).total_seconds() / 3600.0,
             )
         else:
             dur_h = 1.0
@@ -4342,24 +4205,20 @@ def v1_session_ledger_post(payload: dict, user: AppUser = Depends(require_admin_
     return {"ok": True}
 
 
-# --- Courses (admin + coach) ---
+# --- Courses (admin + coach) — URL ``course_id`` = enrollment id ---
 
 
 @app.get("/api/admin/courses", response_model=list[CourseOut])
 def admin_list_courses(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> list[CourseOut]:
-    courses = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
-        .order_by(Course.scheduled_start.desc())
+    rows = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
+        .order_by(CourseEnrollment.scheduled_start.desc())
         .limit(200)
         .all()
     )
-    return [course_to_out(c) for c in courses]
+    return [enrollment_to_out(e) for e in rows]
 
 
 @app.get("/api/admin/courses/by-day", response_model=list[CourseOut])
@@ -4370,21 +4229,17 @@ def admin_courses_by_day(
 ) -> list[CourseOut]:
     # [F009][S003]
     # Feature: Scheduled course & enrollment PINs
-    # Step: Staff lists courses that fall on ``day`` for coach assignment UI.
-    courses_raw = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")))
-        .order_by(Course.scheduled_start.asc())
+    # Step: Staff lists enrollments that fall on ``day`` for coach assignment UI.
+    rows_raw = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
+        .order_by(CourseEnrollment.scheduled_start.asc())
         .limit(800)
         .all()
     )
-    picked = [c for c in courses_raw if day in get_lesson_dates_for_course(c)]
-    return [course_to_out(c) for c in picked]
+    picked = [e for e in rows_raw if day in get_lesson_dates_for_enrollment(e)]
+    return [enrollment_to_out(e) for e in picked]
 
 
 @app.post("/api/admin/courses", response_model=CourseOut)
@@ -4413,51 +4268,38 @@ def admin_create_course(
     first_start = datetime.combine(lesson_dates[0], payload.scheduled_start.time())
     first_end = first_start + dur
 
-    course = Course(
-        title=payload.title,
-        branch_id=payload.branch_id,
-        coach_id=payload.coach_id,
-        scheduled_start=first_start,
-        scheduled_end=first_end,
-        total_lessons=payload.total_lessons,
-        lesson_weekdays=",".join(str(x) for x in ws),
-        series_start_date=lesson_dates[0],
-        series_end_date=series_end,
-    )
-    db.add(course)
-    db.flush()
-
-    branch = course.branch
+    branch = db.query(Branch).filter(Branch.id == payload.branch_id).first()
+    assert branch is not None
     first_for_coach_notice: Student | None = None
     enrolled_names: list[str] = []
     note_trim = (payload.coach_schedule_note or "").strip()
     needs_coach_schedule = bool(note_trim)
     n_inst = max(1, min(5, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
+    first_created: CourseEnrollment | None = None
 
     for sid in payload.student_ids:
         student = db.query(Student).filter(Student.id == sid).first()
         if not student:
             continue
-        if (
-            db.query(CourseEnrollment)
-            .filter(
-                CourseEnrollment.course_id == course.id,
-                CourseEnrollment.student_id == student.id,
-            )
-            .first()
-        ):
-            continue
         if _is_deleted(db, "students", student.id):
             continue
         seg_payload: list[dict] = []
         seg_json: str | None = None
+        peer_kwargs = {
+            "peer_branch_id": payload.branch_id,
+            "peer_coach_id": payload.coach_id,
+            "peer_title": payload.title,
+            "peer_series_start": lesson_dates[0],
+        }
         if n_inst <= 1:
-            primary_pin = allocate_enrollment_pin(db, course.id, student.id)
+            primary_pin = allocate_enrollment_pin(db, None, student.id, **peer_kwargs)
         else:
             batch_reserved: set[str] = set()
             for idx, (lo, hi) in enumerate(segment_ranges):
-                p = allocate_enrollment_pin(db, course.id, student.id, avoid_pins=frozenset(batch_reserved))
+                p = allocate_enrollment_pin(
+                    db, None, student.id, avoid_pins=frozenset(batch_reserved), **peer_kwargs
+                )
                 batch_reserved.add(p)
                 seg_payload.append(
                     {
@@ -4470,15 +4312,25 @@ def admin_create_course(
                 )
             seg_json = json.dumps(seg_payload, ensure_ascii=False)
             primary_pin = str(seg_payload[0]["pin"])
-        db.add(
-            CourseEnrollment(
-                course_id=course.id,
-                student_id=student.id,
-                checkin_pin=primary_pin,
-                segment_pins_json=seg_json,
-                coach_time_confirmed=not needs_coach_schedule,
-            )
+        enr = CourseEnrollment(
+            title=payload.title,
+            branch_id=payload.branch_id,
+            coach_id=payload.coach_id,
+            scheduled_start=first_start,
+            scheduled_end=first_end,
+            total_lessons=payload.total_lessons,
+            lesson_weekdays=",".join(str(x) for x in ws),
+            series_start_date=lesson_dates[0],
+            series_end_date=series_end,
+            student_id=student.id,
+            checkin_pin=primary_pin,
+            segment_pins_json=seg_json,
+            coach_time_confirmed=not needs_coach_schedule,
         )
+        db.add(enr)
+        db.flush()
+        if first_created is None:
+            first_created = enr
         enrolled_names.append(student.full_name)
         if first_for_coach_notice is None:
             first_for_coach_notice = student
@@ -4531,20 +4383,17 @@ def admin_create_course(
         lines.append("請主動約學員確認第一堂時間、地點及準備事項。")
         log_whatsapp(db, first_for_coach_notice, coach.phone, "\n".join(lines))
 
+    if first_created is None:
+        raise HTTPException(status_code=400, detail="No valid student_ids to enroll.")
     db.commit()
-    db.refresh(course)
     full = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(Course.id == course.id)
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == first_created.id)
         .first()
     )
     assert full is not None
-    return course_to_out(full)
+    return enrollment_to_out(full)
 
 
 @app.patch("/api/admin/courses/{course_id}/installment-paid", response_model=CourseOut)
@@ -4559,12 +4408,12 @@ def admin_course_mark_installment_paid(
     Step: Unlock scheduled-package installment PIN after staff confirms payment
     Logic: Sets ``paid: true`` on matching segment in ``segment_pins_json`` — check-in rejects unpaid segments.
     """
-    if _is_deleted(db, "courses", course_id):
+    if _is_deleted(db, "course_enrollments", course_id):
         raise HTTPException(status_code=404, detail="Course not found.")
     enr = (
         db.query(CourseEnrollment)
         .filter(
-            CourseEnrollment.course_id == course_id,
+            CourseEnrollment.id == course_id,
             CourseEnrollment.student_id == payload.student_id,
         )
         .first()
@@ -4591,18 +4440,14 @@ def admin_course_mark_installment_paid(
     enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
     db.commit()
     full = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(Course.id == course_id)
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
         .first()
     )
-    if full is None or _is_deleted(db, "courses", full.id):
+    if full is None or _is_deleted(db, "course_enrollments", full.id):
         raise HTTPException(status_code=404, detail="Course not found.")
-    return course_to_out(full)
+    return enrollment_to_out(full)
 
 
 @app.patch("/api/admin/courses/{course_id}/assign-coach", response_model=CourseOut)
@@ -4614,9 +4459,9 @@ def admin_assign_course_coach(
 ) -> CourseOut:
     # [F009][S003]
     # Feature: Scheduled course & enrollment PINs
-    # Step: Staff reassigns ``Course.coach_id`` for the coach timetable UI.
-    course = db.query(Course).filter(Course.id == course_id).first()
-    if not course or _is_deleted(db, "courses", course.id):
+    # Step: Staff reassigns enrollment ``coach_id`` for the coach timetable UI.
+    enr = db.query(CourseEnrollment).filter(CourseEnrollment.id == course_id).first()
+    if not enr or _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course not found.")
     coach = db.query(Coach).filter(
         Coach.id == payload.coach_id,
@@ -4624,22 +4469,17 @@ def admin_assign_course_coach(
     ).first()
     if not coach:
         raise HTTPException(status_code=400, detail="Invalid coach_id.")
-    course.coach_id = payload.coach_id
-    for enr in db.query(CourseEnrollment).filter(CourseEnrollment.course_id == course.id).all():
-        enr.coach_time_confirmed = False
+    enr.coach_id = payload.coach_id
+    enr.coach_time_confirmed = False
     db.commit()
     full = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(Course.id == course_id)
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
         .first()
     )
     assert full is not None
-    return course_to_out(full)
+    return enrollment_to_out(full)
 
 
 @app.get("/api/coach/courses", response_model=list[CourseOut])
@@ -4658,34 +4498,30 @@ def coach_list_courses(
     if not _coach_user_may_access_coach_row(db, user, coach_row):
         raise HTTPException(status_code=403, detail="This coach schedule is not linked to your login.")
     q = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
         .filter(
-            Course.coach_id == coach_id,
-            ~Course.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")),
+            CourseEnrollment.coach_id == coach_id,
+            ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
         )
     )
     limit_n = 400 if (from_date is not None and to_date is not None or day is not None) else 200
-    courses_raw = q.order_by(Course.scheduled_start.asc()).limit(800).all()
+    rows_raw = q.order_by(CourseEnrollment.scheduled_start.asc()).limit(800).all()
     if day:
-        courses = [c for c in courses_raw if day in get_lesson_dates_for_course(c)][:limit_n]
+        rows = [e for e in rows_raw if day in get_lesson_dates_for_enrollment(e)][:limit_n]
     elif from_date is not None and to_date is not None:
         if to_date < from_date:
             raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
-        picked: list[Course] = []
-        for c in courses_raw:
-            for ld in get_lesson_dates_for_course(c):
+        picked: list[CourseEnrollment] = []
+        for enr in rows_raw:
+            for ld in get_lesson_dates_for_enrollment(enr):
                 if from_date <= ld <= to_date:
-                    picked.append(c)
+                    picked.append(enr)
                     break
-        courses = picked[:limit_n]
+        rows = picked[:limit_n]
     else:
-        courses = courses_raw[:limit_n]
-    return [course_to_out(c) for c in courses]
+        rows = rows_raw[:limit_n]
+    return [enrollment_to_out(e) for e in rows]
 
 
 @app.patch("/api/coach/courses/{course_id}", response_model=CourseOut)
@@ -4702,33 +4538,29 @@ def coach_reschedule_course(
         raise HTTPException(status_code=404, detail="Coach not found.")
     if not _coach_user_may_access_coach_row(db, user, coach_row):
         raise HTTPException(status_code=403, detail="This coach schedule is not linked to your login.")
-    course = db.query(Course).filter(Course.id == course_id).first()
-    if not course:
+    enr = db.query(CourseEnrollment).filter(CourseEnrollment.id == course_id).first()
+    if not enr:
         raise HTTPException(status_code=404, detail="Course not found.")
-    if _is_deleted(db, "courses", course.id):
+    if _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course not found.")
-    if course.coach_id != coach_id:
+    if enr.coach_id != coach_id:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
-    course.scheduled_start = payload.scheduled_start
-    course.scheduled_end = payload.scheduled_end
+    enr.scheduled_start = payload.scheduled_start
+    enr.scheduled_end = payload.scheduled_end
     db.commit()
     full = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(Course.id == course_id)
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
         .first()
     )
     assert full is not None
-    return course_to_out(full)
+    return enrollment_to_out(full)
 
 
 def _coach_payment_summary(enr: CourseEnrollment, student: Student) -> tuple[str, str, float | None, float | None]:
     """[F003][S003] Derive payment + installment labels for coach finance tab."""
-    segments = _parse_segment_pins_json(enr.segment_pins_json)
+    segments = parse_segment_pins_json(enr.segment_pins_json)
     if len(segments) <= 1:
         if not segments or segments[0].paid:
             return "Paid", "全數已付", None, None
@@ -4779,18 +4611,19 @@ def coach_pending_students(
 ) -> list[CoachPendingStudentOut]:
     """[F003][S001] Enrollments assigned to this coach awaiting calendar slot."""
     cid = _resolve_coach_id_param(db, user, coach_id)
-    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     rows = (
-        db.query(CourseEnrollment, Course, Student, Branch)
-        .join(Course, CourseEnrollment.course_id == Course.id)
-        .join(Student, CourseEnrollment.student_id == Student.id)
-        .join(Branch, Course.branch_id == Branch.id)
+        db.query(CourseEnrollment)
+        .options(
+            joinedload(CourseEnrollment.student),
+            joinedload(CourseEnrollment.branch),
+        )
         .filter(
-            Course.coach_id == cid,
+            CourseEnrollment.coach_id == cid,
             CourseEnrollment.coach_time_confirmed.is_(False),
-            ~Course.id.in_(deleted_c),
-            ~Student.id.in_(deleted_s),
+            ~CourseEnrollment.id.in_(deleted_e),
+            ~CourseEnrollment.student_id.in_(deleted_s),
         )
         .order_by(CourseEnrollment.created_at.asc())
         .all()
@@ -4798,16 +4631,16 @@ def coach_pending_students(
     return [
         CoachPendingStudentOut(
             enrollment_id=enr.id,
-            course_id=course.id,
-            student_id=student.id,
-            student_name=student.full_name,
-            student_phone=student.phone,
-            course_title=course.title,
-            branch_name=branch.name,
-            total_lessons=course.total_lessons,
-            placeholder_start=course.scheduled_start,
+            course_id=enr.id,
+            student_id=enr.student.id,
+            student_name=enr.student.full_name,
+            student_phone=enr.student.phone,
+            course_title=enr.title,
+            branch_name=enr.branch.name,
+            total_lessons=enr.total_lessons,
+            placeholder_start=enr.scheduled_start,
         )
-        for enr, course, student, branch in rows
+        for enr in rows
     ]
 
 
@@ -4819,30 +4652,30 @@ def coach_student_payments(
 ) -> list[CoachStudentPaymentOut]:
     """[F003][S003] Payment / installment overview for students on this coach's courses."""
     cid = _resolve_coach_id_param(db, user, coach_id)
-    deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "courses")
+    deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     rows = (
-        db.query(CourseEnrollment, Course, Student)
-        .join(Course, CourseEnrollment.course_id == Course.id)
-        .join(Student, CourseEnrollment.student_id == Student.id)
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.student))
         .filter(
-            Course.coach_id == cid,
-            ~Course.id.in_(deleted_c),
-            ~Student.id.in_(deleted_s),
+            CourseEnrollment.coach_id == cid,
+            ~CourseEnrollment.id.in_(deleted_e),
+            ~CourseEnrollment.student_id.in_(deleted_s),
         )
-        .order_by(Student.full_name.asc(), Course.id.desc())
+        .order_by(CourseEnrollment.student_id.asc(), CourseEnrollment.id.desc())
         .all()
     )
     out: list[CoachStudentPaymentOut] = []
-    for enr, course, student in rows:
+    for enr in rows:
+        student = enr.student
         pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(enr, student)
         out.append(
             CoachStudentPaymentOut(
                 student_id=student.id,
                 student_name=student.full_name,
                 student_phone=student.phone,
-                course_id=course.id,
-                course_title=course.title,
+                course_id=enr.id,
+                course_title=enr.title,
                 payment_status=pay_st,
                 installment_status=inst_st,
                 amount_paid=paid_amt,
@@ -4864,7 +4697,7 @@ def coach_confirm_enrollment_schedule(
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
     enr = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.course).joinedload(Course.branch))
+        .options(joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == enrollment_id)
         .first()
     )
@@ -4872,36 +4705,31 @@ def coach_confirm_enrollment_schedule(
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     if payload.enrollment_id != enrollment_id:
         raise HTTPException(status_code=400, detail="enrollment_id mismatch.")
-    course = enr.course
-    if not course or _is_deleted(db, "courses", course.id):
+    if _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course not found.")
-    if course.coach_id != cid:
+    if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
     start = datetime.combine(payload.day, time(payload.start_hour, 0))
     end = start + timedelta(hours=payload.duration_hours)
-    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_course_id=course.id)
-    ws_raw = [int(x) for x in (course.lesson_weekdays or "0").split(",") if x.strip()]
-    lesson_dates = enumerate_lesson_dates(payload.day, ws_raw, course.total_lessons)
+    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
+    ws_raw = [int(x) for x in (enr.lesson_weekdays or "0").split(",") if x.strip()]
+    lesson_dates = enumerate_lesson_dates(payload.day, ws_raw, enr.total_lessons)
     if not lesson_dates:
         raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
-    course.series_start_date = lesson_dates[0]
-    course.series_end_date = lesson_dates[-1]
-    course.scheduled_start = datetime.combine(lesson_dates[0], start.time())
-    course.scheduled_end = datetime.combine(lesson_dates[0], end.time())
+    enr.series_start_date = lesson_dates[0]
+    enr.series_end_date = lesson_dates[-1]
+    enr.scheduled_start = datetime.combine(lesson_dates[0], start.time())
+    enr.scheduled_end = datetime.combine(lesson_dates[0], end.time())
     enr.coach_time_confirmed = True
     db.commit()
     full = (
-        db.query(Course)
-        .options(
-            joinedload(Course.branch),
-            joinedload(Course.coach),
-            joinedload(Course.enrollments).joinedload(CourseEnrollment.student),
-        )
-        .filter(Course.id == course.id)
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == enr.id)
         .first()
     )
     assert full is not None
-    return course_to_out(full)
+    return enrollment_to_out(full)
 
 
 @app.patch("/api/coach/students/{student_id}/signature")
