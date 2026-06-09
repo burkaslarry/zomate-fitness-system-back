@@ -394,6 +394,65 @@ def _alnum_slug(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
 
+def _default_coach_username(full_name: str) -> str:
+    slug = _alnum_slug(full_name)
+    return slug[:120] if slug else ""
+
+
+def _coach_login_user(db: Session, coach_id: int) -> AppUser | None:
+    return db.query(AppUser).filter(AppUser.coach_id == coach_id).first()
+
+
+def _sync_coach_login(
+    db: Session,
+    coach: Coach,
+    *,
+    login_username: str | None = None,
+    password: str | None = None,
+    create_if_missing: bool = False,
+) -> None:
+    """[F003][S002] Admin-managed COACH login: create or update AppUser linked to coach row."""
+    user = _coach_login_user(db, coach.id)
+    uname: str | None = None
+    if login_username is not None:
+        uname = login_username.strip().lower()
+        if not uname:
+            raise HTTPException(status_code=400, detail="login_username cannot be empty.")
+    pwd = (password or "").strip() or None
+
+    if user is None and not create_if_missing and pwd is None and uname is None:
+        return
+    if user is None and (create_if_missing or pwd or uname):
+        if not uname:
+            uname = _default_coach_username(coach.full_name)
+        if not uname:
+            raise HTTPException(status_code=400, detail="Provide login_username or use an alphanumeric coach name.")
+        if not pwd:
+            raise HTTPException(status_code=400, detail="password required when creating coach login.")
+        conflict = db.query(AppUser).filter(AppUser.username == uname).first()
+        if conflict:
+            raise HTTPException(status_code=409, detail="Login username already exists.")
+        salt, ph = _make_password_record(pwd)
+        db.add(AppUser(username=uname, role="COACH", password_salt=salt, password_hash=ph, coach_id=coach.id))
+        return
+
+    if user is None:
+        return
+
+    if uname and uname != user.username:
+        conflict = db.query(AppUser).filter(AppUser.username == uname, AppUser.id != user.id).first()
+        if conflict:
+            raise HTTPException(status_code=409, detail="Login username already exists.")
+        user.username = uname
+    if pwd:
+        salt, ph = _make_password_record(pwd)
+        user.password_salt = salt
+        user.password_hash = ph
+    user.role = "COACH"
+    user.coach_id = coach.id
+    user.is_active = bool(coach.active)
+
+
 def _login_role_for_response(user: AppUser) -> str:
     """Map DB ``zomate_fs_users.role`` to API contract: ADMIN | CLERK | COACH."""
     r = (user.role or "").strip().upper()
@@ -431,10 +490,22 @@ def _coach_user_may_access_coach_row(db: Session, user: AppUser, coach: Coach | 
 
 
 def _coach_row_for_user(db: Session, user: AppUser) -> Coach | None:
-    """[F003][S001] Map COACH login to a single ``Coach`` row via username slug match."""
+    """[F003][S001] Map COACH login to ``Coach`` via ``AppUser.coach_id`` or username slug fallback."""
     if user.role != "COACH":
         return None
     deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+    if user.coach_id is not None:
+        coach = (
+            db.query(Coach)
+            .filter(
+                Coach.id == user.coach_id,
+                Coach.active.is_(True),
+                ~Coach.id.in_(deleted),
+            )
+            .first()
+        )
+        if coach:
+            return coach
     rows = (
         db.query(Coach)
         .filter(Coach.active.is_(True), ~Coach.id.in_(deleted))
@@ -911,6 +982,7 @@ def coach_row_to_out(
         br = db.get(Branch, coach.branch_id)
         if br is not None and not _is_deleted(db, "branches", br.id):
             bn = br.name
+    login_user = _coach_login_user(db, coach.id)
     return CoachOut(
         id=coach.id,
         full_name=coach.full_name,
@@ -920,6 +992,7 @@ def coach_row_to_out(
         branch_id=coach.branch_id,
         branch_name=bn,
         hire_date=coach.hire_date,
+        login_username=login_user.username if login_user else None,
         created_at=coach.created_at,
         enrolled_students=list(enrolled_students or ()),
     )
@@ -1315,6 +1388,35 @@ def _migrate_coach_hire_date(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_coach_user_links(db: Session) -> None:
+    """[F003][S002] Link COACH AppUser rows to coach profiles via coach_id."""
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE zomate_fs_users ADD COLUMN IF NOT EXISTS coach_id INTEGER "
+                "UNIQUE REFERENCES zomate_fs_coaches(id)"
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+    try:
+        for user in db.query(AppUser).filter(AppUser.role == "COACH", AppUser.coach_id.is_(None)).all():
+            for coach in (
+                db.query(Coach)
+                .filter(Coach.active.is_(True), ~Coach.id.in_(deleted))
+                .order_by(Coach.id.asc())
+                .all()
+            ):
+                if _coach_user_may_access_coach_row(db, user, coach):
+                    user.coach_id = coach.id
+                    break
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _seed_default_branches(db: Session) -> None:
     branches = [
         {
@@ -1649,6 +1751,7 @@ def _sync_startup() -> None:
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
         _migrate_coach_hire_date(db)
+        _migrate_coach_user_links(db)
         _seed_default_branches(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
@@ -3627,10 +3730,21 @@ def create_coach(
         ).first():
             raise HTTPException(status_code=400, detail="Invalid branch_id.")
     data = payload.model_dump()
+    login_username = data.pop("login_username", None)
+    password = data.pop("password", None)
     if data.get("hire_date") is None:
         data["hire_date"] = date.today()
     c = Coach(**data)
     db.add(c)
+    db.flush()
+    if login_username or password:
+        _sync_coach_login(
+            db,
+            c,
+            login_username=login_username,
+            password=password,
+            create_if_missing=True,
+        )
     db.commit()
     db.refresh(c)
     en_map = _enrolled_students_for_coaches(db, [c.id])
@@ -3648,9 +3762,13 @@ def update_coach(
     if not coach or _is_deleted(db, "coaches", coach.id):
         raise HTTPException(status_code=404, detail="Coach not found.")
 
-    data = payload.model_dump(exclude_unset=True)
-    if not data:
+    raw = payload.model_dump(exclude_unset=True)
+    if not raw:
         raise HTTPException(status_code=400, detail="No fields to update.")
+
+    login_username = raw.pop("login_username") if "login_username" in raw else None
+    password = raw.pop("password") if "password" in raw else None
+    data = raw
 
     if "phone" in data and data["phone"]:
         other = (
@@ -3681,6 +3799,19 @@ def update_coach(
         coach.active = bool(data["active"])
     if "hire_date" in data:
         coach.hire_date = data["hire_date"]
+
+    if login_username is not None or password is not None:
+        _sync_coach_login(
+            db,
+            coach,
+            login_username=login_username,
+            password=password,
+            create_if_missing=bool(password),
+        )
+    elif "active" in data and data["active"] is not None:
+        login_user = _coach_login_user(db, coach.id)
+        if login_user:
+            login_user.is_active = bool(coach.active)
 
     db.commit()
     db.refresh(coach)

@@ -302,6 +302,7 @@ class CoachOut(BaseModel):
     branch_id: int | None
     branch_name: str | None = None
     hire_date: date | None = None
+    login_username: str | None = None
     created_at: datetime
     enrolled_students: list[CoachEnrolledStudentOut] = Field(default_factory=list)
 
@@ -315,6 +316,8 @@ class CoachCreate(BaseModel):
     specialty: str | None = Field(default=None, max_length=160)
     branch_id: int | None = None
     hire_date: date | None = Field(default=None, description="入職日期；省略則為伺服器今日（UTC 日期）")
+    login_username: str | None = Field(default=None, min_length=3, max_length=120)
+    password: str | None = Field(default=None, min_length=6, max_length=64)
 
 
 class CoachUpdate(BaseModel):
@@ -326,6 +329,8 @@ class CoachUpdate(BaseModel):
     active: bool | None = None
     branch_id: int | None = None
     hire_date: date | None = None
+    login_username: str | None = Field(default=None, min_length=3, max_length=120)
+    password: str | None = Field(default=None, min_length=6, max_length=64)
 
 
 class CourseCreate(BaseModel):
