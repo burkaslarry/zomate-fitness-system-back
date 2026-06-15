@@ -436,6 +436,85 @@ class CoachStudentPaymentOut(BaseModel):
     signature_image_url: str | None = None
 
 
+class CoachStudentBriefOut(BaseModel):
+    """[F003][S005] Coach roster — students assigned via course enrollments."""
+
+    student_id: int
+    full_name: str
+    phone: str
+    lesson_balance: int
+    enrollment_count: int
+    pending_schedule: bool
+
+
+class CoachStudentEnrollmentOut(BaseModel):
+    enrollment_id: int
+    course_title: str
+    scheduled_start: datetime
+    scheduled_end: datetime
+    total_lessons: int
+    coach_time_confirmed: bool
+    payment_status: str
+    installment_status: str
+
+
+class CoachStudentCheckinOut(BaseModel):
+    id: int
+    channel: str
+    remarks: str | None
+    created_at: datetime
+
+
+class CoachStudentAttendanceOut(BaseModel):
+    id: int
+    course_id: int | None
+    course_title: str | None
+    session_calendar_date: date
+    attended_at: datetime
+
+
+class CoachStudentRecordOut(BaseModel):
+    """[F003][S005] Full student dossier for coach portal."""
+
+    student_id: int
+    full_name: str
+    phone: str
+    lesson_balance: int
+    enrollments: list[CoachStudentEnrollmentOut]
+    checkins: list[CoachStudentCheckinOut]
+    attendance: list[CoachStudentAttendanceOut]
+
+
+class CoachRemindPaymentBody(BaseModel):
+    """[F003][S006] Coach-triggered installment / balance payment reminder."""
+
+    course_id: int = Field(ge=1)
+    coach_id: int | None = None
+
+
+class CoachRemindPaymentOut(BaseModel):
+    ok: bool
+    message: str
+    wa_link: str
+    logged: bool
+
+
+class CoachBookSession(BaseModel):
+    """[F003][S007] Coach books or reschedules 1–2h session; server rejects slot conflicts."""
+
+    coach_id: int | None = None
+    enrollment_id: int = Field(ge=1)
+    day: date
+    start_hour: int = Field(ge=9, le=18)
+    duration_hours: int = Field(ge=1, le=2)
+
+    @model_validator(mode="after")
+    def validate_slot_within_business_hours(self) -> "CoachBookSession":
+        if self.start_hour + self.duration_hours > 19:
+            raise ValueError("Time slot must end by 19:00 (7pm).")
+        return self
+
+
 class CourseAssignCoach(BaseModel):
     """Reassign a course series to another coach (staff)."""
 
