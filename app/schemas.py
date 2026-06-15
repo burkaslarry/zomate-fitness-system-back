@@ -109,6 +109,8 @@ class MemberCreate(BaseModel):
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
     digital_signature: str = Field(min_length=20, max_length=400_000)
+    coach_id: int | None = Field(default=None, ge=1)
+    course_category_id: int | None = Field(default=None, ge=1)
 
     @field_validator("email", mode="before")
     @classmethod
@@ -305,9 +307,16 @@ class CoachOut(BaseModel):
     login_username: str | None = None
     created_at: datetime
     enrolled_students: list[CoachEnrolledStudentOut] = Field(default_factory=list)
+    skill_category_ids: list[int] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
+
+
+class CoachSkillsUpdate(BaseModel):
+    """[F011][S002] Admin assigns course categories a coach may teach."""
+
+    course_category_ids: list[int] = Field(default_factory=list)
 
 
 class CoachCreate(BaseModel):

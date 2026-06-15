@@ -46,6 +46,26 @@ class Coach(Base):
 
     branch: Mapped["Branch | None"] = relationship(back_populates="coaches")
     course_enrollments: Mapped[list["CourseEnrollment"]] = relationship(back_populates="coach")
+    skills: Mapped[list["CoachSkill"]] = relationship(back_populates="coach")
+
+
+class CoachSkill(Base):
+    """[F011][S002] Many-to-many: which course categories a coach may teach."""
+
+    __tablename__ = "zomate_fs_coach_skills"
+    __table_args__ = (
+        UniqueConstraint("coach_id", "course_category_id", name="uq_zomate_fs_coach_skill"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    coach_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=False, index=True)
+    course_category_id: Mapped[int] = mapped_column(
+        ForeignKey("zomate_fs_course_categories.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    coach: Mapped["Coach"] = relationship(back_populates="skills")
+    course_category: Mapped["CourseCategory"] = relationship()
 
 
 class CourseEnrollment(Base):
@@ -120,6 +140,7 @@ class CourseCategory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     enrollments: Mapped[list["CategoryEnrollment"]] = relationship(back_populates="course_category")
+    coach_skills: Mapped[list["CoachSkill"]] = relationship(back_populates="course_category")
 
 
 class CategoryEnrollment(Base):

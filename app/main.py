@@ -47,6 +47,7 @@ from .models import (
     CategoryEnrollment,
     CheckinLog,
     Coach,
+    CoachSkill,
     CourseCategory,
     CourseEnrollment,
     DeletedRecord,
@@ -70,6 +71,7 @@ from .schemas import (
     CoachEnrolledStudentOut,
     CoachMeOut,
     CoachOut,
+    CoachSkillsUpdate,
     CoachPendingStudentOut,
     CoachScheduleConfirm,
     CoachSignatureUpdate,
@@ -971,6 +973,52 @@ def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[in
     return out
 
 
+def _coach_skill_category_ids(db: Session, coach_id: int) -> list[int]:
+    """[F011][S002] Course category IDs this coach is permitted to teach."""
+    rows = (
+        db.query(CoachSkill.course_category_id)
+        .filter(CoachSkill.coach_id == coach_id)
+        .order_by(CoachSkill.course_category_id.asc())
+        .all()
+    )
+    return [int(r[0]) for r in rows]
+
+
+def _set_coach_skills(db: Session, coach_id: int, category_ids: list[int]) -> list[int]:
+    """[F011][S002] Replace coach skill mappings; return normalized category id list."""
+    unique_ids = sorted({int(cid) for cid in category_ids if int(cid) > 0})
+    if unique_ids:
+        active = (
+            db.query(CourseCategory.id)
+            .filter(
+                CourseCategory.id.in_(unique_ids),
+                CourseCategory.is_active.is_(True),
+                CourseCategory.is_deleted.is_(False),
+            )
+            .all()
+        )
+        valid = {int(r[0]) for r in active}
+        invalid = [cid for cid in unique_ids if cid not in valid]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Invalid or inactive course category ids: {invalid}")
+        unique_ids = sorted(valid)
+    db.query(CoachSkill).filter(CoachSkill.coach_id == coach_id).delete(synchronize_session=False)
+    for cid in unique_ids:
+        db.add(CoachSkill(coach_id=coach_id, course_category_id=cid))
+    return unique_ids
+
+
+def _assert_coach_teaches_category(db: Session, coach_id: int, category_id: int) -> None:
+    """[F011][S002] Registration — selected category must be mapped to coach."""
+    skill_rows = _coach_skill_category_ids(db, coach_id)
+    if skill_rows and category_id not in skill_rows:
+        raise HTTPException(status_code=400, detail="Selected course category is not assigned to this coach.")
+    if not skill_rows:
+        cat = db.get(CourseCategory, category_id)
+        if not cat or not cat.is_active or cat.is_deleted:
+            raise HTTPException(status_code=400, detail="Invalid course category.")
+
+
 def coach_row_to_out(
     db: Session,
     coach: Coach,
@@ -995,6 +1043,7 @@ def coach_row_to_out(
         login_username=login_user.username if login_user else None,
         created_at=coach.created_at,
         enrolled_students=list(enrolled_students or ()),
+        skill_category_ids=_coach_skill_category_ids(db, coach.id),
     )
 
 
@@ -1019,19 +1068,19 @@ def _signature_relative_path(stored: str | None) -> str | None:
 
 
 def _signature_image_for_member(student: Student) -> str | None:
-    """[F001][S004] Prefer PostgreSQL blob; fall back to local disk for dev uploads."""
+    """[F001][S004] Prefer disk URL via proxy; legacy blob fallback only."""
+    relative_path = _signature_relative_path(student.signature_image_url)
+    if relative_path and (UPLOADS_DIR / relative_path).is_file():
+        return _file_url(relative_path)
     blob = getattr(student, "signature_image_blob", None)
     if blob:
         encoded = base64.b64encode(blob).decode("ascii")
         return f"data:image/png;base64,{encoded}"
-    relative_path = _signature_relative_path(student.signature_image_url)
-    if relative_path and (UPLOADS_DIR / relative_path).is_file():
-        return _file_url(relative_path)
     return None
 
 
-def _save_signature_image(data_url: str, student_id: int) -> tuple[str, bytes]:
-    """[F001][S004] Persist canvas signature PNG; return relative path + raw bytes for DB blob."""
+def _save_signature_image(data_url: str, student_id: int) -> str:
+    """[F001][S004] Persist canvas signature PNG to disk; return relative path only (no DB blob)."""
     prefix = "data:image/png;base64,"
     raw = data_url.strip()
     if not raw.startswith(prefix):
@@ -1051,13 +1100,13 @@ def _save_signature_image(data_url: str, student_id: int) -> tuple[str, bytes]:
         (UPLOADS_DIR / relative_path).write_bytes(payload)
     except OSError:
         pass
-    return relative_path, payload
+    return relative_path
 
 
 def _apply_signature_image(student: Student, data_url: str) -> None:
-    relative_path, payload = _save_signature_image(data_url, student.id)
+    relative_path = _save_signature_image(data_url, student.id)
     student.signature_image_url = relative_path
-    student.signature_image_blob = payload
+    student.signature_image_blob = None
 
 
 def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
@@ -2181,6 +2230,22 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
     db.add(student)
     db.flush()
     _apply_signature_image(student, payload.digital_signature)
+    if payload.coach_id is not None and payload.course_category_id is not None:
+        coach = db.get(Coach, payload.coach_id)
+        if not coach or _is_deleted(db, "coaches", coach.id) or not coach.active:
+            raise HTTPException(status_code=400, detail="Invalid or inactive coach.")
+        _assert_coach_teaches_category(db, payload.coach_id, payload.course_category_id)
+        cat = _resolve_active_course_category(db, payload.course_category_id)
+        db.add(
+            CategoryEnrollment(
+                student_id=student.id,
+                course_category_id=cat.id,
+                status="active",
+                started_at=date.today(),
+                total_lessons=0,
+                notes=f"Onboarding coach_id={payload.coach_id}",
+            )
+        )
     db.add(AuditLog(action="member_create", student_id=student.id, detail=json.dumps({"hkid": hkid}, ensure_ascii=False)))
     record_activity(db, student, "member_create", student.id)
     db.commit()
@@ -3051,14 +3116,19 @@ def update_public_coach(coach_id: int, payload: CoachUpdate, db: Session = Depen
 
 
 @app.get("/api/course-categories")
-def list_course_categories_public(db: Session = Depends(get_db)) -> list[dict]:
-    """[F011][S001] 報 Course / 試堂 — 只回傳啟用中的 course category。"""
-    rows = (
-        db.query(CourseCategory)
-        .filter(CourseCategory.is_active.is_(True), CourseCategory.is_deleted.is_(False))
-        .order_by(CourseCategory.id.asc())
-        .all()
+def list_course_categories_public(
+    coach_id: int | None = Query(default=None, ge=1),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """[F011][S001] 報 Course / 試堂 / 新會員 — 啟用 category；可選 coach_id 過濾教練權限。"""
+    q = db.query(CourseCategory).filter(
+        CourseCategory.is_active.is_(True), CourseCategory.is_deleted.is_(False)
     )
+    if coach_id is not None:
+        skill_ids = _coach_skill_category_ids(db, coach_id)
+        if skill_ids:
+            q = q.filter(CourseCategory.id.in_(skill_ids))
+    rows = q.order_by(CourseCategory.id.asc()).all()
     return [{"id": c.id, "name": c.name, "is_active": c.is_active} for c in rows]
 
 
@@ -3817,6 +3887,36 @@ def update_coach(
     db.refresh(coach)
     en_map = _enrolled_students_for_coaches(db, [coach.id])
     return coach_row_to_out(db, coach, enrolled_students=en_map.get(coach.id, []))
+
+
+@app.get("/api/admin/coaches/{coach_id}/skills")
+def admin_get_coach_skills(
+    coach_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F011][S002] 教練課程權限分配 — list assigned category ids."""
+    coach = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach or _is_deleted(db, "coaches", coach.id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    return {"coach_id": coach_id, "course_category_ids": _coach_skill_category_ids(db, coach_id)}
+
+
+@app.put("/api/admin/coaches/{coach_id}/skills")
+def admin_set_coach_skills(
+    coach_id: int,
+    payload: CoachSkillsUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F011][S002] 教練課程權限分配 — replace category checkboxes."""
+    coach = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach or _is_deleted(db, "coaches", coach.id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    ids = _set_coach_skills(db, coach_id, payload.course_category_ids)
+    db.commit()
+    log_event("coach_skills_updated", coach_id=coach_id, category_ids=ids)
+    return {"coach_id": coach_id, "course_category_ids": ids}
 
 
 @app.get("/api/admin/coaches/export.csv")
@@ -4753,6 +4853,26 @@ def coach_list_courses(
     else:
         rows = rows_raw[:limit_n]
     return [enrollment_to_out(e) for e in rows]
+
+
+@app.get("/api/coach/schedule", response_model=list[CourseOut])
+def coach_list_schedule_alias(
+    coach_id: int,
+    day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> list[CourseOut]:
+    """[F003][S002] Alias for GET /api/coach/courses — coach-isolated calendar refresh."""
+    return coach_list_courses(
+        coach_id=coach_id,
+        day=day,
+        from_date=from_date,
+        to_date=to_date,
+        db=db,
+        user=user,
+    )
 
 
 @app.patch("/api/coach/courses/{course_id}", response_model=CourseOut)
