@@ -82,8 +82,10 @@ from .schemas import (
     CoachStudentEnrollmentOut,
     CoachStudentCheckinOut,
     CoachStudentAttendanceOut,
+    CoachStudentFollowUpOut,
     CoachRemindPaymentBody,
     CoachRemindPaymentOut,
+    CoachStudentFollowUpOut,
     CoachBookSession,
     CoachTrialGrantBody,
     CoachUpdate,
@@ -319,6 +321,7 @@ def _record_soft_delete(db: Session, entity_type: str, entity_id: int, actor: Ap
 
 
 def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
+    """[F002][S004] A4 printable QR PDF with Zomate Fitness Limited branding."""
     qr_img = qrcode.make(payload)
     qr_buffer = io.BytesIO()
     qr_img.save(qr_buffer, format="PNG")
@@ -327,12 +330,14 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
     packet = io.BytesIO()
     canvas = Canvas(packet, pagesize=A4)
     width, _ = A4
-    canvas.setFont("Helvetica-Bold", 16)
-    canvas.drawString(40, 800, "Zomate Fitness — QR Paper (Print-out)")
-    canvas.setFont("Helvetica", 11)
-    canvas.drawString(40, 776, "Print this page and display at reception / gym floor.")
+    canvas.setFont("Helvetica-Bold", 22)
+    title = "Zomate Fitness Limited"
+    title_w = canvas.stringWidth(title, "Helvetica-Bold", 22)
+    canvas.drawString((width - title_w) / 2, 800, title)
+    canvas.setFont("Helvetica-Bold", 14)
+    canvas.drawString(40, 768, f"QR — {label}")
     canvas.setFont("Helvetica", 10)
-    canvas.drawString(40, 752, f"Purpose: {label}")
+    canvas.drawString(40, 748, "Print this page and display at reception / gym floor.")
     canvas.drawImage(
         ImageReader(qr_buffer),
         (width - 260) / 2,
@@ -343,7 +348,7 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
         mask="auto",
     )
     canvas.setFont("Helvetica", 9)
-    canvas.drawString(40, 56, "Scan with mobile — Zomate Fitness check-in / onboarding.")
+    canvas.drawString(40, 56, "Scan with mobile — Zomate Fitness Limited check-in / onboarding.")
     canvas.drawString(40, 42, "A4 printable layout · QR for counter display.")
     canvas.showPage()
     canvas.save()
@@ -3928,6 +3933,96 @@ def admin_set_coach_skills(
     return {"coach_id": coach_id, "course_category_ids": ids}
 
 
+@app.get("/api/admin/coaches/{coach_id}/student-follow-up", response_model=list[CoachStudentFollowUpOut])
+def admin_coach_student_follow_up(
+    coach_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> list[CoachStudentFollowUpOut]:
+    """[F003][S008] Admin grid: attendance status, next lesson, installment payment reminder."""
+    coach = db.query(Coach).filter(Coach.id == coach_id).first()
+    if not coach or _is_deleted(db, "coaches", coach.id):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    deleted_e = _deleted_course_enrollment_ids()
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    enrollments = (
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.student))
+        .filter(
+            CourseEnrollment.coach_id == coach_id,
+            ~CourseEnrollment.id.in_(deleted_e),
+            ~CourseEnrollment.student_id.in_(deleted_s),
+        )
+        .order_by(CourseEnrollment.student_id.asc(), CourseEnrollment.scheduled_start.asc())
+        .all()
+    )
+    by_student: dict[int, dict] = {}
+    today = date.today()
+    for enr in enrollments:
+        st = enr.student
+        sid = st.id
+        pay_st, inst_st, _, _ = _coach_payment_summary(enr, st)
+        if sid not in by_student:
+            last_att = (
+                db.query(Attendance)
+                .filter(Attendance.student_id == sid, Attendance.coach_id == coach_id)
+                .order_by(Attendance.attended_at.desc())
+                .first()
+            )
+            last_chk = (
+                db.query(CheckinLog)
+                .filter(CheckinLog.student_id == sid)
+                .order_by(CheckinLog.created_at.desc())
+                .first()
+            )
+            if last_att:
+                att_status = f"最近上堂 {last_att.session_calendar_date.isoformat()}"
+            elif last_chk:
+                att_status = f"最近簽到 {last_chk.created_at.date().isoformat()}"
+            else:
+                att_status = "從未簽到"
+            by_student[sid] = {
+                "student_id": sid,
+                "full_name": st.full_name,
+                "phone": st.phone,
+                "attendance_status": att_status,
+                "next_lesson": "—",
+                "payment_reminder": None,
+                "_next_dt": None,
+            }
+        row = by_student[sid]
+        if not enr.coach_time_confirmed:
+            row["next_lesson"] = "待排程"
+        else:
+            lesson_day = enr.scheduled_start.date()
+            if lesson_day >= today:
+                if row["_next_dt"] is None or lesson_day < row["_next_dt"]:
+                    row["_next_dt"] = lesson_day
+                    t0 = enr.scheduled_start.strftime("%H:%M")
+                    t1 = enr.scheduled_end.strftime("%H:%M")
+                    row["next_lesson"] = f"{lesson_day.isoformat()} {t0}–{t1} · {enr.title}"
+        if pay_st != "Paid" and inst_st:
+            reminder = f"{inst_st} · {enr.title}"
+            if row["payment_reminder"]:
+                row["payment_reminder"] = f"{row['payment_reminder']}；{reminder}"
+            else:
+                row["payment_reminder"] = reminder
+    out: list[CoachStudentFollowUpOut] = []
+    for data in by_student.values():
+        out.append(
+            CoachStudentFollowUpOut(
+                student_id=data["student_id"],
+                full_name=data["full_name"],
+                phone=data["phone"],
+                attendance_status=data["attendance_status"],
+                next_lesson=data["next_lesson"],
+                payment_reminder=data["payment_reminder"],
+            )
+        )
+    out.sort(key=lambda r: r.full_name)
+    return out
+
+
 @app.get("/api/admin/coaches/export.csv")
 def export_coaches_csv(
     db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
@@ -4281,27 +4376,19 @@ def download_qrcode_pdf(
     origin: str | None = None,
     payload: str | None = None,
 ) -> Response:
-    kind_map = {
-        "onboard": "onboard",
-        "checkin": "checkin",
-        "payload": "payload",
-    }
-    if kind not in kind_map:
-        raise HTTPException(status_code=400, detail="Invalid kind.")
+    """[F002][S004] Onboard or check-in URL QR PDF (payload kind removed)."""
+    if kind not in ("onboard", "checkin"):
+        raise HTTPException(status_code=400, detail="Invalid kind. Use onboard or checkin.")
 
     base = (origin or str(request.base_url).rstrip("/")).rstrip("/")
     if kind == "onboard":
         data = f"{base}/student/onboard"
         name = "onboard_qr.pdf"
         label = "Registration"
-    elif kind == "checkin":
+    else:
         data = payload or f"{base}/student/checkin?from=qr"
         label = "Check-In"
         name = "checkin_qr.pdf"
-    else:
-        data = payload or json.dumps({"type": "zomate_checkin", "v": 1})
-        label = "Check-In (JSON)"
-        name = "checkin_payload_qr.pdf"
 
     pdf = _build_qr_code_pdf_bytes(label=label, payload=data)
     headers = {"Content-Disposition": f'attachment; filename="{name}"'}

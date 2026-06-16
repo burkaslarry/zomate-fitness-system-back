@@ -499,6 +499,17 @@ class CoachRemindPaymentOut(BaseModel):
     logged: bool
 
 
+class CoachStudentFollowUpOut(BaseModel):
+    """[F003][S008] Admin coach student follow-up grid row."""
+
+    student_id: int
+    full_name: str
+    phone: str
+    attendance_status: str
+    next_lesson: str
+    payment_reminder: str | None = None
+
+
 class CoachBookSession(BaseModel):
     """[F003][S007] Coach books or reschedules 1–2h session; server rejects slot conflicts."""
 
