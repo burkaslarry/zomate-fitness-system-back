@@ -1141,14 +1141,12 @@ def _set_coach_skills(db: Session, coach_id: int, category_ids: list[int]) -> li
 
 
 def _assert_coach_teaches_category(db: Session, coach_id: int, category_id: int) -> None:
-    """[F011][S002] Registration — selected category must be mapped to coach."""
+    """[F011][S002] Registration — selected category must be ticked on coach skills."""
     skill_rows = _coach_skill_category_ids(db, coach_id)
-    if skill_rows and category_id not in skill_rows:
-        raise HTTPException(status_code=400, detail="Selected course category is not assigned to this coach.")
     if not skill_rows:
-        cat = db.get(CourseCategory, category_id)
-        if not cat or not cat.is_active or cat.is_deleted:
-            raise HTTPException(status_code=400, detail="Invalid course category.")
+        raise HTTPException(status_code=400, detail="This coach has no course categories assigned.")
+    if category_id not in skill_rows:
+        raise HTTPException(status_code=400, detail="Selected course category is not assigned to this coach.")
 
 
 def coach_row_to_out(
@@ -3468,14 +3466,13 @@ def list_course_categories_public(
     coach_id: int | None = Query(default=None, ge=1),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    """[F011][S001] 報 Course / 試堂 / 新會員 — 啟用 category；可選 coach_id 過濾教練權限。"""
+    """[F011][S001] 報 Course / 試堂 / 新會員 — 啟用 category；coach_id 只返回已勾選權限的種類。"""
     q = db.query(CourseCategory).filter(
         CourseCategory.is_active.is_(True), CourseCategory.is_deleted.is_(False)
     )
     if coach_id is not None:
         skill_ids = _coach_skill_category_ids(db, coach_id)
-        if skill_ids:
-            q = q.filter(CourseCategory.id.in_(skill_ids))
+        q = q.filter(CourseCategory.id.in_(skill_ids))
     rows = q.order_by(CourseCategory.id.asc()).all()
     return [{"id": c.id, "name": c.name, "is_active": c.is_active} for c in rows]
 
@@ -4453,12 +4450,17 @@ def admin_coach_student_follow_up(
                 "student_id": sid,
                 "full_name": st.full_name,
                 "phone": st.phone,
+                "courses": [],
+                "_course_titles": set(),
                 "attendance_status": att_status,
                 "next_lesson": "—",
                 "payment_reminder": None,
                 "_next_dt": None,
             }
         row = by_student[sid]
+        if enr.title not in row["_course_titles"]:
+            row["_course_titles"].add(enr.title)
+            row["courses"].append(enr.title)
         if not enr.coach_time_confirmed:
             row["next_lesson"] = "待排程"
         else:
@@ -4482,6 +4484,7 @@ def admin_coach_student_follow_up(
                 student_id=data["student_id"],
                 full_name=data["full_name"],
                 phone=data["phone"],
+                courses="、".join(data["courses"]) if data["courses"] else "—",
                 attendance_status=data["attendance_status"],
                 next_lesson=data["next_lesson"],
                 payment_reminder=data["payment_reminder"],

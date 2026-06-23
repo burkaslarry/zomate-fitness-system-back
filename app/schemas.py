@@ -506,6 +506,7 @@ class CoachStudentFollowUpOut(BaseModel):
     student_id: int
     full_name: str
     phone: str
+    courses: str
     attendance_status: str
     next_lesson: str
     payment_reminder: str | None = None
