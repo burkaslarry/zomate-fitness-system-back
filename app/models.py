@@ -110,6 +110,11 @@ class Student(Base):
     emergency_contact_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: JSON object mirroring PAR-Q checklist from registration wizard.
+    parq_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: not_required | pending (PAR-Q yes, no file) | received
+    medical_clearance_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_required")
+    medical_clearance_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     signature_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
@@ -327,6 +332,19 @@ class WhatsAppLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     student: Mapped["Student"] = relationship(back_populates="whatsapp_logs")
+
+
+class WhatsAppMessageTemplate(Base):
+    """[F005][S003] Admin-editable WhatsApp message templates (student / coach audiences)."""
+
+    __tablename__ = "zomate_fs_whatsapp_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    audience: Mapped[str] = mapped_column(String(16), nullable=False, default="student")
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ActivityLog(Base):

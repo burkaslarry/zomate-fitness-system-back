@@ -62,6 +62,7 @@ from .models import (
     Student,
     StudentPhoto,
     WhatsAppLog,
+    WhatsAppMessageTemplate,
 )
 from .schemas import (
     BranchCreate,
@@ -111,8 +112,23 @@ from .schemas import (
     StudentOut,
     StudentRegisterV1,
     TrialClassCreate,
+    PaymentNotificationSendBody,
+    WhatsAppTemplateOut,
+    WhatsAppTemplateUpdate,
+    WhatsAppStatusOut,
+    WhatsAppTestSendBody,
     TrialPurchaseInput,
 )
+from .medical_clearance import (
+    compute_medical_clearance_status,
+    legacy_had_medical_filename,
+    medical_clearance_payload,
+    parse_parq_from_health_notes,
+    parq_dict_any_yes,
+    validate_medical_upload,
+)
+from .payment_notifications import apply_receipt_payment_match, send_payment_whatsapp_notifications
+from .payment_records import build_payment_records, count_missing_receipt_renewals, student_onboarding_coach
 from .enrollment_schedule import (
     enrollment_active_at_now,
     enrollment_to_out,
@@ -121,6 +137,8 @@ from .enrollment_schedule import (
     parse_lesson_weekdays_str,
     parse_segment_pins_json,
 )
+from .whatsapp_templates import seed_whatsapp_templates
+from .whatsapp_business import dispatch_reminder, get_whatsapp_client
 from .storage import FileStorageService
 
 # -----------------------------------------------------------------------------
@@ -145,7 +163,7 @@ from .storage import FileStorageService
 #   Features F011:CourseCategoryOps -- /api/admin/course-categories (soft-hide via is_deleted).
 #   Features F012:CategoryEnrollmentFinance -- category enrollment POST + InstallmentPlan seeding hooks.
 #   Features F013:CoachTrialQuota -- POST .../coach-trial-grant; ``coach_trial_quota_remaining``.
-#   Features F014:FinanceReportsV1 -- GET /api/v1/reports/*; session-ledger payload uses ``entries``.
+#   Features F014:FinanceReportsV1 -- GET /api/v1/reports/*.
 #   Features F015:AdminChromeFrontend -- Next.js shell (``components/backend-shell.tsx``); sidebar + pings.
 #
 # Swagger: /docs · ReDoc: /redoc · OpenAPI: /openapi.json
@@ -640,9 +658,108 @@ def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
     return user
 
 
-def log_whatsapp(db: Session, student: Student, recipient: str, message: str) -> None:
+def log_whatsapp(
+    db: Session,
+    student: Student,
+    recipient: str,
+    message: str,
+    *,
+    template_key: str | None = None,
+    template_context: dict[str, str] | None = None,
+) -> None:
+    """[F005][S003] Persist WhatsApp log row and optionally dispatch via Meta Cloud API."""
     log = WhatsAppLog(student_id=student.id, recipient=recipient, message=message)
     db.add(log)
+    dispatch_reminder(
+        recipient,
+        message,
+        template_key=template_key,
+        template_context=template_context,
+    )
+
+
+def _form_bool(value: str | bool | None, default: bool = True) -> bool:
+    """[F004][S002] Parse multipart checkbox values from admin receipt upload."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _save_member_receipt_row(
+    db: Session,
+    *,
+    student: Student,
+    file: UploadFile,
+    member_key: str,
+    amount: float | None,
+    payment_method: str | None,
+    note: str | None,
+    context: str | None,
+    source: str,
+    installment_no: int | None = None,
+    course_enrollment_id: int | None = None,
+    installment_plan_id: int | None = None,
+    send_whatsapp: bool = True,
+    notify_coach: bool = True,
+) -> dict:
+    """[F004][S002] Persist receipt, optionally match installment, and log WhatsApp payment reminders."""
+    path = _save_upload_file(file, "receipts", member_key, 5 * 1024 * 1024)
+    note_text = (note or "").strip()
+    context_text = (context or "").strip()
+    if context_text:
+        note_text = f"[{context_text}] {note_text}".strip()
+    receipt = Receipt(
+        student_id=student.id,
+        member_hkid=student.hkid or member_key,
+        file_path=path,
+        amount=amount,
+        payment_method=(payment_method or "").strip() or None,
+        note=note_text or None,
+        source=source if source in {"REGISTER", "RENEWAL"} else "RENEWAL",
+    )
+    db.add(receipt)
+    db.flush()
+    match_result = apply_receipt_payment_match(
+        db,
+        student=student,
+        installment_no=installment_no,
+        course_enrollment_id=course_enrollment_id,
+        installment_plan_id=installment_plan_id,
+        amount=amount,
+    )
+    db.add(
+        AuditLog(
+            action="receipt_upload",
+            student_id=student.id,
+            detail=json.dumps(
+                {"receipt_id": receipt.id, "source": receipt.source, **match_result},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    record_activity(db, student, "receipt_upload", receipt.id)
+    whatsapp_result = None
+    if send_whatsapp:
+        whatsapp_result = send_payment_whatsapp_notifications(
+            db,
+            log_whatsapp,
+            student=student,
+            receipt_confirmed=True,
+            notify_coach=notify_coach,
+            course_enrollment_id=course_enrollment_id,
+            installment_no=installment_no,
+            installment_plan_id=installment_plan_id,
+            amount=amount,
+        )
+    return {
+        "id": receipt.id,
+        "file_path": path,
+        "file_url": _file_url(path),
+        "installment_match": match_result,
+        "whatsapp": whatsapp_result,
+    }
 
 
 # TODO [F005][S003]
@@ -1179,6 +1296,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
     Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
     """
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
+    ob_coach_id, ob_coach_name = student_onboarding_coach(db, student.id)
     return {
         "id": student.id,
         "hkid": student.hkid,
@@ -1198,7 +1316,25 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "current_course_package_status": _member_package_status(db, student.id),
         "last_checkin_at": _student_last_checkin_iso(db, student.id),
         "created_at": student.created_at.isoformat(),
+        "medical_clearance_status": getattr(student, "medical_clearance_status", None) or "not_required",
+        "parq_any_yes": _student_parq_any_yes(student),
+        "onboarding_coach_id": ob_coach_id,
+        "onboarding_coach_name": ob_coach_name,
     }
+
+
+def _student_parq_any_yes(student: Student) -> bool:
+    """[F001][S002] Whether PAR-Q has any「是」for admin roster badges."""
+    raw = getattr(student, "parq_json", None)
+    if raw:
+        try:
+            parq = json.loads(raw)
+            if isinstance(parq, dict):
+                return parq_dict_any_yes(parq)
+        except json.JSONDecodeError:
+            pass
+    parq = parse_parq_from_health_notes(student.health_notes)
+    return parq_dict_any_yes(parq) if parq else False
 
 
 def student_to_student_out(db: Session, student: Student) -> StudentOut:
@@ -1236,6 +1372,7 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
             "course_title": enr.title,
             "branch_name": enr.branch.name,
             "coach_name": (enr.coach.full_name if enr.coach else None) or "—",
+            "coach_id": enr.coach_id,
             "scheduled_start": enr.scheduled_start.isoformat(),
             "series_end_date": enr.series_end_date.isoformat() if enr.series_end_date else None,
             "checkin_pin": enr.checkin_pin,
@@ -1435,6 +1572,57 @@ def _migrate_management_columns(db: Session) -> None:
         db.commit()
     except Exception:
         db.rollback()
+
+
+def _migrate_medical_clearance_columns(db: Session) -> None:
+    """[F001][S002] PAR-Q JSON + medical clearance status/path on students."""
+    stmts = [
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS parq_json TEXT NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS medical_clearance_status VARCHAR(32) NOT NULL DEFAULT 'not_required'",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS medical_clearance_path VARCHAR(512) NULL",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_students_medical_status ON zomate_fs_students (medical_clearance_status)",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _backfill_medical_clearance_columns(db: Session) -> None:
+    """[F001][S002] Populate new columns from legacy health_notes text."""
+    rows = db.query(Student).all()
+    touched = False
+    for student in rows:
+        parq: dict | None = None
+        raw = getattr(student, "parq_json", None)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                parq = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                parq = None
+        if parq is None:
+            parq = parse_parq_from_health_notes(student.health_notes)
+            if parq:
+                student.parq_json = json.dumps(parq, ensure_ascii=False)
+                touched = True
+        if not parq:
+            if getattr(student, "medical_clearance_status", "not_required") != "not_required":
+                student.medical_clearance_status = "not_required"
+                touched = True
+            continue
+        any_yes = parq_dict_any_yes(parq)
+        has_file = bool(getattr(student, "medical_clearance_path", None)) or legacy_had_medical_filename(
+            student.health_notes
+        )
+        new_status = compute_medical_clearance_status(parq_any_yes=any_yes, has_file=has_file)
+        if student.medical_clearance_status != new_status:
+            student.medical_clearance_status = new_status
+            touched = True
+    if touched:
+        db.commit()
 
 
 def _migrate_coach_hire_date(db: Session) -> None:
@@ -1813,8 +2001,11 @@ def _sync_startup() -> None:
         _migrate_branch_extended_columns(db)
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
+        _migrate_medical_clearance_columns(db)
+        _backfill_medical_clearance_columns(db)
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
+        seed_whatsapp_templates(db)
         _seed_default_branches(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
@@ -2199,35 +2390,70 @@ def member_duplicate_check(payload: MemberProspectDupCheck, db: Session = Depend
     return {"blocked": False, "message": None}
 
 
-@app.post("/api/members")
-def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
+def _resolve_coach_id_from_registration(
+    db: Session,
+    *,
+    coach_id: int | None,
+    coach_username: str | None,
+) -> int | None:
+    """[F001][S001] Resolve coach from username slug or linked AppUser login."""
+    if coach_id is not None and coach_id >= 1:
+        return coach_id
+    uname = (coach_username or "").strip().lower()
+    if not uname:
+        return None
+    user = db.query(AppUser).filter(AppUser.username == uname).first()
+    if user and user.coach_id:
+        return int(user.coach_id)
+    deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+    rows = db.query(Coach).filter(~Coach.id.in_(deleted), Coach.active.is_(True)).all()
+    for coach in rows:
+        if _default_coach_username(coach.full_name) == uname:
+            return coach.id
+    return None
+
+
+def _create_member_impl(
+    db: Session,
+    payload: MemberCreate,
+    medical_file: UploadFile | None = None,
+) -> Student:
+    """[F001][S002] Persist new student with PAR-Q, optional medical file, signature, coach enrollment."""
     hkid = normalize_hkid(payload.hkid)
     phone_raw = normalize_hk_phone_local_eight(payload.phone.strip())
     if not phone_raw:
-        raise HTTPException(
-            status_code=400,
-            detail="電話須為香港 8 位手機號碼（預設 +852）。",
-        )
+        raise HTTPException(status_code=400, detail="電話須為香港 8 位手機號碼（預設 +852）。")
     phone_vars = _hk_phone_lookup_variants(phone_raw)
     eco_raw = normalize_hk_phone_local_eight(payload.emergency_contact_phone.strip())
     if not eco_raw:
-        raise HTTPException(
-            status_code=400,
-            detail="緊急聯絡電話須為香港 8 位手機號碼。",
-        )
+        raise HTTPException(status_code=400, detail="緊急聯絡電話須為香港 8 位手機號碼。")
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.hkid == hkid).first():
         raise HTTPException(status_code=409, detail="HKID already registered.")
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
         raise HTTPException(status_code=409, detail="Phone already registered.")
+
+    parq_data = payload.parq.model_dump()
+    any_yes = payload.parq.any_yes()
+    medical_path: str | None = None
+    medical_label = (payload.medical_clearance_file_name or "").strip()
+    if medical_file is not None and medical_file.filename:
+        validate_medical_upload(medical_file)
+        medical_path = _save_upload_file(medical_file, "medical_clearance", hkid, 3 * 1024 * 1024)
+        medical_label = medical_file.filename or medical_label
+
+    clearance_status = compute_medical_clearance_status(
+        parq_any_yes=any_yes,
+        has_file=bool(medical_path),
+    )
     notes = "\n".join(
         [
             f"HKID: {hkid}",
             f"Date of birth: {payload.date_of_birth.isoformat()}",
             f"Emergency: {payload.emergency_contact_name.strip()} / {eco_raw}",
             "Digital signature (step 3): canvas image saved",
-            f"PAR-Q JSON: {json.dumps(payload.parq.model_dump(), ensure_ascii=False)}",
-            f"Medical clearance file: {(payload.medical_clearance_file_name or '').strip()}",
+            f"PAR-Q JSON: {json.dumps(parq_data, ensure_ascii=False)}",
+            f"Medical clearance file: {medical_label or (medical_path or '')}",
         ]
     )
     student = Student(
@@ -2239,17 +2465,26 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
         emergency_contact_name=payload.emergency_contact_name.strip(),
         emergency_contact_phone=eco_raw,
         health_notes=notes,
+        parq_json=json.dumps(parq_data, ensure_ascii=False),
+        medical_clearance_status=clearance_status,
+        medical_clearance_path=medical_path,
         disclaimer_accepted=True,
     )
     db.add(student)
     db.flush()
     _apply_signature_image(student, payload.digital_signature)
-    if payload.coach_id is not None and payload.course_category_id is not None:
-        coach = db.get(Coach, payload.coach_id)
+    resolved_coach_id = _resolve_coach_id_from_registration(
+        db,
+        coach_id=payload.coach_id,
+        coach_username=payload.coach_username,
+    )
+    if resolved_coach_id is not None and payload.course_category_id is not None:
+        coach = db.get(Coach, resolved_coach_id)
         if not coach or _is_deleted(db, "coaches", coach.id) or not coach.active:
             raise HTTPException(status_code=400, detail="Invalid or inactive coach.")
-        _assert_coach_teaches_category(db, payload.coach_id, payload.course_category_id)
+        _assert_coach_teaches_category(db, resolved_coach_id, payload.course_category_id)
         cat = _resolve_active_course_category(db, payload.course_category_id)
+        coach_label = (payload.coach_username or "").strip() or str(resolved_coach_id)
         db.add(
             CategoryEnrollment(
                 student_id=student.id,
@@ -2257,11 +2492,68 @@ def create_member(payload: MemberCreate, db: Session = Depends(get_db)) -> dict:
                 status="active",
                 started_at=date.today(),
                 total_lessons=0,
-                notes=f"Onboarding coach_id={payload.coach_id}",
+                notes=f"Onboarding coach={coach_label}",
             )
         )
-    db.add(AuditLog(action="member_create", student_id=student.id, detail=json.dumps({"hkid": hkid}, ensure_ascii=False)))
+    db.add(
+        AuditLog(
+            action="member_create",
+            student_id=student.id,
+            detail=json.dumps({"hkid": hkid, "medical_clearance_status": clearance_status}, ensure_ascii=False),
+        )
+    )
     record_activity(db, student, "member_create", student.id)
+    if medical_path:
+        record_activity(db, student, "medical_clearance_upload", student.id)
+    return student
+
+
+@app.post("/api/members")
+def create_member(
+    full_name: str = Form(...),
+    hkid: str = Form(...),
+    phone: str = Form(...),
+    email: str | None = Form(default=None),
+    date_of_birth: str = Form(...),
+    emergency_contact_name: str = Form(...),
+    emergency_contact_phone: str = Form(...),
+    parq: str = Form(...),
+    medical_clearance_file_name: str | None = Form(default=""),
+    cooling_off_acknowledged: str = Form(default="false"),
+    disclaimer_accepted: str = Form(default="false"),
+    digital_signature: str = Form(...),
+    coach_id: int | None = Form(default=None),
+    coach_username: str | None = Form(default=None),
+    course_category_id: int | None = Form(default=None),
+    medical_clearance: UploadFile | None = File(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    """[F001][S002] Public registration — multipart with optional medical clearance file upload."""
+    try:
+        parq_obj = ParqQuestionsIn.model_validate(json.loads(parq))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid PAR-Q payload.") from exc
+    try:
+        payload = MemberCreate(
+            full_name=full_name,
+            hkid=hkid,
+            phone=phone,
+            email=email,
+            date_of_birth=date.fromisoformat(date_of_birth.strip()),
+            emergency_contact_name=emergency_contact_name,
+            emergency_contact_phone=emergency_contact_phone,
+            parq=parq_obj,
+            medical_clearance_file_name=medical_clearance_file_name,
+            cooling_off_acknowledged=_form_bool(cooling_off_acknowledged, default=False),
+            disclaimer_accepted=_form_bool(disclaimer_accepted, default=False),
+            digital_signature=digital_signature,
+            coach_id=coach_id,
+            coach_username=coach_username,
+            course_category_id=course_category_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    student = _create_member_impl(db, payload, medical_file=medical_clearance)
     db.commit()
     db.refresh(student)
     return {"member": student_to_member_dict(db, student)}
@@ -2329,6 +2621,7 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
     )
     return {
         "profile": student_to_member_dict(db, student),
+        "health": medical_clearance_payload(student, _file_url),
         "receipts": [
             {
                 "id": r.id,
@@ -2386,6 +2679,7 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
             for a in logs
         ],
         "course_checkin_pins": _course_checkin_pins_for_student(db, student),
+        "payment_records": build_payment_records(db, student_id=student.id, file_url_fn=_file_url),
         "category_enrollments": [
             {
                 "id": ce.id,
@@ -2528,29 +2822,33 @@ def upload_member_receipt(
     note: str | None = Form(default=None),
     context: str | None = Form(default=None),
     source: str = Form(default="REGISTER"),
+    installment_no: int | None = Form(default=None),
+    course_enrollment_id: int | None = Form(default=None),
+    installment_plan_id: int | None = Form(default=None),
+    send_whatsapp: str | None = Form(default="true"),
+    notify_coach: str | None = Form(default="true"),
     db: Session = Depends(get_db),
 ) -> dict:
+    """[F004][S002] Receipt upload with optional installment match + WhatsApp payment reminder."""
     student = get_student_by_hkid_or_404(db, hkid)
-    path = _save_upload_file(file, "receipts", student.hkid or hkid, 5 * 1024 * 1024)
-    note_text = (note or "").strip()
-    context_text = (context or "").strip()
-    if context_text:
-        note_text = f"[{context_text}] {note_text}".strip()
-    receipt = Receipt(
-        student_id=student.id,
-        member_hkid=student.hkid or normalize_hkid(hkid),
-        file_path=path,
+    result = _save_member_receipt_row(
+        db,
+        student=student,
+        file=file,
+        member_key=student.hkid or hkid,
         amount=amount,
-        payment_method=(payment_method or "").strip() or None,
-        note=note_text or None,
-        source=source if source in {"REGISTER", "RENEWAL"} else "REGISTER",
+        payment_method=payment_method,
+        note=note,
+        context=context,
+        source=source,
+        installment_no=installment_no,
+        course_enrollment_id=course_enrollment_id,
+        installment_plan_id=installment_plan_id,
+        send_whatsapp=_form_bool(send_whatsapp),
+        notify_coach=_form_bool(notify_coach),
     )
-    db.add(receipt)
-    db.flush()
-    db.add(AuditLog(action="receipt_upload", student_id=student.id, detail=json.dumps({"receipt_id": receipt.id, "source": receipt.source}, ensure_ascii=False)))
-    record_activity(db, student, "receipt_upload", receipt.id)
     db.commit()
-    return {"id": receipt.id, "file_path": path, "file_url": _file_url(path)}
+    return result
 
 
 @app.post("/api/members/by-id/{student_id}/receipts")
@@ -2562,39 +2860,72 @@ def upload_member_receipt_by_id(
     note: str | None = Form(default=None),
     context: str | None = Form(default=None),
     source: str = Form(default="RENEWAL"),
+    installment_no: int | None = Form(default=None),
+    course_enrollment_id: int | None = Form(default=None),
+    installment_plan_id: int | None = Form(default=None),
+    send_whatsapp: str | None = Form(default="true"),
+    notify_coach: str | None = Form(default="true"),
     db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    """[F004][S002] Admin / clerk receipt upload from ID-based student detail route."""
+    """[F004][S002] Admin receipt upload: match full/installment payment + optional WhatsApp to student/coach."""
     student = db.get(Student, student_id)
     if student is None or _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
     key = student.hkid or f"student-{student.id}"
-    path = _save_upload_file(file, "receipts", key, 5 * 1024 * 1024)
-    note_text = (note or "").strip()
-    context_text = (context or "").strip()
-    if context_text:
-        note_text = f"[{context_text}] {note_text}".strip()
-    receipt = Receipt(
-        student_id=student.id,
-        member_hkid=student.hkid or f"ID{student.id}",
-        file_path=path,
+    result = _save_member_receipt_row(
+        db,
+        student=student,
+        file=file,
+        member_key=key,
         amount=amount,
-        payment_method=(payment_method or "").strip() or None,
-        note=note_text or None,
-        source=source if source in {"REGISTER", "RENEWAL"} else "RENEWAL",
+        payment_method=payment_method,
+        note=note,
+        context=context,
+        source=source,
+        installment_no=installment_no,
+        course_enrollment_id=course_enrollment_id,
+        installment_plan_id=installment_plan_id,
+        send_whatsapp=_form_bool(send_whatsapp),
+        notify_coach=_form_bool(notify_coach),
     )
-    db.add(receipt)
-    db.flush()
+    db.commit()
+    return result
+
+
+@app.post("/api/members/by-id/{student_id}/medical-clearance")
+def upload_medical_clearance_by_id(
+    student_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F001][S002] Staff upload PAR-Q medical clearance — marks student as received."""
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if not _student_parq_any_yes(student):
+        raise HTTPException(status_code=400, detail="此學員 PAR-Q 毋須醫生證明。")
+    validate_medical_upload(file)
+    key = student.hkid or f"student-{student.id}"
+    path = _save_upload_file(file, "medical_clearance", key, 3 * 1024 * 1024)
+    student.medical_clearance_path = path
+    student.medical_clearance_status = compute_medical_clearance_status(parq_any_yes=True, has_file=True)
     db.add(
         AuditLog(
-            action="receipt_upload",
+            action="medical_clearance_upload",
             student_id=student.id,
-            detail=json.dumps({"receipt_id": receipt.id, "source": receipt.source}, ensure_ascii=False),
+            detail=json.dumps({"path": path}, ensure_ascii=False),
         )
     )
-    record_activity(db, student, "receipt_upload", receipt.id)
+    record_activity(db, student, "medical_clearance_upload", student.id)
     db.commit()
-    return {"id": receipt.id, "file_path": path, "file_url": _file_url(path)}
+    db.refresh(student)
+    return {
+        "ok": True,
+        "health": medical_clearance_payload(student, _file_url),
+        "profile": student_to_member_dict(db, student),
+    }
 
 
 @app.post("/api/members/{hkid}/resend-pin")
@@ -2703,11 +3034,13 @@ def create_renewal_multipart(
     }
     db.add(AuditLog(action="renewal_create", student_id=student.id, detail=json.dumps(detail_obj, ensure_ascii=False)))
     record_activity(db, student, "renewal_create", renewal_row.id)
-    log_whatsapp(
+    send_payment_whatsapp_notifications(
         db,
-        student,
-        student.phone,
-        f"付款已確認（{kind_label or tx_type}）：HKD {amount:g}，已加入 {total_lessons} 堂。PIN 跟 payment/package；請安排第一堂後使用 Course PIN 簽到，剩餘堂數 {bal_after}。",
+        log_whatsapp,
+        student=student,
+        receipt_confirmed=receipt_row is not None,
+        notify_coach=True,
+        amount=float(amount),
     )
     log_event(
         "[F002][S003] checkout_summary_created",
@@ -3261,6 +3594,28 @@ def finance_summary(from_: date | None = Query(default=None, alias="from"), to: 
 # Logic: Summary counts, WhatsApp logs, CSV import/export, hard-delete guards for ADMIN.
 
 
+@app.get("/api/admin/payment-records")
+def admin_payment_records(
+    status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F004][S002] Global payment / receipt / installment history for admin CRM."""
+    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    return {"records": rows, "total": len(rows)}
+
+
+@app.get("/api/admin/missing-receipt-registrations")
+def admin_missing_receipt_registrations(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F004][S002] Course registrations (renewals) lacking receipt upload."""
+    rows = build_payment_records(db, status="missing_receipt", file_url_fn=_file_url)
+    return {"records": rows, "total": len(rows)}
+
+
 @app.get("/api/admin/summary")
 def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> dict:
     total_students = (
@@ -3320,6 +3675,15 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         .scalar()
         or 0
     )
+    deleted_student_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    medical_clearance_pending = (
+        db.query(func.count(Student.id))
+        .filter(~Student.id.in_(deleted_student_ids))
+        .filter(Student.medical_clearance_status == "pending")
+        .scalar()
+        or 0
+    )
+    missing_receipt_registrations = count_missing_receipt_renewals(db)
     return {
         "total_students": total_students,
         "active_students": active_students,
@@ -3331,6 +3695,8 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         "courses": courses,
         "installment_students_unpaid": installment_students_unpaid,
         "installment_students_total": installment_students_total,
+        "medical_clearance_pending": medical_clearance_pending,
+        "missing_receipt_registrations": missing_receipt_registrations,
     }
 
 
@@ -3576,6 +3942,107 @@ def whatsapp_logs(db: Session = Depends(get_db), user: AppUser = Depends(require
         }
         for item in logs
     ]
+
+
+@app.get("/api/admin/whatsapp-templates", response_model=list[WhatsAppTemplateOut])
+def list_whatsapp_templates(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> list[WhatsAppMessageTemplate]:
+    """[F005][S003] Admin-editable WhatsApp message templates (student / coach)."""
+    seed_whatsapp_templates(db)
+    db.commit()
+    rows = db.query(WhatsAppMessageTemplate).order_by(WhatsAppMessageTemplate.audience, WhatsAppMessageTemplate.key).all()
+    return rows
+
+
+@app.put("/api/admin/whatsapp-templates/{template_key}", response_model=WhatsAppTemplateOut)
+def update_whatsapp_template(
+    template_key: str,
+    payload: WhatsAppTemplateUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> WhatsAppMessageTemplate:
+    """[F005][S003] Update template body; placeholders like {{student_name}} are preserved."""
+    row = db.query(WhatsAppMessageTemplate).filter(WhatsAppMessageTemplate.key == template_key).first()
+    if row is None:
+        seed_whatsapp_templates(db)
+        db.flush()
+        row = db.query(WhatsAppMessageTemplate).filter(WhatsAppMessageTemplate.key == template_key).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Template not found.")
+    row.body = payload.body.strip()
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.get("/api/admin/whatsapp/status", response_model=WhatsAppStatusOut)
+def admin_whatsapp_status(user: AppUser = Depends(require_admin_or_clerk)) -> WhatsAppStatusOut:
+    """[F005][S003] Show whether WhatsApp Business API credentials are configured (no secrets)."""
+    _ = user
+    snap = get_whatsapp_client().status()
+    return WhatsAppStatusOut(**snap)
+
+
+@app.post("/api/admin/whatsapp/test-send")
+def admin_whatsapp_test_send(
+    payload: WhatsAppTestSendBody,
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F005][S003] Send one Meta-approved template to verify WABA credentials."""
+    _ = user
+    result = get_whatsapp_client().send_template(
+        payload.phone,
+        payload.template_name,
+        language_code=payload.language_code,
+        body_parameters=payload.body_parameters,
+    )
+    return {
+        "ok": result.ok,
+        "dry_run": result.dry_run,
+        "message_id": result.message_id,
+        "to": result.to,
+        "template_name": result.template_name,
+        "error": result.error,
+    }
+
+
+@app.post("/api/admin/students/{student_id}/send-payment-reminder")
+def admin_send_payment_reminder(
+    student_id: int,
+    payload: PaymentNotificationSendBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F005][S003] After payment record: log WhatsApp reminders for student and coach (copy via wa.me)."""
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if payload.installment_no is not None:
+        apply_receipt_payment_match(
+            db,
+            student=student,
+            installment_no=payload.installment_no,
+            course_enrollment_id=payload.course_enrollment_id,
+            installment_plan_id=payload.installment_plan_id,
+            amount=payload.amount,
+        )
+    result = send_payment_whatsapp_notifications(
+        db,
+        log_whatsapp,
+        student=student,
+        receipt_confirmed=payload.receipt_confirmed,
+        notify_coach=payload.notify_coach,
+        course_enrollment_id=payload.course_enrollment_id,
+        installment_no=payload.installment_no,
+        installment_plan_id=payload.installment_plan_id,
+        amount=payload.amount,
+    )
+    record_activity(db, student, "payment_whatsapp_reminder", payload.course_enrollment_id)
+    db.commit()
+    return {"ok": True, "whatsapp": result}
 
 
 @app.get("/api/admin/audit-logs")
@@ -4468,15 +4935,6 @@ _V1_EXPENSE_ROWS: list[dict] = [
     },
 ]
 
-_V1_LEDGER_ROWS: list[dict] = [
-    {
-        "studentName": "Larry Lo",
-        "sessionStartIso": datetime.utcnow().isoformat() + "Z",
-        "reason": "attended",
-        "notes": "Ledger seed · FastAPI",
-    }
-]
-
 
 # [F004][S001]
 # Feature: Admin Reports & Financials
@@ -4602,34 +5060,6 @@ def v1_reports_coach_attendance(
             }
         )
     return {"rows": detail_rows, "summary": summary_rows, "month": month}
-
-
-# [F003][S005]
-# Feature: Attendance & Today-Only QR Check-in
-# Step: Session ledger — deduct reasons and admin adjustments
-# Logic: GET lists ledger rows; POST inserts adjustment entry (demo-seeded in dev).
-
-
-@app.get("/api/v1/session-ledger")
-def v1_session_ledger_get(user: AppUser = Depends(require_admin_or_clerk)) -> dict:
-    return {"entries": list(_V1_LEDGER_ROWS)}
-
-
-@app.post("/api/v1/session-ledger")
-def v1_session_ledger_post(payload: dict, user: AppUser = Depends(require_admin_or_clerk)) -> dict:
-    req = payload or {}
-    if not req.get("studentName"):
-        raise HTTPException(status_code=400, detail="studentName required")
-    _V1_LEDGER_ROWS.insert(
-        0,
-        {
-            "studentName": str(req["studentName"]),
-            "sessionStartIso": str(req.get("sessionStartIso") or datetime.utcnow().isoformat() + "Z"),
-            "reason": str(req.get("reason") or "attended"),
-            "notes": str(req.get("notes") or ""),
-        },
-    )
-    return {"ok": True}
 
 
 # --- Courses (admin + coach) — URL ``course_id`` = enrollment id ---
@@ -4882,11 +5312,11 @@ def admin_assign_course_coach(
     course_id: int,
     payload: CourseAssignCoach,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_admin),
 ) -> CourseOut:
     # [F009][S003]
     # Feature: Scheduled course & enrollment PINs
-    # Step: Staff reassigns enrollment ``coach_id`` for the coach timetable UI.
+    # Step: Admin-only reassign enrollment ``coach_id`` (轉教練).
     enr = db.query(CourseEnrollment).filter(CourseEnrollment.id == course_id).first()
     if not enr or _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course not found.")

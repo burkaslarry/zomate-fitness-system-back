@@ -110,6 +110,7 @@ class MemberCreate(BaseModel):
     disclaimer_accepted: bool = True
     digital_signature: str = Field(min_length=20, max_length=400_000)
     coach_id: int | None = Field(default=None, ge=1)
+    coach_username: str | None = Field(default=None, min_length=1, max_length=120)
     course_category_id: int | None = Field(default=None, ge=1)
 
     @field_validator("email", mode="before")
@@ -590,3 +591,55 @@ class CoachTrialGrantBody(BaseModel):
     coach_id: int | None = None
     branch_id: int | None = None
     class_date: date | None = None
+
+
+class WhatsAppTemplateOut(BaseModel):
+    """[F005][S003] Admin WhatsApp template row."""
+
+    key: str
+    audience: str
+    title: str
+    body: str
+    updated_at: datetime | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class WhatsAppTemplateUpdate(BaseModel):
+    """[F005][S003] Update template body (placeholders preserved)."""
+
+    body: str = Field(min_length=1)
+
+
+class PaymentNotificationSendBody(BaseModel):
+    """[F005][S003] Staff triggers payment reminder WhatsApp logs for student + coach."""
+
+    course_enrollment_id: int | None = Field(default=None, ge=1)
+    installment_no: int | None = Field(default=None, ge=1, le=5)
+    installment_plan_id: int | None = Field(default=None, ge=1)
+    receipt_confirmed: bool = True
+    notify_coach: bool = True
+    amount: float | None = Field(default=None, ge=0)
+
+
+class WhatsAppStatusOut(BaseModel):
+    """[F005][S003] WhatsApp Business API configuration snapshot (no secrets)."""
+
+    enabled: bool
+    configured: bool
+    phone_number_id_set: bool
+    access_token_set: bool
+    business_account_id_set: bool
+    app_id_set: bool
+    default_language: str
+    template_map_keys: list[str]
+
+
+class WhatsAppTestSendBody(BaseModel):
+    """[F005][S003] Admin test send using a Meta-approved template name."""
+
+    phone: str = Field(min_length=8, max_length=30)
+    template_name: str = Field(min_length=1, max_length=128)
+    language_code: str = Field(default="zh_HK", min_length=2, max_length=16)
+    body_parameters: list[str] = Field(default_factory=list)
