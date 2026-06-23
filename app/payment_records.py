@@ -26,7 +26,23 @@ def _coach_slug(full_name: str) -> str:
 
 def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, str | None]:
     """[F002][S001] Coach chosen at /register — from category enrollment notes or latest renewal."""
-    from .models import CategoryEnrollment, Coach, RenewalRecord
+    from .models import AppUser, CategoryEnrollment, Coach, RenewalRecord
+
+    def _resolve_coach_label(label: str) -> tuple[int | None, str | None]:
+        if label.isdigit():
+            coach = db.get(Coach, int(label))
+            if coach:
+                return coach.id, coach.full_name
+        slug = label.lower()
+        user = db.query(AppUser).filter(AppUser.username == slug).first()
+        if user and user.coach_id:
+            coach = db.get(Coach, int(user.coach_id))
+            if coach:
+                return coach.id, coach.full_name
+        for coach in db.query(Coach).filter(Coach.active.is_(True)).all():
+            if _coach_slug(coach.full_name) == slug:
+                return coach.id, coach.full_name
+        return None, None
 
     enrollments = (
         db.query(CategoryEnrollment)
@@ -40,17 +56,9 @@ def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, 
         match = _ONBOARDING_COACH_RE.search(notes)
         if not match:
             continue
-        label = match.group(1).strip()
-        if label.isdigit():
-            coach = db.get(Coach, int(label))
-            if coach:
-                return coach.id, coach.full_name
-        slug = label.lower()
-        for coach in db.query(Coach).filter(Coach.active.is_(True)).all():
-            if (coach.login_username or "").strip().lower() == slug:
-                return coach.id, coach.full_name
-            if _coach_slug(coach.full_name) == slug:
-                return coach.id, coach.full_name
+        resolved = _resolve_coach_label(match.group(1).strip())
+        if resolved[0] is not None:
+            return resolved
     renewal = (
         db.query(RenewalRecord)
         .filter(RenewalRecord.student_id == student_id, RenewalRecord.coach_id.isnot(None))

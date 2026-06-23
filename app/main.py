@@ -106,6 +106,7 @@ from .schemas import (
     MemberProspectDupCheck,
     MemberUpdate,
     PackageOut,
+    ParqQuestionsIn,
     RenewalCreate,
     StudentCategoryEnrollmentCreate,
     StudentOnboardCreate,
@@ -4388,9 +4389,9 @@ def admin_set_coach_skills(
     coach_id: int,
     payload: CoachSkillsUpdate,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_admin),
 ) -> dict:
-    """[F011][S002] 教練課程權限分配 — replace category checkboxes."""
+    """[F011][S002] 教練課程權限分配 — Admin-only replace category checkboxes."""
     coach = db.query(Coach).filter(Coach.id == coach_id).first()
     if not coach or _is_deleted(db, "coaches", coach.id):
         raise HTTPException(status_code=404, detail="Coach not found.")
@@ -5547,8 +5548,10 @@ def coach_student_payments(
         .all()
     )
     out: list[CoachStudentPaymentOut] = []
+    seen_student_ids: set[int] = set()
     for enr in rows:
         student = enr.student
+        seen_student_ids.add(student.id)
         pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(enr, student)
         out.append(
             CoachStudentPaymentOut(
@@ -5561,6 +5564,39 @@ def coach_student_payments(
                 installment_status=inst_st,
                 amount_paid=paid_amt,
                 amount_total=total_amt,
+                signature_image_url=_signature_image_for_member(student),
+            )
+        )
+    # [F004][S003] Surface renewals logged under this coach but missing receipt upload.
+    missing_receipt_renewals = (
+        db.query(RenewalRecord)
+        .options(joinedload(RenewalRecord.student))
+        .filter(
+            RenewalRecord.coach_id == cid,
+            RenewalRecord.receipt_id.is_(None),
+            RenewalRecord.amount.isnot(None),
+            RenewalRecord.amount > 0,
+            ~RenewalRecord.student_id.in_(deleted_s),
+        )
+        .order_by(RenewalRecord.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    for rr in missing_receipt_renewals:
+        student = rr.student
+        if student is None:
+            continue
+        out.append(
+            CoachStudentPaymentOut(
+                student_id=student.id,
+                student_name=student.full_name,
+                student_phone=student.phone,
+                course_id=0,
+                course_title=f"{rr.lessons} 堂 · 缺收據",
+                payment_status="Pending",
+                installment_status="待補收據",
+                amount_paid=float(rr.amount) if rr.amount is not None else None,
+                amount_total=float(rr.amount) if rr.amount is not None else None,
                 signature_image_url=_signature_image_for_member(student),
             )
         )
