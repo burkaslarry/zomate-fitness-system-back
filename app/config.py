@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     keepalive_jitter_seconds: float = Field(default=30.0, alias="KEEPALIVE_JITTER_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # [F005][S003] WhatsApp Business API (Meta Cloud API) — see docs/WHATSAPP_BUSINESS_API_TODO.md
+    whatsapp_enabled: bool = Field(default=False, alias="WHATSAPP_ENABLED")
+    whatsapp_access_token: str = Field(default="", alias="WHATSAPP_ACCESS_TOKEN")
+    whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_business_account_id: str = Field(default="", alias="WHATSAPP_BUSINESS_ACCOUNT_ID")
+    whatsapp_app_id: str = Field(default="", alias="WHATSAPP_APP_ID")
+    whatsapp_default_language: str = Field(default="zh_HK", alias="WHATSAPP_DEFAULT_LANGUAGE")
+    whatsapp_graph_api_base: str = Field(default="https://graph.facebook.com", alias="WHATSAPP_GRAPH_API_BASE")
+    whatsapp_template_map: str = Field(default="", alias="WHATSAPP_TEMPLATE_MAP")
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
     @model_validator(mode="after")
