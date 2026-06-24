@@ -67,6 +67,26 @@ def _mark_course_installment_paid(enr: CourseEnrollment, installment_no: int) ->
     enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
 
 
+def _mark_course_full_paid(enr: CourseEnrollment) -> bool:
+    raw = getattr(enr, "segment_pins_json", None)
+    if not raw:
+        return False
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="Corrupt installment segment payload.") from exc
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=500, detail="Invalid installment segment payload.")
+    touched = False
+    for row in rows:
+        if isinstance(row, dict):
+            row["paid"] = True
+            touched = True
+    if touched:
+        enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
+    return touched
+
+
 def _mark_category_installment_paid(
     db: Session,
     plan_id: int,
@@ -98,10 +118,11 @@ def apply_receipt_payment_match(
     course_enrollment_id: int | None,
     installment_plan_id: int | None,
     amount: float | None,
+    full_payment: bool = False,
 ) -> dict[str, Any]:
     """[F004][S002] Link uploaded receipt to installment (course segment or category plan)."""
-    out: dict[str, Any] = {"installment_marked_paid": False}
-    if installment_no is None:
+    out: dict[str, Any] = {"installment_marked_paid": False, "full_payment_marked_paid": False}
+    if installment_no is None and not full_payment:
         return out
     if course_enrollment_id is not None:
         enr = (
@@ -114,6 +135,12 @@ def apply_receipt_payment_match(
         )
         if not enr:
             raise HTTPException(status_code=404, detail="Course enrollment not found for this student.")
+        if full_payment:
+            out["full_payment_marked_paid"] = _mark_course_full_paid(enr)
+            out["course_enrollment_id"] = course_enrollment_id
+            return out
+        if installment_no is None:
+            return out
         _mark_course_installment_paid(enr, installment_no)
         out["installment_marked_paid"] = True
         out["course_enrollment_id"] = course_enrollment_id
@@ -181,6 +208,7 @@ def send_payment_whatsapp_notifications(
     installment_no: int | None = None,
     installment_plan_id: int | None = None,
     amount: float | None = None,
+    full_payment: bool = False,
 ) -> dict[str, Any]:
     """[F005][S003] Render templates and log WhatsApp messages for student (+ optional coach)."""
     enr = _resolve_course_enrollment(db, student.id, course_enrollment_id)
@@ -198,7 +226,7 @@ def send_payment_whatsapp_notifications(
         except json.JSONDecodeError:
             segment_dicts = []
 
-    is_installment = len(segments) > 1 or installment_plan_id is not None or installment_no is not None
+    is_installment = (len(segments) > 1 or installment_plan_id is not None or installment_no is not None) and not full_payment
     if installment_plan_id is not None:
         plan = db.get(InstallmentPlan, installment_plan_id)
         if plan and plan.total_installments > 1:

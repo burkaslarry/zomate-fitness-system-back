@@ -98,18 +98,23 @@ def parse_segment_pins_json(raw: str | None) -> list[InstallmentSegmentPinOut]:
             continue
         try:
             ino = int(row["installment_no"])
+            lesson_from = int(row["lesson_from"])
+            lesson_to = int(row["lesson_to"])
             pr = row.get("paid")
             if pr is None:
                 paid_bool = ino <= 1
             else:
                 paid_bool = bool(pr)
+            reminder_raw = row.get("reminder_lesson")
+            reminder_lesson = int(reminder_raw) if reminder_raw is not None else max(lesson_from, lesson_to - 1)
             out.append(
                 InstallmentSegmentPinOut(
                     installment_no=ino,
-                    lesson_from=int(row["lesson_from"]),
-                    lesson_to=int(row["lesson_to"]),
+                    lesson_from=lesson_from,
+                    lesson_to=lesson_to,
                     pin=str(row["pin"]).strip(),
                     paid=paid_bool,
+                    reminder_lesson=reminder_lesson,
                 )
             )
         except (KeyError, TypeError, ValueError):

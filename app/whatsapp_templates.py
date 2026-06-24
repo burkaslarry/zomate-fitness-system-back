@@ -155,7 +155,7 @@ def _ordinal_en(n: int) -> str:
 
 
 def build_installment_notes_from_segments(segments: list[dict]) -> str:
-    """[F005][S003] e.g. 第A堂付 2nd instalment for unpaid future tranches."""
+    """[F005][S003] e.g. 第9堂提醒 / 付 2nd instalment for unpaid future tranches."""
     lines: list[str] = []
     for seg in segments:
         if not isinstance(seg, dict):
@@ -166,8 +166,8 @@ def build_installment_notes_from_segments(segments: list[dict]) -> str:
         lo = int(seg.get("lesson_from") or 0)
         if ino <= 1 or lo <= 0:
             continue
-        lesson_label = chr(ord("A") + min(ino - 2, 25))
-        lines.append(f"第{lesson_label}堂付 {_ordinal_en(ino)} instalment")
+        reminder_lesson = int(seg.get("reminder_lesson") or max(lo, int(seg.get("lesson_to") or lo) - 1))
+        lines.append(f"第{reminder_lesson}堂提醒 / 付 {_ordinal_en(ino)} instalment")
     return "\n".join(lines)
 
 

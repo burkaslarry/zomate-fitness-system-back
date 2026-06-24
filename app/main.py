@@ -94,6 +94,7 @@ from .schemas import (
     CourseCategoryAdminUpdate,
     CourseAssignCoach,
     CourseCreate,
+    CourseInstallmentReminderUpdate,
     CourseInstallmentMarkPaid,
     CourseOut,
     CourseReschedule,
@@ -702,6 +703,7 @@ def _save_member_receipt_row(
     installment_no: int | None = None,
     course_enrollment_id: int | None = None,
     installment_plan_id: int | None = None,
+    full_payment: bool = False,
     send_whatsapp: bool = True,
     notify_coach: bool = True,
 ) -> dict:
@@ -729,6 +731,7 @@ def _save_member_receipt_row(
         course_enrollment_id=course_enrollment_id,
         installment_plan_id=installment_plan_id,
         amount=amount,
+        full_payment=full_payment,
     )
     db.add(
         AuditLog(
@@ -753,6 +756,7 @@ def _save_member_receipt_row(
             installment_no=installment_no,
             installment_plan_id=installment_plan_id,
             amount=amount,
+            full_payment=full_payment,
         )
     return {
         "id": receipt.id,
@@ -813,8 +817,8 @@ def allocate_enrollment_pin(
 
 def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[int, int]]:
     """Inclusive 1-based lesson indices per installment (split remainder across first tranches)."""
-    tl = max(1, total_lessons)
-    n = max(1, min(5, n_segments))
+    tl = max(10, total_lessons)
+    n = max(1, min(3, n_segments))
     if n == 1:
         return [(1, tl)]
     remainder = tl % n
@@ -826,6 +830,13 @@ def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[in
         out.append((cur, cur + sz - 1))
         cur += sz
     return out
+
+
+def _default_installment_reminder_lesson(lesson_from: int, lesson_to: int) -> int:
+    """[F003][S003] Reminder fires one lesson before each tranche boundary by default."""
+    if lesson_to <= lesson_from:
+        return lesson_to
+    return max(lesson_from, lesson_to - 1)
 
 
 def _enrollment_matches_class_pin(enr: CourseEnrollment, pin: str) -> bool:
@@ -2824,6 +2835,7 @@ def upload_member_receipt(
     installment_no: int | None = Form(default=None),
     course_enrollment_id: int | None = Form(default=None),
     installment_plan_id: int | None = Form(default=None),
+    full_payment: str | None = Form(default="false"),
     send_whatsapp: str | None = Form(default="true"),
     notify_coach: str | None = Form(default="true"),
     db: Session = Depends(get_db),
@@ -2843,6 +2855,7 @@ def upload_member_receipt(
         installment_no=installment_no,
         course_enrollment_id=course_enrollment_id,
         installment_plan_id=installment_plan_id,
+        full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
     )
@@ -2862,6 +2875,7 @@ def upload_member_receipt_by_id(
     installment_no: int | None = Form(default=None),
     course_enrollment_id: int | None = Form(default=None),
     installment_plan_id: int | None = Form(default=None),
+    full_payment: str | None = Form(default="false"),
     send_whatsapp: str | None = Form(default="true"),
     notify_coach: str | None = Form(default="true"),
     db: Session = Depends(get_db),
@@ -2885,6 +2899,7 @@ def upload_member_receipt_by_id(
         installment_no=installment_no,
         course_enrollment_id=course_enrollment_id,
         installment_plan_id=installment_plan_id,
+        full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
     )
@@ -4018,15 +4033,6 @@ def admin_send_payment_reminder(
     student = db.get(Student, student_id)
     if student is None or _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
-    if payload.installment_no is not None:
-        apply_receipt_payment_match(
-            db,
-            student=student,
-            installment_no=payload.installment_no,
-            course_enrollment_id=payload.course_enrollment_id,
-            installment_plan_id=payload.installment_plan_id,
-            amount=payload.amount,
-        )
     result = send_payment_whatsapp_notifications(
         db,
         log_whatsapp,
@@ -5135,7 +5141,7 @@ def admin_create_course(
     enrolled_names: list[str] = []
     note_trim = (payload.coach_schedule_note or "").strip()
     needs_coach_schedule = bool(note_trim)
-    n_inst = max(1, min(5, getattr(payload, "total_installments", 1)))
+    n_inst = max(1, min(3, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
     first_created: CourseEnrollment | None = None
 
@@ -5167,6 +5173,7 @@ def admin_create_course(
                         "installment_no": idx + 1,
                         "lesson_from": lo,
                         "lesson_to": hi,
+                        "reminder_lesson": _default_installment_reminder_lesson(lo, hi),
                         "pin": p,
                         "paid": idx == 0,
                     }
@@ -5296,6 +5303,61 @@ def admin_course_mark_installment_paid(
             row["paid"] = True
             touched = True
             break
+    if not touched:
+        raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")
+    enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
+    db.commit()
+    full = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
+        .first()
+    )
+    if full is None or _is_deleted(db, "course_enrollments", full.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    return enrollment_to_out(full)
+
+
+@app.patch("/api/admin/courses/{course_id}/installment-reminder", response_model=CourseOut)
+def admin_course_update_installment_reminder(
+    course_id: int,
+    payload: CourseInstallmentReminderUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> CourseOut:
+    """[F003][S003] Adjust scheduled-package WhatsApp reminder lesson without changing payment state."""
+    if _is_deleted(db, "course_enrollments", course_id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    enr = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.id == course_id,
+            CourseEnrollment.student_id == payload.student_id,
+        )
+        .first()
+    )
+    if not enr:
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    raw = getattr(enr, "segment_pins_json", None)
+    if not raw:
+        raise HTTPException(status_code=400, detail="This enrollment has no installment PIN segments.")
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=500, detail="Corrupt installment segment payload.") from exc
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=500, detail="Invalid installment segment payload.")
+    touched = False
+    for row in rows:
+        if not isinstance(row, dict) or int(row.get("installment_no") or 0) != payload.installment_no:
+            continue
+        lesson_from = int(row.get("lesson_from") or 1)
+        lesson_to = int(row.get("lesson_to") or enr.total_lessons or lesson_from)
+        if not lesson_from <= payload.reminder_lesson <= lesson_to:
+            raise HTTPException(status_code=400, detail="Reminder lesson must stay inside this installment lesson range.")
+        row["reminder_lesson"] = payload.reminder_lesson
+        touched = True
+        break
     if not touched:
         raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")
     enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
@@ -5460,6 +5522,14 @@ def _coach_payment_summary(enr: CourseEnrollment, student: Student) -> tuple[str
     return "Pending", inst, None, None
 
 
+def _next_unpaid_installment_meta(enr: CourseEnrollment) -> tuple[int | None, int | None]:
+    """[F004][S002] Pick next receipt mapping target for coach/admin upload UI."""
+    for seg in parse_segment_pins_json(enr.segment_pins_json):
+        if not seg.paid:
+            return seg.installment_no, seg.reminder_lesson
+    return None, None
+
+
 @app.get("/api/coach/me", response_model=CoachMeOut)
 def coach_me(
     db: Session = Depends(get_db),
@@ -5556,6 +5626,7 @@ def coach_student_payments(
         student = enr.student
         seen_student_ids.add(student.id)
         pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(enr, student)
+        next_inst, next_reminder = _next_unpaid_installment_meta(enr)
         out.append(
             CoachStudentPaymentOut(
                 student_id=student.id,
@@ -5567,6 +5638,8 @@ def coach_student_payments(
                 installment_status=inst_st,
                 amount_paid=paid_amt,
                 amount_total=total_amt,
+                next_installment_no=next_inst,
+                next_reminder_lesson=next_reminder,
                 signature_image_url=_signature_image_for_member(student),
             )
         )
@@ -5600,6 +5673,8 @@ def coach_student_payments(
                 installment_status="待補收據",
                 amount_paid=float(rr.amount) if rr.amount is not None else None,
                 amount_total=float(rr.amount) if rr.amount is not None else None,
+                next_installment_no=None,
+                next_reminder_lesson=None,
                 signature_image_url=_signature_image_for_member(student),
             )
         )
@@ -5638,6 +5713,59 @@ def _coach_require_student_access(db: Session, user: AppUser, coach_id: int, stu
     if user.role == "COACH" and not _coach_teaches_student(db, coach_id, student_id):
         raise HTTPException(status_code=403, detail="This student is not assigned to your coach profile.")
     return student
+
+
+@app.post("/api/coach/students/{student_id}/receipts")
+def coach_upload_student_receipt(
+    student_id: int,
+    file: UploadFile = File(...),
+    amount: float | None = Form(default=None),
+    payment_method: str | None = Form(default=None),
+    note: str | None = Form(default=None),
+    course_enrollment_id: int | None = Form(default=None),
+    installment_no: int | None = Form(default=None),
+    full_payment: str | None = Form(default="false"),
+    send_whatsapp: str | None = Form(default="true"),
+    coach_id: int | None = Form(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F004][S002] Coach uploads receipt and maps it to full pay or installment 1–3."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    student = _coach_require_student_access(db, user, cid, student_id)
+    if course_enrollment_id is not None:
+        enr = (
+            db.query(CourseEnrollment)
+            .filter(
+                CourseEnrollment.id == course_enrollment_id,
+                CourseEnrollment.student_id == student_id,
+                CourseEnrollment.coach_id == cid,
+            )
+            .first()
+        )
+        if enr is None or _is_deleted(db, "course_enrollments", course_enrollment_id):
+            raise HTTPException(status_code=404, detail="Course enrollment not found for this coach/student.")
+    if installment_no is not None and not 1 <= installment_no <= 3:
+        raise HTTPException(status_code=400, detail="installment_no must be 1, 2, or 3.")
+    result = _save_member_receipt_row(
+        db,
+        student=student,
+        file=file,
+        member_key=student.hkid or f"student-{student.id}",
+        amount=amount,
+        payment_method=payment_method,
+        note=note,
+        context="coach_receipt_upload",
+        source="RENEWAL",
+        installment_no=installment_no,
+        course_enrollment_id=course_enrollment_id,
+        full_payment=_form_bool(full_payment, default=False),
+        send_whatsapp=_form_bool(send_whatsapp),
+        notify_coach=False,
+    )
+    record_activity(db, student, "coach_receipt_upload", course_enrollment_id)
+    db.commit()
+    return result
 
 
 @app.get("/api/coach/students", response_model=list[CoachStudentBriefOut])
@@ -5738,6 +5866,8 @@ def coach_student_records(
                 coach_time_confirmed=bool(e.coach_time_confirmed),
                 payment_status=_coach_payment_summary(e, student)[0],
                 installment_status=_coach_payment_summary(e, student)[1],
+                next_installment_no=_next_unpaid_installment_meta(e)[0],
+                next_reminder_lesson=_next_unpaid_installment_meta(e)[1],
             )
             for e in enrollments
         ],

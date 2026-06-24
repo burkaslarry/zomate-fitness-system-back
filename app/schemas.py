@@ -353,9 +353,9 @@ class CourseCreate(BaseModel):
     # Calendar start for the series — defaults to scheduled_start.date() if omitted.
     course_start_date: date | None = None
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
-    total_lessons: int = Field(default=1, ge=1, le=30)
+    total_lessons: int = Field(default=10, ge=10, le=30)
     # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
-    total_installments: int = Field(default=1, ge=1, le=5)
+    total_installments: int = Field(default=1, ge=1, le=3)
     # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
     student_first_session_at: datetime | None = None
     coach_schedule_note: str | None = Field(default=None, max_length=500)
@@ -434,6 +434,8 @@ class CoachStudentPaymentOut(BaseModel):
     installment_status: str
     amount_paid: float | None = None
     amount_total: float | None = None
+    next_installment_no: int | None = None
+    next_reminder_lesson: int | None = None
     signature_image_url: str | None = None
 
 
@@ -457,6 +459,8 @@ class CoachStudentEnrollmentOut(BaseModel):
     coach_time_confirmed: bool
     payment_status: str
     installment_status: str
+    next_installment_no: int | None = None
+    next_reminder_lesson: int | None = None
 
 
 class CoachStudentCheckinOut(BaseModel):
@@ -540,13 +544,22 @@ class InstallmentSegmentPinOut(BaseModel):
     lesson_to: int = Field(ge=1)
     pin: str = Field(min_length=1, max_length=8)
     paid: bool = True
+    reminder_lesson: int | None = Field(default=None, ge=1)
 
 
 class CourseInstallmentMarkPaid(BaseModel):
     """Staff marks one scheduled-package installment segment as collected — unlocks that tranche PIN for check-in."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=5)
+    installment_no: int = Field(ge=1, le=3)
+
+
+class CourseInstallmentReminderUpdate(BaseModel):
+    """[F003][S003] Staff adjusts the lesson number that triggers a WhatsApp installment reminder."""
+
+    student_id: int = Field(ge=1)
+    installment_no: int = Field(ge=1, le=3)
+    reminder_lesson: int = Field(ge=1, le=999)
 
 
 class CourseEnrollmentOut(BaseModel):
@@ -584,8 +597,8 @@ class CourseCategoryCreate(BaseModel):
 
 class StudentCategoryEnrollmentCreate(BaseModel):
     course_category_id: int
-    total_lessons: int = Field(ge=1, le=999)
-    total_installments: int = Field(default=3, ge=1, le=5)
+    total_lessons: int = Field(ge=10, le=999)
+    total_installments: int = Field(default=3, ge=1, le=3)
 
 
 class CoachTrialGrantBody(BaseModel):
@@ -617,7 +630,7 @@ class PaymentNotificationSendBody(BaseModel):
     """[F005][S003] Staff triggers payment reminder WhatsApp logs for student + coach."""
 
     course_enrollment_id: int | None = Field(default=None, ge=1)
-    installment_no: int | None = Field(default=None, ge=1, le=5)
+    installment_no: int | None = Field(default=None, ge=1, le=3)
     installment_plan_id: int | None = Field(default=None, ge=1)
     receipt_confirmed: bool = True
     notify_coach: bool = True
