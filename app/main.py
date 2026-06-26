@@ -3957,6 +3957,45 @@ def whatsapp_logs(db: Session = Depends(get_db), user: AppUser = Depends(require
     ]
 
 
+@app.get("/api/webhooks/whatsapp")
+def whatsapp_webhook_verify(
+    hub_mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+) -> PlainTextResponse:
+    """[F005][S004] Meta webhook verification handshake for WhatsApp callbacks."""
+    verify_token = settings.whatsapp_webhook_verify_token.strip()
+    if not verify_token:
+        log_event("[F005][S004] whatsapp_webhook_verify_missing_token")
+        raise HTTPException(status_code=503, detail="WHATSAPP_WEBHOOK_VERIFY_TOKEN is not configured.")
+    if hub_mode == "subscribe" and hub_verify_token == verify_token:
+        log_event("[F005][S004] whatsapp_webhook_verify_ok")
+        return PlainTextResponse(hub_challenge or "", status_code=200)
+    log_event("[F005][S004] whatsapp_webhook_verify_failed", hub_mode=hub_mode or "")
+    raise HTTPException(status_code=403, detail="Webhook verify token mismatch.")
+
+
+@app.post("/api/webhooks/whatsapp")
+async def whatsapp_webhook_event(request: Request) -> dict:
+    """[F005][S004] Receive Meta webhook events (incoming messages and status updates)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        log_event("[F005][S004] whatsapp_webhook_event_invalid_json")
+        return {"ok": True}
+    if isinstance(payload, dict):
+        entries = payload.get("entry")
+        entry_count = len(entries) if isinstance(entries, list) else 0
+        log_event(
+            "[F005][S004] whatsapp_webhook_event",
+            object=str(payload.get("object") or ""),
+            entries=entry_count,
+        )
+    else:
+        log_event("[F005][S004] whatsapp_webhook_event_non_object")
+    return {"ok": True}
+
+
 @app.get("/api/admin/whatsapp-templates", response_model=list[WhatsAppTemplateOut])
 def list_whatsapp_templates(
     db: Session = Depends(get_db),
