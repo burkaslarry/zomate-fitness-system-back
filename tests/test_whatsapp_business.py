@@ -9,6 +9,7 @@ def test_normalize_whatsapp_phone_hk_local() -> None:
 
 def test_normalize_whatsapp_phone_hk_with_country_code() -> None:
     assert normalize_whatsapp_phone("+85293103031") == "85293103031"
+    assert normalize_whatsapp_phone("+852 93103031") == "85293103031"
 
 
 def test_build_body_parameters_order() -> None:
