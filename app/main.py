@@ -104,6 +104,7 @@ from .schemas import (
     LoginInput,
     LoginSession,
     ManualLessonRedeemInput,
+    LedgerAdjustInput,
     ExpenseCreate,
     MemberCreate,
     MemberProspectDupCheck,
@@ -1248,9 +1249,20 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
 
 
 def _apply_signature_image(student: Student, data_url: str) -> None:
+    """[F001][S004] Persist signature PNG to disk when possible; always keep DB blob for ephemeral disks."""
+    prefix = "data:image/png;base64,"
+    raw = data_url.strip()
+    if not raw.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Signature must be a PNG canvas data URL.")
+    try:
+        payload = base64.b64decode(raw[len(prefix) :], validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
+    if len(payload) > 1_000_000:
+        raise HTTPException(status_code=413, detail="Signature image is too large.")
+    student.signature_image_blob = payload
     relative_path = _save_signature_image(data_url, student.id)
     student.signature_image_url = relative_path
-    student.signature_image_blob = None
 
 
 def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
@@ -1388,6 +1400,7 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
             "coach_id": enr.coach_id,
             "scheduled_start": enr.scheduled_start.isoformat(),
             "series_end_date": enr.series_end_date.isoformat() if enr.series_end_date else None,
+            "total_lessons": enr.total_lessons,
             "checkin_pin": enr.checkin_pin,
             "installment_segments": [s.model_dump() for s in parse_segment_pins_json(enr.segment_pins_json)],
         }
@@ -3417,6 +3430,57 @@ def admin_manual_redeem_lessons(
     }
 
 
+@app.post("/api/admin/students/{student_id}/ledger-adjust")
+def admin_ledger_adjust(
+    student_id: int,
+    payload: LedgerAdjustInput,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F007][S002] Staff ledger correction (e.g. undo duplicate course-open credit)."""
+    if payload.delta_lessons == 0:
+        raise HTTPException(status_code=400, detail="delta_lessons must not be zero.")
+    student = db.query(Student).filter(Student.id == student_id).first()
+    if student is None or _is_deleted(db, "students", student_id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    before = _lesson_balance_sum(db, student.id)
+    if before + payload.delta_lessons < 0:
+        raise HTTPException(status_code=400, detail="Adjustment would make lesson balance negative.")
+    after = apply_lesson_ledger_delta(
+        db,
+        student,
+        payload.delta_lessons,
+        payload.reason,
+        created_by_role=user.role.lower(),
+    )
+    note = (payload.remarks or "").strip() or f"Ledger adjust by {user.username}"
+    db.add(
+        AuditLog(
+            action="admin_ledger_adjust",
+            student_id=student.id,
+            detail=json.dumps(
+                {
+                    "delta_lessons": payload.delta_lessons,
+                    "before": before,
+                    "after": after,
+                    "reason": payload.reason,
+                    "remarks": note,
+                    "user": user.username,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(student)
+    return {
+        "ok": True,
+        "student_id": student.id,
+        "lesson_balance_before": before,
+        "lesson_balance_after": after,
+    }
+
+
 @app.post("/api/students/{student_id}/bind-face")
 def bind_face(student_id: int, face_id_external: str, db: Session = Depends(get_db)) -> dict:
     student = db.query(Student).filter(Student.id == student_id).first()
@@ -5267,14 +5331,18 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
         if first_for_coach_notice is None:
             first_for_coach_notice = student
         pkg_sessions = payload.total_lessons
+        credit_delta = 0
         if pkg_sessions > 0:
-            apply_lesson_ledger_delta(
-                db,
-                student,
-                pkg_sessions,
-                "course_open_package",
-                created_by_role=user.role.lower(),
-            )
+            current_bal = _lesson_balance_sum(db, student.id)
+            credit_delta = max(0, pkg_sessions - current_bal)
+            if credit_delta > 0:
+                apply_lesson_ledger_delta(
+                    db,
+                    student,
+                    credit_delta,
+                    "course_open_package",
+                    created_by_role=user.role.lower(),
+                )
         bal_msg = _lesson_balance_sum(db, student.id)
         if n_inst <= 1:
             pin_txt = (
@@ -5294,7 +5362,7 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
             f"{pin_txt}"
-            f" 餘額已加 {pkg_sessions} 堂（套餐堂數），現有 {bal_msg} 堂。"
+            f" 餘額已加 {credit_delta} 堂（套餐堂數），現有 {bal_msg} 堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
 

@@ -218,6 +218,14 @@ class ManualLessonRedeemInput(BaseModel):
     remarks: str | None = Field(default=None, max_length=255)
 
 
+class LedgerAdjustInput(BaseModel):
+    """[F007][S002] Admin correction when payment + course open double-credited the ledger."""
+
+    delta_lessons: int = Field(..., ge=-100, le=100)
+    reason: str = Field(default="admin_ledger_adjust", min_length=1, max_length=160)
+    remarks: str | None = Field(default=None, max_length=255)
+
+
 class FaceIdCheckinInput(BaseModel):
     face_id_external: str
 
