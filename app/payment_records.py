@@ -248,6 +248,41 @@ def build_payment_records(
     return rows
 
 
+def build_sales_report_rows(db: Session) -> list[dict]:
+    """[F004][S001] Map unified payment records to monthly sales report row shape."""
+    rows: list[dict] = []
+    for r in build_payment_records(db, file_url_fn=None):
+        status = str(r.get("status") or "")
+        if status == "paid":
+            pay = "已付"
+        elif status == "missing_receipt":
+            pay = "缺收據"
+        elif status == "outstanding":
+            pay = "待付"
+        else:
+            pay = status.upper() if status else "—"
+        if r.get("record_type") == "installment":
+            inst = "進行中" if status == "outstanding" else ("已付" if status == "paid" else "—")
+        elif r.get("installment_no"):
+            inst = f"第{r['installment_no']}期"
+        else:
+            inst = "無"
+        created = str(r.get("created_at") or "")
+        date_part = created[:10] if len(created) >= 10 else created
+        rows.append(
+            {
+                "date": date_part,
+                "clientName": r.get("student_name") or "",
+                "courseType": r.get("label") or "",
+                "amount": float(r.get("amount") or 0),
+                "coachName": r.get("coach_name") or "—",
+                "paymentStatus": pay,
+                "installmentStatus": inst,
+            }
+        )
+    return rows
+
+
 def count_missing_receipt_renewals(db: Session) -> int:
     """[F004][S002] Renewals with amount but no receipt file linked."""
     from sqlalchemy import select

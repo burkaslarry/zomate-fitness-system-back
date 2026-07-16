@@ -133,7 +133,12 @@ from .medical_clearance import (
     validate_medical_upload,
 )
 from .payment_notifications import apply_receipt_payment_match, send_payment_whatsapp_notifications
-from .payment_records import build_payment_records, count_missing_receipt_renewals, student_onboarding_coach
+from .payment_records import (
+    build_payment_records,
+    build_sales_report_rows,
+    count_missing_receipt_renewals,
+    student_onboarding_coach,
+)
 from .enrollment_schedule import (
     enrollment_active_at_now,
     enrollment_to_out,
@@ -5026,36 +5031,6 @@ def export_attendance_template_csv(user: AppUser = Depends(require_admin_or_cler
 # Frontend uses NEXT_PUBLIC_API_BASE_URL=http://localhost:8000 with these paths.
 # -----------------------------------------------------------------------------
 
-_V1_SALES_ROWS: list[dict] = [
-    {
-        "date": "2026-04-02",
-        "clientName": "Chan Tai Man",
-        "courseType": "PT 10",
-        "amount": 8800,
-        "coachName": "Coach A",
-        "paymentStatus": "PAID_FULL",
-        "installmentStatus": "NONE",
-    },
-    {
-        "date": "2026-04-18",
-        "clientName": "Lee Siu Ming",
-        "courseType": "PT 30",
-        "amount": 22800,
-        "coachName": "Coach B",
-        "paymentStatus": "INSTALLMENT_ACTIVE",
-        "installmentStatus": "ACTIVE",
-    },
-    {
-        "date": "2026-04-22",
-        "clientName": "Wong Ka Yan",
-        "courseType": "Trial → PT 10",
-        "amount": 1280,
-        "coachName": "Coach A",
-        "paymentStatus": "PENDING",
-        "installmentStatus": "NONE",
-    },
-]
-
 _V1_EXPENSE_ROWS: list[dict] = [
     {
         "id": "e1",
@@ -5086,9 +5061,10 @@ _V1_EXPENSE_ROWS: list[dict] = [
 def v1_reports_sales(
     sort: str | None = None,
     columns: str | None = None,
+    db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    rows = list(_V1_SALES_ROWS)
+    rows = build_sales_report_rows(db)
     if sort:
         part = sort.split(",")[0]
         if ":" in part:
