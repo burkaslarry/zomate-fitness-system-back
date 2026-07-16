@@ -591,6 +591,42 @@ class CourseOut(BaseModel):
     enrollments: list[CourseEnrollmentOut] = Field(default_factory=list)
 
 
+class CoachSessionOut(BaseModel):
+    """[F008][S002] One coach session row (student + date + category)."""
+
+    enrollment_id: int
+    student_id: int
+    student_name: str
+    student_phone: str
+    category_id: int | None = None
+    category_name: str
+    session_date: str
+    start_time: str
+    end_time: str
+    branch_name: str
+    checkin_pin: str
+    coach_time_confirmed: bool
+    attendance_status: str
+    course_title: str
+
+
+class CoachAttendanceReportRowOut(BaseModel):
+    """[F008][S004] Monthly coach attendance rollup by course type."""
+
+    course_type: str
+    students: str
+    session_dates: str
+
+
+class CoachAttendanceReportOut(BaseModel):
+    """[F008][S004] Month-scoped coach attendance dashboard payload."""
+
+    month: str
+    from_date: date
+    to_date: date
+    rows: list[CoachAttendanceReportRowOut] = Field(default_factory=list)
+
+
 class CourseCategoryCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
 

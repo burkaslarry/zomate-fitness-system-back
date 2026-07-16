@@ -86,7 +86,9 @@ from .schemas import (
     CoachStudentFollowUpOut,
     CoachRemindPaymentBody,
     CoachRemindPaymentOut,
-    CoachStudentFollowUpOut,
+    CoachSessionOut,
+    CoachAttendanceReportOut,
+    CoachAttendanceReportRowOut,
     CoachBookSession,
     CoachTrialGrantBody,
     CoachUpdate,
@@ -139,6 +141,7 @@ from .enrollment_schedule import (
     parse_lesson_weekdays_str,
     parse_segment_pins_json,
 )
+from .coach_sessions import build_coach_attendance_report_rows, build_coach_session_rows
 from .whatsapp_templates import seed_whatsapp_templates
 from .whatsapp_business import dispatch_reminder, get_whatsapp_client
 from .storage import FileStorageService
@@ -1731,6 +1734,8 @@ def _seed_management_defaults(db: Session) -> None:
         "續會學生一對二",
         "自帶學生一對一",
         "自帶學生一對二",
+        "泰拳一對一",
+        "泰拳一對二",
         "Yoga 瑜珈",
         "Stretching 拉伸",
         "Pilates 普拉提",
@@ -2963,6 +2968,7 @@ def create_renewal_multipart(
     course_package_type_code: str | None = Form(default=None),
     course_package_type_label: str | None = Form(default=None),
     note: str | None = Form(default=None),
+    skip_lesson_ledger: bool = Form(default=False),
     receipt: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -3008,13 +3014,16 @@ def create_renewal_multipart(
         )
         db.add(receipt_row)
         db.flush()
-    bal_after = apply_lesson_ledger_delta(
-        db,
-        student,
-        int(total_lessons),
-        "renewal_package",
-        created_by_role="renewal",
-    )
+    if skip_lesson_ledger:
+        bal_after = _lesson_balance_sum(db, student.id)
+    else:
+        bal_after = apply_lesson_ledger_delta(
+            db,
+            student,
+            int(total_lessons),
+            "renewal_package",
+            created_by_role="renewal",
+        )
     renewal_row = RenewalRecord(
         student_id=student.id,
         student_name=student.full_name,
@@ -5148,10 +5157,8 @@ def admin_courses_by_day(
     return [enrollment_to_out(e) for e in picked]
 
 
-@app.post("/api/admin/courses", response_model=CourseOut)
-def admin_create_course(
-    payload: CourseCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
-) -> CourseOut:
+def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> CourseOut:
+    """[F002][S002] Shared course enrollment + PIN issuance for staff and coach register-course."""
     if not db.query(Branch).filter(
         Branch.id == payload.branch_id,
         ~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")),
@@ -5301,6 +5308,28 @@ def admin_create_course(
     )
     assert full is not None
     return enrollment_to_out(full)
+
+
+@app.post("/api/admin/courses", response_model=CourseOut)
+def admin_create_course(
+    payload: CourseCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+) -> CourseOut:
+    return _create_course_impl(payload, db, user)
+
+
+@app.post("/api/coach/register-course", response_model=CourseOut)
+def coach_register_course(
+    payload: CourseCreate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CourseOut:
+    """[F002][S003] Coach (or staff) registers a paid course package and issues check-in PIN(s)."""
+    _require_coach_access(db, user, payload.coach_id)
+    if user.role == "COACH":
+        coach_row = _coach_row_for_user(db, user)
+        if coach_row is None or coach_row.id != payload.coach_id:
+            raise HTTPException(status_code=403, detail="COACH may only register courses under their own profile.")
+    return _create_course_impl(payload, db, user)
 
 
 @app.patch("/api/admin/courses/{course_id}/installment-paid", response_model=CourseOut)
@@ -5503,6 +5532,207 @@ def coach_list_schedule_alias(
         to_date=to_date,
         db=db,
         user=user,
+    )
+
+
+def _coach_enrollments_for_sessions(
+    db: Session,
+    coach_id: int,
+    *,
+    day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+) -> list[CourseEnrollment]:
+    """[F008][S002] Load enrollments that have sessions in the requested window."""
+    deleted_e = _deleted_course_enrollment_ids()
+    rows_raw = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(
+            CourseEnrollment.coach_id == coach_id,
+            ~CourseEnrollment.id.in_(deleted_e),
+        )
+        .order_by(CourseEnrollment.scheduled_start.asc())
+        .limit(800)
+        .all()
+    )
+    if day:
+        return [e for e in rows_raw if day in get_lesson_dates_for_enrollment(e)][:400]
+    if from_date is not None and to_date is not None:
+        if to_date < from_date:
+            raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
+        picked: list[CourseEnrollment] = []
+        for enr in rows_raw:
+            for ld in get_lesson_dates_for_enrollment(enr):
+                if from_date <= ld <= to_date:
+                    picked.append(enr)
+                    break
+        return picked[:400]
+    return rows_raw[:200]
+
+
+def _parse_category_ids_param(raw: str | None) -> list[int] | None:
+    if not raw or not str(raw).strip():
+        return None
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            cid = int(part)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="category_ids must be comma-separated integers.")
+        if cid > 0:
+            out.append(cid)
+    return sorted(set(out)) if out else None
+
+
+@app.get("/api/coach/sessions", response_model=list[CoachSessionOut])
+def coach_list_sessions(
+    coach_id: int | None = None,
+    day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    category_ids: str | None = Query(default=None, description="Comma-separated CourseCategory ids"),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> list[CoachSessionOut]:
+    """[F008][S002] Coach-scoped session rows with optional course-type filter."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    cat_filter = _parse_category_ids_param(category_ids)
+    enrollments = _coach_enrollments_for_sessions(
+        db, cid, day=day, from_date=from_date, to_date=to_date
+    )
+    rows = build_coach_session_rows(
+        db,
+        enrollments,
+        coach_id=cid,
+        day=day,
+        from_date=from_date,
+        to_date=to_date,
+        category_ids=cat_filter,
+    )
+    log_event("coach_sessions_list", coach_id=cid, count=len(rows))
+    return [CoachSessionOut.model_validate(r) for r in rows]
+
+
+@app.get("/api/coach/sessions/export.xlsx")
+def coach_export_sessions_xlsx(
+    coach_id: int | None = None,
+    day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    category_ids: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> PlainTextResponse:
+    """[F008][S003] Excel-compatible CSV export of filtered coach sessions."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    cat_filter = _parse_category_ids_param(category_ids)
+    enrollments = _coach_enrollments_for_sessions(
+        db, cid, day=day, from_date=from_date, to_date=to_date
+    )
+    rows = build_coach_session_rows(
+        db,
+        enrollments,
+        coach_id=cid,
+        day=day,
+        from_date=from_date,
+        to_date=to_date,
+        category_ids=cat_filter,
+    )
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(
+        [
+            "學生姓名",
+            "電話",
+            "課程類型",
+            "上堂日期",
+            "開始時間",
+            "結束時間",
+            "分店",
+            "課堂PIN",
+            "確認狀態",
+            "簽到狀態",
+            "課程名稱",
+        ]
+    )
+    for r in rows:
+        w.writerow(
+            [
+                r["student_name"],
+                r["student_phone"],
+                r["category_name"],
+                r["session_date"],
+                r["start_time"],
+                r["end_time"],
+                r["branch_name"],
+                r["checkin_pin"],
+                "已確認" if r["coach_time_confirmed"] else "待確認",
+                r["attendance_status"],
+                r["course_title"],
+            ]
+        )
+    log_event("coach_sessions_export", coach_id=cid, count=len(rows))
+    return PlainTextResponse(
+        buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="coach-sessions.csv"'},
+    )
+
+
+def _parse_month_param(month: str | None) -> tuple[str, date, date]:
+    """[F008][S004] Parse yyyy-MM → (month, from_date, to_date); default = current HK month."""
+    from calendar import monthrange
+
+    raw = (month or "").strip()
+    if not raw:
+        today = now_hk().date()
+        raw = f"{today.year:04d}-{today.month:02d}"
+    try:
+        year_s, month_s = raw.split("-", 1)
+        year_i = int(year_s)
+        month_i = int(month_s)
+        if month_i < 1 or month_i > 12:
+            raise ValueError("month out of range")
+        last_day = monthrange(year_i, month_i)[1]
+        from_d = date(year_i, month_i, 1)
+        to_d = date(year_i, month_i, last_day)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="month must be yyyy-MM.") from exc
+    return f"{year_i:04d}-{month_i:02d}", from_d, to_d
+
+
+@app.get("/api/coach/attendance-report", response_model=CoachAttendanceReportOut)
+def coach_attendance_report(
+    month: str | None = Query(default=None, description="yyyy-MM; default current month"),
+    coach_id: int | None = None,
+    category_ids: str | None = Query(default=None, description="Comma-separated CourseCategory ids"),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CoachAttendanceReportOut:
+    """[F008][S004] Monthly dashboard: Course Type | Students | 上堂日期."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    month_key, from_d, to_d = _parse_month_param(month)
+    cat_filter = _parse_category_ids_param(category_ids)
+    enrollments = _coach_enrollments_for_sessions(db, cid, from_date=from_d, to_date=to_d)
+    session_rows = build_coach_session_rows(
+        db,
+        enrollments,
+        coach_id=cid,
+        from_date=from_d,
+        to_date=to_d,
+        category_ids=cat_filter,
+    )
+    report_rows = build_coach_attendance_report_rows(session_rows)
+    log_event("coach_attendance_report", coach_id=cid, month=month_key, count=len(report_rows))
+    return CoachAttendanceReportOut(
+        month=month_key,
+        from_date=from_d,
+        to_date=to_d,
+        rows=[CoachAttendanceReportRowOut.model_validate(r) for r in report_rows],
     )
 
 
