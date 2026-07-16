@@ -1419,6 +1419,33 @@ def record_activity(db: Session, student: Student, activity_type: str, ref_id: i
         db.add(ActivityLog(member_hkid=student.hkid, type=activity_type, ref_id=ref_id))
 
 
+def _activity_logs_for_student(db: Session, student: Student, *, limit: int = 100) -> list[ActivityLog]:
+    """[F001][S002] Activity rows scoped to this student — HKID may be reused after soft delete."""
+    if not student.hkid:
+        return []
+    renewal_ids = {
+        r.id
+        for r in db.query(RenewalRecord.id).filter(RenewalRecord.student_id == student.id).all()
+    }
+    rows = (
+        db.query(ActivityLog)
+        .filter(ActivityLog.member_hkid == student.hkid)
+        .order_by(ActivityLog.created_at.desc())
+        .limit(limit * 3)
+        .all()
+    )
+    out: list[ActivityLog] = []
+    for row in rows:
+        if row.type == "member_create" and row.ref_id != student.id:
+            continue
+        if row.type == "renewal_create" and row.ref_id not in renewal_ids:
+            continue
+        out.append(row)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _migrate_enrollment_merged_columns(db: Session) -> None:
     """[F009][S004] Bootstrap + production: merge courses into enrollments (alembic 20260606_0012)."""
     stmts = [
@@ -2624,16 +2651,7 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
     trial_branch_ids = [t["branch_id"] for t in trials if t.get("branch_id") is not None]
     trial_coaches = {c.id: c.full_name for c in db.query(Coach).filter(Coach.id.in_(trial_coach_ids)).all()} if trial_coach_ids else {}
     trial_branches = {b.id: b.name for b in db.query(Branch).filter(Branch.id.in_(trial_branch_ids)).all()} if trial_branch_ids else {}
-    activity_hkid = student.hkid or (normalize_hkid(fallback_hkid) if fallback_hkid else None)
-    logs = (
-        db.query(ActivityLog)
-        .filter(ActivityLog.member_hkid == activity_hkid)
-        .order_by(ActivityLog.created_at.desc())
-        .limit(100)
-        .all()
-        if activity_hkid
-        else []
-    )
+    logs = _activity_logs_for_student(db, student, limit=100)
     return {
         "profile": student_to_member_dict(db, student),
         "health": medical_clearance_payload(student, _file_url),
