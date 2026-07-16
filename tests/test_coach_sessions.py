@@ -3,7 +3,8 @@
 from datetime import date, datetime
 
 from app.coach_sessions import build_coach_session_rows, resolve_enrollment_category
-from app.models import Branch, Coach, CourseCategory, CourseEnrollment, Student
+from app.main import _coach_payment_summary
+from app.models import Branch, Coach, CourseCategory, CourseEnrollment, RenewalRecord, Student
 
 
 def test_resolve_enrollment_category_from_title(db_session):
@@ -64,3 +65,47 @@ def test_build_coach_session_rows_single_day(db_session):
     assert rows[0]["student_name"] == "Lee"
     assert rows[0]["category_name"] == "新學生一對一"
     assert rows[0]["attendance_status"] == "未簽到"
+
+
+def test_coach_payment_summary_pending_without_receipt(db_session):
+    """[F003][S003] Open-package enrollment without receipt must not read as Paid."""
+    branch = Branch(name="TST", code="TST4", address="a", active=True)
+    coach = Coach(full_name="Fung Lo", phone="90008888", branch=branch, active=True)
+    student = Student(full_name="Wai Lun, Lo", phone="93103035", hkid="Y011")
+    db_session.add_all([branch, coach, student])
+    db_session.flush()
+
+    enr = CourseEnrollment(
+        title="Yoga",
+        branch_id=branch.id,
+        coach_id=coach.id,
+        student_id=student.id,
+        scheduled_start=datetime(2026, 7, 16, 10, 0),
+        scheduled_end=datetime(2026, 7, 16, 11, 0),
+        total_lessons=10,
+        checkin_pin="95398",
+        segment_pins_json=None,
+        coach_time_confirmed=True,
+    )
+    db_session.add(enr)
+    db_session.add(
+        RenewalRecord(
+            student_id=student.id,
+            student_name=student.full_name,
+            phone=student.phone,
+            course_ratio="1-1",
+            lessons=10,
+            payment_method="cash",
+            coach_id=coach.id,
+            amount=8000,
+            receipt_id=None,
+            applicant_name=student.full_name,
+            signature="sig",
+            renewal_date=date(2026, 7, 16),
+        )
+    )
+    db_session.commit()
+
+    pay_st, inst_st, _, _ = _coach_payment_summary(db_session, enr, student)
+    assert pay_st == "Pending"
+    assert inst_st == "待補收據"

@@ -4567,7 +4567,7 @@ def admin_coach_student_follow_up(
     for enr in enrollments:
         st = enr.student
         sid = st.id
-        pay_st, inst_st, _, _ = _coach_payment_summary(enr, st)
+        pay_st, inst_st, _, _ = _coach_payment_summary(db, enr, st)
         if sid not in by_student:
             last_att = (
                 db.query(Attendance)
@@ -5835,13 +5835,59 @@ def coach_reschedule_course(
     return enrollment_to_out(full)
 
 
-def _coach_payment_summary(enr: CourseEnrollment, student: Student) -> tuple[str, str, float | None, float | None]:
+def _enrollment_has_confirmed_payment(db: Session, enr: CourseEnrollment, student: Student) -> tuple[bool, str]:
+    """[F003][S003] True only when a receipt (or paid renewal) exists — not merely open-package ledger."""
+    paid_rr = (
+        db.query(RenewalRecord)
+        .filter(
+            RenewalRecord.student_id == student.id,
+            RenewalRecord.receipt_id.isnot(None),
+            RenewalRecord.coach_id == enr.coach_id,
+        )
+        .order_by(RenewalRecord.created_at.desc())
+        .first()
+    )
+    if paid_rr:
+        return True, "全數已付"
+    unpaid_rr = (
+        db.query(RenewalRecord)
+        .filter(
+            RenewalRecord.student_id == student.id,
+            RenewalRecord.receipt_id.is_(None),
+            RenewalRecord.amount.isnot(None),
+            RenewalRecord.amount > 0,
+        )
+        .order_by(RenewalRecord.created_at.desc())
+        .first()
+    )
+    if unpaid_rr:
+        return False, "待補收據"
+    paid_rec = (
+        db.query(Receipt)
+        .filter(
+            Receipt.student_id == student.id,
+            Receipt.created_at >= enr.created_at,
+        )
+        .order_by(Receipt.created_at.desc())
+        .first()
+    )
+    if paid_rec:
+        return True, "全數已付"
+    return False, "待付款"
+
+
+def _coach_payment_summary(
+    db: Session, enr: CourseEnrollment, student: Student
+) -> tuple[str, str, float | None, float | None]:
     """[F003][S003] Derive payment + installment labels for coach finance tab."""
     segments = parse_segment_pins_json(enr.segment_pins_json)
     if len(segments) <= 1:
-        if not segments or segments[0].paid:
+        if len(segments) == 1 and not segments[0].paid:
+            return "Pending", "待付款", None, None
+        confirmed, inst_label = _enrollment_has_confirmed_payment(db, enr, student)
+        if confirmed:
             return "Paid", "全數已付", None, None
-        return "Pending", "待付款", None, None
+        return "Pending", inst_label, None, None
     paid_n = sum(1 for s in segments if s.paid)
     total_n = len(segments)
     inst = f"第{paid_n}/{total_n}期已付"
@@ -5952,10 +5998,13 @@ def coach_student_payments(
     )
     out: list[CoachStudentPaymentOut] = []
     seen_student_ids: set[int] = set()
+    pending_from_enrollment: set[int] = set()
     for enr in rows:
         student = enr.student
         seen_student_ids.add(student.id)
-        pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(enr, student)
+        pay_st, inst_st, paid_amt, total_amt = _coach_payment_summary(db, enr, student)
+        if pay_st == "Pending":
+            pending_from_enrollment.add(student.id)
         next_inst, next_reminder = _next_unpaid_installment_meta(enr)
         out.append(
             CoachStudentPaymentOut(
@@ -5992,6 +6041,8 @@ def coach_student_payments(
         student = rr.student
         if student is None:
             continue
+        if student.id in pending_from_enrollment:
+            continue
         out.append(
             CoachStudentPaymentOut(
                 student_id=student.id,
@@ -6018,10 +6069,10 @@ def _wa_me_link(phone: str, message: str) -> str:
     return f"https://wa.me/{hk}?text={quote(message, safe='')}"
 
 
-def _installment_reminder_message(student: Student, enr: CourseEnrollment) -> str:
+def _installment_reminder_message(db: Session, student: Student, enr: CourseEnrollment) -> str:
     """[F003][S006] Installment-aware WhatsApp copy for unpaid tranches."""
     segments = parse_segment_pins_json(enr.segment_pins_json)
-    _pay_st, inst_st, _a, _b = _coach_payment_summary(enr, student)
+    _pay_st, inst_st, _a, _b = _coach_payment_summary(db, enr, student)
     if len(segments) > 1:
         unpaid = next((s for s in segments if not s.paid), None)
         if unpaid:
@@ -6194,8 +6245,8 @@ def coach_student_records(
                 scheduled_end=e.scheduled_end,
                 total_lessons=e.total_lessons,
                 coach_time_confirmed=bool(e.coach_time_confirmed),
-                payment_status=_coach_payment_summary(e, student)[0],
-                installment_status=_coach_payment_summary(e, student)[1],
+                payment_status=_coach_payment_summary(db, e, student)[0],
+                installment_status=_coach_payment_summary(db, e, student)[1],
                 next_installment_no=_next_unpaid_installment_meta(e)[0],
                 next_reminder_lesson=_next_unpaid_installment_meta(e)[1],
             )
@@ -6241,10 +6292,10 @@ def coach_remind_payment(
     )
     if not enr or _is_deleted(db, "course_enrollments", enr.id):
         raise HTTPException(status_code=404, detail="Course enrollment not found for this student.")
-    pay_st, _inst, _, _ = _coach_payment_summary(enr, student)
+    pay_st, _inst, _, _ = _coach_payment_summary(db, enr, student)
     if pay_st == "Paid":
         raise HTTPException(status_code=400, detail="This course is already fully paid.")
-    msg = _installment_reminder_message(student, enr)
+    msg = _installment_reminder_message(db, student, enr)
     log_whatsapp(db, student, student.phone, msg)
     record_activity(db, student, "coach_payment_reminder", enr.id)
     db.commit()
