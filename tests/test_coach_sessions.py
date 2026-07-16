@@ -67,6 +67,41 @@ def test_build_coach_session_rows_single_day(db_session):
     assert rows[0]["attendance_status"] == "未簽到"
 
 
+def test_build_coach_session_rows_skips_unresolved_category(db_session):
+    """[F008][S004] Enrollments without a course category must not appear in coach reports."""
+    branch = Branch(name="TST", code="TST5", address="a", active=True)
+    coach = Coach(full_name="C3", phone="90000004", branch=branch, active=True)
+    student = Student(full_name="Larry Lo, Pilates E2E 774413", phone="93333333", hkid="A333")
+    db_session.add_all([branch, coach, student])
+    db_session.flush()
+
+    enr = CourseEnrollment(
+        title="Pilates E2E 774413",
+        branch_id=branch.id,
+        coach_id=coach.id,
+        student_id=student.id,
+        scheduled_start=datetime(2026, 7, 5, 10, 0),
+        scheduled_end=datetime(2026, 7, 5, 11, 0),
+        total_lessons=8,
+        lesson_weekdays="5",
+        series_start_date=date(2026, 7, 5),
+        series_end_date=date(2026, 7, 31),
+        checkin_pin="77441",
+        coach_time_confirmed=True,
+    )
+    db_session.add(enr)
+    db_session.commit()
+
+    rows = build_coach_session_rows(
+        db_session,
+        [enr],
+        coach_id=coach.id,
+        from_date=date(2026, 7, 1),
+        to_date=date(2026, 7, 31),
+    )
+    assert rows == []
+
+
 def test_coach_payment_summary_pending_without_receipt(db_session):
     """[F003][S003] Open-package enrollment without receipt must not read as Paid."""
     branch = Branch(name="TST", code="TST4", address="a", active=True)

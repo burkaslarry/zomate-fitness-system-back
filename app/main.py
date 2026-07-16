@@ -5606,12 +5606,14 @@ def _coach_enrollments_for_sessions(
 ) -> list[CourseEnrollment]:
     """[F008][S002] Load enrollments that have sessions in the requested window."""
     deleted_e = _deleted_course_enrollment_ids()
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     rows_raw = (
         db.query(CourseEnrollment)
         .options(*_enrollment_load_options())
         .filter(
             CourseEnrollment.coach_id == coach_id,
             ~CourseEnrollment.id.in_(deleted_e),
+            ~CourseEnrollment.student_id.in_(deleted_s),
         )
         .order_by(CourseEnrollment.scheduled_start.asc())
         .limit(800)

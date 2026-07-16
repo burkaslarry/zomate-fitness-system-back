@@ -116,7 +116,9 @@ def build_coach_session_rows(
 
     for enr in enrollments:
         cat_id, cat_name = resolve_enrollment_category(db, enr, skill_ids=skill_ids)
-        if filter_cats is not None and (cat_id is None or cat_id not in filter_cats):
+        if cat_id is None or not cat_name:
+            continue
+        if filter_cats is not None and cat_id not in filter_cats:
             continue
 
         student = enr.student
@@ -140,7 +142,7 @@ def build_coach_session_rows(
                     "student_name": student.full_name,
                     "student_phone": student.phone,
                     "category_id": cat_id,
-                    "category_name": cat_name or "—",
+                    "category_name": cat_name,
                     "session_date": session_date.isoformat(),
                     "start_time": start_dt.strftime("%H:%M"),
                     "end_time": end_dt.strftime("%H:%M"),
@@ -166,7 +168,9 @@ def build_coach_attendance_report_rows(session_rows: list[dict]) -> list[dict]:
     groups: dict[str, dict[str, set[str]]] = {}
     order: list[str] = []
     for row in session_rows:
-        course_type = str(row.get("category_name") or "—").strip() or "—"
+        course_type = str(row.get("category_name") or "").strip()
+        if not course_type or course_type == "—":
+            continue
         student = str(row.get("student_name") or "").strip()
         session_date = str(row.get("session_date") or "").strip()
         if course_type not in groups:
