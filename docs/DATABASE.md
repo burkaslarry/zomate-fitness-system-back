@@ -46,4 +46,4 @@ All require `Authorization: Bearer <token>` (ADMIN or CLERK). The Next.js app sh
 2. **前端** `zomate-fitness-system-front/`：設 `NEXT_PUBLIC_API_BASE_URL` 指向該 FastAPI（或本機 dev 可不設，預設 `http://127.0.0.1:8000`）。
 3. 不要用 mock 時：**不要**設定 `NEXT_PUBLIC_USE_NEXT_MOCK_API`。全站請求會走 FastAPI → PostgreSQL。
 
-本機一次啟動（遠端 DB）可用專案根目錄：`DATABASE_URL='…' ./run-demo-with-remote-db.sh`
+本機一次啟動（遠端 DB）可用專案根目錄：`DATABASE_URL='…' ./run-prod.sh`

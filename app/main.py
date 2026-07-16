@@ -385,7 +385,7 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
 
 
 def _seed_default_users(db: Session) -> None:
-    # CF09:CoachDemoAccount — demo 身份：coachdemo／COACH 只可用「教練曆」（前端限 /coach/calendar）；worker／CLERK 仍為後台職員。
+    # CF09:CoachSeedAccount — 種子 COACH 帳號：coachdemo／COACH 只可用「教練曆」（前端限 /coach/calendar）；worker／CLERK 仍為後台職員。
     users = [
         ("masterzoe", "12345678", "ADMIN"),
         ("worker", "12347890", "CLERK"),
@@ -1810,7 +1810,7 @@ def _seed_management_defaults(db: Session) -> None:
                 full_name="Coach Demo",
                 phone="90000001",
                 branch_id=first_branch.id,
-                specialty="Demo",
+                specialty="General",
                 active=True,
                 hire_date=date.today(),
             )
@@ -1997,7 +1997,7 @@ async def perform_lesson_checkin(
     if notified_coach:
         log_whatsapp(db, student, notified_coach.phone, coach_msg)
     else:
-        log_whatsapp(db, student, "coach-demo", coach_msg)
+        log_whatsapp(db, student, "coach-remind", coach_msg)
 
     detail_obj: dict = {
         "channel": channel,
@@ -5244,7 +5244,6 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
     first_for_coach_notice: Student | None = None
     enrolled_names: list[str] = []
     note_trim = (payload.coach_schedule_note or "").strip()
-    needs_coach_schedule = bool(note_trim)
     n_inst = max(1, min(3, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
     first_created: CourseEnrollment | None = None
@@ -5297,7 +5296,7 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
             student_id=student.id,
             checkin_pin=primary_pin,
             segment_pins_json=seg_json,
-            coach_time_confirmed=not needs_coach_schedule,
+            coach_time_confirmed=False,
         )
         db.add(enr)
         db.flush()
