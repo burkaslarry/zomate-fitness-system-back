@@ -602,7 +602,14 @@ class CourseOut(BaseModel):
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
     series_start_date: date | None = None
     series_end_date: date | None = None
+    coach_time_confirmed: bool = True
     enrollments: list[CourseEnrollmentOut] = Field(default_factory=list)
+
+
+class CoachEnrollmentCancelBody(BaseModel):
+    """[F003][S009] Coach soft-cancels an assigned enrollment."""
+
+    coach_id: int | None = None
 
 
 class CoachSessionOut(BaseModel):

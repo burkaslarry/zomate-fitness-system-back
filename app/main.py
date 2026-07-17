@@ -90,6 +90,7 @@ from .schemas import (
     CoachAttendanceReportOut,
     CoachAttendanceReportRowOut,
     CoachBookSession,
+    CoachEnrollmentCancelBody,
     CoachTrialGrantBody,
     CoachUpdate,
     CourseCategoryCreate,
@@ -6380,17 +6381,20 @@ def coach_confirm_enrollment_schedule(
         raise HTTPException(status_code=404, detail="Course not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
-    start = datetime.combine(payload.day, time(payload.start_hour, 0))
+    first_day = payload.day
+    start = datetime.combine(first_day, time(payload.start_hour, 0))
     end = start + timedelta(hours=payload.duration_hours)
-    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
-    ws_raw = [int(x) for x in (enr.lesson_weekdays or "0").split(",") if x.strip()]
-    lesson_dates = enumerate_lesson_dates(payload.day, ws_raw, enr.total_lessons)
+    _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id)
+    # [F003][S002] First booking uses coach-picked calendar day (not legacy placeholder weekday).
+    ws_raw = [first_day.weekday()]
+    lesson_dates = enumerate_lesson_dates(first_day, ws_raw, enr.total_lessons)
     if not lesson_dates:
         raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
-    enr.series_start_date = lesson_dates[0]
+    enr.lesson_weekdays = ",".join(str(w) for w in ws_raw)
+    enr.series_start_date = first_day
     enr.series_end_date = lesson_dates[-1]
-    enr.scheduled_start = datetime.combine(lesson_dates[0], start.time())
-    enr.scheduled_end = datetime.combine(lesson_dates[0], end.time())
+    enr.scheduled_start = datetime.combine(first_day, start.time())
+    enr.scheduled_end = datetime.combine(first_day, end.time())
     enr.coach_time_confirmed = True
     db.commit()
     full = (
@@ -6401,6 +6405,31 @@ def coach_confirm_enrollment_schedule(
     )
     assert full is not None
     return enrollment_to_out(full)
+
+
+@app.post("/api/coach/enrollments/{enrollment_id}/cancel")
+def coach_cancel_enrollment(
+    enrollment_id: int,
+    payload: CoachEnrollmentCancelBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F003][S009] Coach soft-cancels an assigned enrollment (removes from calendar)."""
+    cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    enr = (
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.student))
+        .filter(CourseEnrollment.id == enrollment_id)
+        .first()
+    )
+    if not enr or _is_deleted(db, "course_enrollments", enr.id):
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    if enr.coach_id != cid:
+        raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    _record_soft_delete(db, "course_enrollments", enr.id, user)
+    record_activity(db, enr.student, "coach_cancel_enrollment", enr.id)
+    db.commit()
+    return {"ok": True, "enrollment_id": enr.id}
 
 
 @app.patch("/api/coach/students/{student_id}/signature")

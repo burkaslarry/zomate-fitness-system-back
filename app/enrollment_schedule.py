@@ -154,5 +154,6 @@ def enrollment_to_out(enr: CourseEnrollment) -> CourseOut:
         lesson_weekdays=ws,
         series_start_date=enr.series_start_date,
         series_end_date=enr.series_end_date,
+        coach_time_confirmed=bool(getattr(enr, "coach_time_confirmed", True)),
         enrollments=enrollments,
     )
