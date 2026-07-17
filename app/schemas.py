@@ -393,16 +393,19 @@ class CourseReschedule(BaseModel):
 
 
 class CoachScheduleConfirm(BaseModel):
-    """[F003][S001] Coach assigns 1–2 hour slot on a calendar day for one enrollment."""
+    """[F003][S001] Coach assigns 0.5–2 hour slot on a calendar day for one enrollment."""
 
     coach_id: int | None = None
     enrollment_id: int = Field(ge=1)
     day: date
     start_hour: int = Field(ge=9, le=18)
-    duration_hours: int = Field(ge=1, le=2)
+    duration_hours: float = Field(ge=0.5, le=2)
 
     @model_validator(mode="after")
     def validate_slot_within_business_hours(self) -> "CoachScheduleConfirm":
+        allowed = {0.5, 1.0, 1.5, 2.0}
+        if self.duration_hours not in allowed:
+            raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
         if self.start_hour + self.duration_hours > 19:
             raise ValueError("Time slot must end by 19:00 (7pm).")
         return self
@@ -525,16 +528,19 @@ class CoachStudentFollowUpOut(BaseModel):
 
 
 class CoachBookSession(BaseModel):
-    """[F003][S007] Coach books or reschedules 1–2h session; server rejects slot conflicts."""
+    """[F003][S007] Coach books or reschedules 0.5–2h session; server rejects slot conflicts."""
 
     coach_id: int | None = None
     enrollment_id: int = Field(ge=1)
     day: date
     start_hour: int = Field(ge=9, le=18)
-    duration_hours: int = Field(ge=1, le=2)
+    duration_hours: float = Field(ge=0.5, le=2)
 
     @model_validator(mode="after")
     def validate_slot_within_business_hours(self) -> "CoachBookSession":
+        allowed = {0.5, 1.0, 1.5, 2.0}
+        if self.duration_hours not in allowed:
+            raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
         if self.start_hour + self.duration_hours > 19:
             raise ValueError("Time slot must end by 19:00 (7pm).")
         return self

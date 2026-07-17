@@ -6315,7 +6315,7 @@ def coach_book_session(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> CourseOut:
-    """[F003][S007] Coach books (pending) or reschedules (confirmed) 1–2h with conflict guard."""
+    """[F003][S007] Coach books (pending) or reschedules (confirmed) 0.5–2h with conflict guard."""
     confirm_payload = CoachScheduleConfirm(
         coach_id=payload.coach_id,
         enrollment_id=payload.enrollment_id,
@@ -6364,7 +6364,7 @@ def coach_confirm_enrollment_schedule(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> CourseOut:
-    """[F003][S002] Coach assigns 1–2h slot; blocks double-booking via confirmed enrollments."""
+    """[F003][S002] Coach assigns 0.5–2h slot; blocks double-booking via confirmed enrollments."""
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
     enr = (
         db.query(CourseEnrollment)
