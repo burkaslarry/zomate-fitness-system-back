@@ -399,6 +399,7 @@ class CoachScheduleConfirm(BaseModel):
     enrollment_id: int = Field(ge=1)
     day: date
     start_hour: int = Field(ge=9, le=18)
+    start_minute: int = Field(default=0, ge=0, le=45)
     duration_hours: float = Field(ge=0.5, le=2)
 
     @model_validator(mode="after")
@@ -406,7 +407,9 @@ class CoachScheduleConfirm(BaseModel):
         allowed = {0.5, 1.0, 1.5, 2.0}
         if self.duration_hours not in allowed:
             raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
-        if self.start_hour + self.duration_hours > 19:
+        if self.start_minute not in {0, 15, 30, 45}:
+            raise ValueError("start_minute must be 0, 15, 30, or 45.")
+        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 19:
             raise ValueError("Time slot must end by 19:00 (7pm).")
         return self
 
@@ -534,6 +537,7 @@ class CoachBookSession(BaseModel):
     enrollment_id: int = Field(ge=1)
     day: date
     start_hour: int = Field(ge=9, le=18)
+    start_minute: int = Field(default=0, ge=0, le=45)
     duration_hours: float = Field(ge=0.5, le=2)
 
     @model_validator(mode="after")
@@ -541,7 +545,9 @@ class CoachBookSession(BaseModel):
         allowed = {0.5, 1.0, 1.5, 2.0}
         if self.duration_hours not in allowed:
             raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
-        if self.start_hour + self.duration_hours > 19:
+        if self.start_minute not in {0, 15, 30, 45}:
+            raise ValueError("start_minute must be 0, 15, 30, or 45.")
+        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 19:
             raise ValueError("Time slot must end by 19:00 (7pm).")
         return self
 

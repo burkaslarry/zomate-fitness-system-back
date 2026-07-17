@@ -6371,6 +6371,7 @@ def coach_book_session(
         enrollment_id=payload.enrollment_id,
         day=payload.day,
         start_hour=payload.start_hour,
+        start_minute=payload.start_minute,
         duration_hours=payload.duration_hours,
     )
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
@@ -6384,7 +6385,7 @@ def coach_book_session(
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
-    start = datetime.combine(payload.day, time(payload.start_hour, 0))
+    start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
     if not enr.coach_time_confirmed:
@@ -6431,7 +6432,7 @@ def coach_confirm_enrollment_schedule(
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
     first_day = payload.day
-    start = datetime.combine(first_day, time(payload.start_hour, 0))
+    start = datetime.combine(first_day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id)
     # [F003][S002] First booking uses coach-picked calendar day (not legacy placeholder weekday).
