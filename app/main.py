@@ -3716,6 +3716,55 @@ def admin_payment_records(
     return {"records": rows, "total": len(rows)}
 
 
+@app.delete("/api/admin/payment-records/{record_type}/{ref_id}")
+def admin_delete_payment_record(
+    record_type: str,
+    ref_id: int,
+    reverse_lessons: bool = Query(default=True),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F004][S002] Soft-delete renewal/receipt payment rows; optional lesson ledger reversal."""
+    norm = record_type.strip().lower()
+    if norm == "renewal":
+        row = db.query(RenewalRecord).filter(RenewalRecord.id == ref_id).first()
+        if not row or _is_deleted(db, "renewal_records", ref_id):
+            raise HTTPException(status_code=404, detail="Renewal record not found.")
+        student = db.query(Student).filter(Student.id == row.student_id).first()
+        if not student or _is_deleted(db, "students", student.id):
+            raise HTTPException(status_code=404, detail="Student not found.")
+        _record_soft_delete(db, "renewal_records", ref_id, user)
+        bal_after = None
+        if reverse_lessons and int(row.lessons or 0) > 0:
+            bal_after = apply_lesson_ledger_delta(
+                db,
+                student,
+                -int(row.lessons),
+                "renewal_void",
+                created_by_role="admin",
+            )
+        db.add(
+            AuditLog(
+                action="renewal_void",
+                student_id=student.id,
+                detail=json.dumps(
+                    {"renewal_id": ref_id, "lessons_reversed": int(row.lessons or 0)},
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        db.commit()
+        return {"ok": True, "record_type": "renewal", "ref_id": ref_id, "lesson_balance": bal_after}
+    if norm == "receipt":
+        row = db.query(Receipt).filter(Receipt.id == ref_id).first()
+        if not row or _is_deleted(db, "receipts", ref_id):
+            raise HTTPException(status_code=404, detail="Receipt not found.")
+        _record_soft_delete(db, "receipts", ref_id, user)
+        db.commit()
+        return {"ok": True, "record_type": "receipt", "ref_id": ref_id}
+    raise HTTPException(status_code=400, detail="Only renewal or receipt records can be deleted.")
+
+
 @app.get("/api/admin/missing-receipt-registrations")
 def admin_missing_receipt_registrations(
     db: Session = Depends(get_db),

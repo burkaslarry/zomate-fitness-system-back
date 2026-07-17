@@ -7,7 +7,10 @@ Logic: Build admin CRM payment rows; resolve onboarding coach; missing-receipt d
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Literal
+
+from .timezone import utc_to_hk
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -15,6 +18,13 @@ if TYPE_CHECKING:
     from .models import Student
 
 PaymentRecordStatus = Literal["paid", "outstanding", "missing_receipt"]
+
+
+def payment_created_at_iso(dt: datetime | None) -> str:
+    """[F004][S002] Serialize naive UTC ``created_at`` as Asia/Hong_Kong ISO (+08:00)."""
+    if dt is None:
+        return ""
+    return utc_to_hk(dt).isoformat()
 
 _ONBOARDING_COACH_RE = re.compile(r"Onboarding coach=([^\s,]+)", re.I)
 
@@ -93,6 +103,10 @@ def build_payment_records(
     )
 
     deleted_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    deleted_renewal_ids = select(DeletedRecord.entity_id).where(
+        DeletedRecord.entity_type == "renewal_records"
+    )
+    deleted_receipt_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "receipts")
     students_q = db.query(Student).filter(~Student.id.in_(deleted_ids))
     if student_id is not None:
         students_q = students_q.filter(Student.id == student_id)
@@ -106,6 +120,7 @@ def build_payment_records(
     renewals = (
         db.query(RenewalRecord)
         .filter(RenewalRecord.student_id.in_(student_ids))
+        .filter(~RenewalRecord.id.in_(deleted_renewal_ids))
         .order_by(RenewalRecord.created_at.desc())
         .all()
     )
@@ -142,13 +157,14 @@ def build_payment_records(
                 "label": f"{rr.lessons} 堂 · {rr.remarks or '報 Course / 續會'}",
                 "receipt_id": rr.receipt_id,
                 "receipt_url": file_url_fn(rec.file_path) if rec and file_url_fn else None,
-                "created_at": rr.created_at.isoformat(),
+                "created_at": payment_created_at_iso(rr.created_at),
             }
         )
 
     standalone_receipts = (
         db.query(Receipt)
         .filter(Receipt.student_id.in_(student_ids))
+        .filter(~Receipt.id.in_(deleted_receipt_ids))
         .order_by(Receipt.created_at.desc())
         .all()
     )
@@ -175,7 +191,7 @@ def build_payment_records(
                 "label": rec.note or rec.source or "收據",
                 "receipt_id": rec.id,
                 "receipt_url": file_url_fn(rec.file_path) if file_url_fn else None,
-                "created_at": rec.created_at.isoformat(),
+                "created_at": payment_created_at_iso(rec.created_at),
             }
         )
 
@@ -218,9 +234,9 @@ def build_payment_records(
                         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
                         "receipt_id": None,
                         "receipt_url": None,
-                        "created_at": (pay.paid_at or pay.due_date).isoformat()
-                        if hasattr(pay.paid_at or pay.due_date, "isoformat")
-                        else ce.started_at.isoformat(),
+                        "created_at": payment_created_at_iso(
+                            pay.paid_at or pay.due_date or ce.started_at
+                        ),
                     }
                 )
 
