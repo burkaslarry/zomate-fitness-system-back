@@ -759,20 +759,19 @@ def _save_member_receipt_row(
         )
     )
     record_activity(db, student, "receipt_upload", receipt.id)
-    whatsapp_result = None
-    if send_whatsapp:
-        whatsapp_result = send_payment_whatsapp_notifications(
-            db,
-            log_whatsapp,
-            student=student,
-            receipt_confirmed=True,
-            notify_coach=notify_coach,
-            course_enrollment_id=course_enrollment_id,
-            installment_no=installment_no,
-            installment_plan_id=installment_plan_id,
-            amount=amount,
-            full_payment=full_payment,
-        )
+    whatsapp_result = send_payment_whatsapp_notifications(
+        db,
+        log_whatsapp,
+        student=student,
+        receipt_confirmed=True,
+        notify_coach=notify_coach,
+        course_enrollment_id=course_enrollment_id,
+        installment_no=installment_no,
+        installment_plan_id=installment_plan_id,
+        amount=amount,
+        full_payment=full_payment,
+        log_messages=send_whatsapp,
+    )
     return {
         "id": receipt.id,
         "file_path": path,

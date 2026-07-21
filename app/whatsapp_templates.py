@@ -179,7 +179,7 @@ def build_installment_notes_from_segments(segments: list[dict]) -> str:
         if ino <= 1 or lo <= 0:
             continue
         reminder_lesson = int(seg.get("reminder_lesson") or max(lo, int(seg.get("lesson_to") or lo) - 1))
-        lines.append(f"第{reminder_lesson}堂提醒 / 付 {_ordinal_en(ino)} instalment")
+        lines.append(f"第{reminder_lesson}堂付 {_ordinal_en(ino)} instalment")
     return "\n".join(lines)
 
 

@@ -183,6 +183,39 @@ def _resolve_course_enrollment(
     )
 
 
+def _resolve_notification_pin(
+    enr: CourseEnrollment | None,
+    segment_dicts: list[dict],
+    installment_no: int | None,
+    full_payment: bool,
+) -> str:
+    """[F005][S003] Pick segment PIN after installment receipt — unlock tranche for student message."""
+    if not enr:
+        return "—"
+    if segment_dicts:
+        if installment_no is not None:
+            for seg in segment_dicts:
+                if int(seg.get("installment_no") or 0) == installment_no:
+                    return str(seg.get("pin") or enr.checkin_pin or "—")
+        if full_payment:
+            for seg in segment_dicts:
+                pin = str(seg.get("pin") or "").strip()
+                if pin:
+                    return pin
+        paid_segs = [s for s in segment_dicts if s.get("paid")]
+        if paid_segs:
+            latest = max(paid_segs, key=lambda s: int(s.get("installment_no") or 0))
+            return str(latest.get("pin") or enr.checkin_pin or "—")
+    return str(enr.checkin_pin or "—")
+
+
+def _format_next_lesson_date(enr: CourseEnrollment | None) -> str:
+    """[F005][S003] Match reminder_student.txt — date-only next lesson."""
+    if enr is None or enr.scheduled_start is None:
+        return "—"
+    return enr.scheduled_start.strftime("%Y-%m-%d")
+
+
 def _payment_status_label(is_installment: bool, receipt_confirmed: bool, segments: list) -> str:
     if not receipt_confirmed:
         return "待確認"
@@ -209,6 +242,7 @@ def send_payment_whatsapp_notifications(
     installment_plan_id: int | None = None,
     amount: float | None = None,
     full_payment: bool = False,
+    log_messages: bool = True,
 ) -> dict[str, Any]:
     """[F005][S003] Render templates and log WhatsApp messages for student (+ optional coach)."""
     enr = _resolve_course_enrollment(db, student.id, course_enrollment_id)
@@ -245,7 +279,7 @@ def send_payment_whatsapp_notifications(
             if cat and cat.course_category:
                 course_title = cat.course_category.name
 
-    pin = enr.checkin_pin if enr else "—"
+    pin = _resolve_notification_pin(enr, segment_dicts, installment_no, full_payment)
     attended = count_course_checkins(db, student.id, enr.id if enr else None)
     total_lessons = int(enr.total_lessons) if enr and enr.total_lessons else 0
     remaining = max(0, total_lessons - attended) if total_lessons else 0
@@ -279,7 +313,7 @@ def send_payment_whatsapp_notifications(
         student=student,
         course_title=course_title,
         pin=pin,
-        next_lesson_date=format_lesson_datetime(enr),
+        next_lesson_date=_format_next_lesson_date(enr),
         lessons_attended=attended,
         lessons_remaining=remaining,
         payment_status=payment_status,
@@ -295,16 +329,19 @@ def send_payment_whatsapp_notifications(
         audience="student",
     )
     student_msg = render_whatsapp_template(get_template_body(db, student_key), ctx)
-    log_whatsapp_fn(
-        db,
-        student,
-        student.phone,
-        student_msg,
-        template_key=student_key,
-        template_context=ctx,
-    )
+    if log_messages:
+        log_whatsapp_fn(
+            db,
+            student,
+            student.phone,
+            student_msg,
+            template_key=student_key,
+            template_context=ctx,
+        )
 
     result: dict[str, Any] = {
+        "is_installment": is_installment,
+        "pin_unlocked": pin,
         "student": {
             "recipient": student.phone,
             "message": student_msg,
@@ -321,14 +358,15 @@ def send_payment_whatsapp_notifications(
             audience="coach",
         )
         coach_msg = render_whatsapp_template(get_template_body(db, coach_key), ctx)
-        log_whatsapp_fn(
-            db,
-            student,
-            coach.phone,
-            coach_msg,
-            template_key=coach_key,
-            template_context=ctx,
-        )
+        if log_messages:
+            log_whatsapp_fn(
+                db,
+                student,
+                coach.phone,
+                coach_msg,
+                template_key=coach_key,
+                template_context=ctx,
+            )
         result["coach"] = {
             "recipient": coach.phone,
             "message": coach_msg,
