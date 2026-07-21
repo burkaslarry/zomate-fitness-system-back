@@ -97,15 +97,20 @@ class RenewalCreate(BaseModel):
 
 
 class MemberCreate(BaseModel):
+    chinese_name: str = Field(min_length=1, max_length=120)
     full_name: str = Field(min_length=1, max_length=120)
+    nickname: str | None = Field(default=None, max_length=80)
+    gender: Literal["male", "female"]
     hkid: str = Field(min_length=4, max_length=32)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
     date_of_birth: date
     emergency_contact_name: str = Field(min_length=1, max_length=120)
+    emergency_contact_relationship: str = Field(min_length=1, max_length=80)
     emergency_contact_phone: str = Field(min_length=8, max_length=30)
     parq: ParqQuestionsIn
     medical_clearance_file_name: str | None = ""
+    pdpo_acknowledged: bool = True
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
     digital_signature: str = Field(min_length=20, max_length=400_000)
@@ -122,8 +127,8 @@ class MemberCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_ack_and_clearance(self) -> "MemberCreate":
-        if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
-            raise ValueError("請確認冷靜期條款及免責聲明。")
+        if not self.pdpo_acknowledged or not self.cooling_off_acknowledged or not self.disclaimer_accepted:
+            raise ValueError("請確認收集個人資料聲明、冷靜期條款及免責聲明。")
         return self
 
 

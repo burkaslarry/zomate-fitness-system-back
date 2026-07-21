@@ -1642,6 +1642,22 @@ def _migrate_management_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_member_profile_columns(db: Session) -> None:
+    """[F001][S001] Extended member profile fields from paper membership form."""
+    stmts = [
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS chinese_name VARCHAR(120) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS nickname VARCHAR(80) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS gender VARCHAR(20) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR(80) NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _migrate_medical_clearance_columns(db: Session) -> None:
     """[F001][S002] PAR-Q JSON + medical clearance status/path on students."""
     stmts = [
@@ -2072,6 +2088,7 @@ def _sync_startup() -> None:
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
         _migrate_medical_clearance_columns(db)
+        _migrate_member_profile_columns(db)
         _backfill_medical_clearance_columns(db)
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
@@ -2519,20 +2536,29 @@ def _create_member_impl(
     notes = "\n".join(
         [
             f"HKID: {hkid}",
+            f"Chinese name: {payload.chinese_name.strip()}",
+            f"English name: {payload.full_name.strip()}",
+            f"Nickname: {(payload.nickname or '').strip()}",
+            f"Gender: {payload.gender}",
             f"Date of birth: {payload.date_of_birth.isoformat()}",
-            f"Emergency: {payload.emergency_contact_name.strip()} / {eco_raw}",
+            f"Emergency: {payload.emergency_contact_name.strip()} / {payload.emergency_contact_relationship.strip()} / {eco_raw}",
             "Digital signature (step 3): canvas image saved",
             f"PAR-Q JSON: {json.dumps(parq_data, ensure_ascii=False)}",
             f"Medical clearance file: {medical_label or (medical_path or '')}",
+            f"PDPO acknowledged: {payload.pdpo_acknowledged}",
         ]
     )
     student = Student(
         full_name=payload.full_name.strip(),
+        chinese_name=payload.chinese_name.strip(),
+        nickname=(payload.nickname or "").strip() or None,
+        gender=payload.gender,
         hkid=hkid,
         phone=phone_raw,
         email=(payload.email or "").strip() or None,
         date_of_birth=payload.date_of_birth,
         emergency_contact_name=payload.emergency_contact_name.strip(),
+        emergency_contact_relationship=payload.emergency_contact_relationship.strip(),
         emergency_contact_phone=eco_raw,
         health_notes=notes,
         parq_json=json.dumps(parq_data, ensure_ascii=False),
@@ -2580,15 +2606,20 @@ def _create_member_impl(
 
 @app.post("/api/members")
 def create_member(
+    chinese_name: str = Form(...),
     full_name: str = Form(...),
+    nickname: str | None = Form(default=None),
+    gender: str = Form(...),
     hkid: str = Form(...),
     phone: str = Form(...),
     email: str | None = Form(default=None),
     date_of_birth: str = Form(...),
     emergency_contact_name: str = Form(...),
+    emergency_contact_relationship: str = Form(...),
     emergency_contact_phone: str = Form(...),
     parq: str = Form(...),
     medical_clearance_file_name: str | None = Form(default=""),
+    pdpo_acknowledged: str = Form(default="false"),
     cooling_off_acknowledged: str = Form(default="false"),
     disclaimer_accepted: str = Form(default="false"),
     digital_signature: str = Form(...),
@@ -2603,17 +2634,24 @@ def create_member(
         parq_obj = ParqQuestionsIn.model_validate(json.loads(parq))
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid PAR-Q payload.") from exc
+    if gender not in {"male", "female"}:
+        raise HTTPException(status_code=400, detail="Invalid gender.")
     try:
         payload = MemberCreate(
+            chinese_name=chinese_name,
             full_name=full_name,
+            nickname=nickname,
+            gender=gender,  # type: ignore[arg-type]
             hkid=hkid,
             phone=phone,
             email=email,
             date_of_birth=date.fromisoformat(date_of_birth.strip()),
             emergency_contact_name=emergency_contact_name,
+            emergency_contact_relationship=emergency_contact_relationship,
             emergency_contact_phone=emergency_contact_phone,
             parq=parq_obj,
             medical_clearance_file_name=medical_clearance_file_name,
+            pdpo_acknowledged=_form_bool(pdpo_acknowledged, default=False),
             cooling_off_acknowledged=_form_bool(cooling_off_acknowledged, default=False),
             disclaimer_accepted=_form_bool(disclaimer_accepted, default=False),
             digital_signature=digital_signature,

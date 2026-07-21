@@ -101,6 +101,9 @@ class Student(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    chinese_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    nickname: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    gender: Mapped[str | None] = mapped_column(String(20), nullable=True)
     hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
     phone: Mapped[str] = mapped_column(String(30), nullable=False, unique=True, index=True)
     email: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -108,6 +111,7 @@ class Student(Base):
     date_of_birth: Mapped[date | None] = mapped_column(DateColumn, nullable=True)
     used_mobile_number: Mapped[str | None] = mapped_column(String(30), nullable=True)
     emergency_contact_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    emergency_contact_relationship: Mapped[str | None] = mapped_column(String(80), nullable=True)
     emergency_contact_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     health_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: JSON object mirroring PAR-Q checklist from registration wizard.
