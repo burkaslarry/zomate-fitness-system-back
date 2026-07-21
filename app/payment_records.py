@@ -27,6 +27,32 @@ def payment_created_at_iso(dt: datetime | None) -> str:
     return utc_to_hk(dt).isoformat()
 
 _ONBOARDING_COACH_RE = re.compile(r"Onboarding coach=([^\s,]+)", re.I)
+_RENEWAL_CATEGORY_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def extract_renewal_category_label(remarks: str | None) -> str | None:
+    """[F004][S002] Parse ``[Category]`` prefix from regCourse renewal notes."""
+    if not remarks:
+        return None
+    match = _RENEWAL_CATEGORY_RE.match(remarks.strip())
+    return match.group(1).strip() if match else None
+
+
+def build_renewal_payment_label(
+    *,
+    lessons: int,
+    remarks: str | None,
+    package_name: str | None = None,
+) -> str:
+    """[F004][S002] Human-readable renewal row label with course category when known."""
+    category = package_name or extract_renewal_category_label(remarks)
+    if category:
+        rest = _RENEWAL_CATEGORY_RE.sub("", (remarks or "").strip(), count=1).strip()
+        label = f"{lessons} 堂 · {category}"
+        if rest:
+            label += f" · {rest}"
+        return label
+    return f"{lessons} 堂 · {remarks or '報 Course / 續會'}"
 
 
 def _coach_slug(full_name: str) -> str:
@@ -97,6 +123,7 @@ def build_payment_records(
         CategoryEnrollment,
         DeletedRecord,
         InstallmentPlan,
+        Package,
         Receipt,
         RenewalRecord,
         Student,
@@ -130,6 +157,12 @@ def build_payment_records(
         for rec in db.query(Receipt).filter(Receipt.id.in_(receipt_ids)).all():
             receipt_map[rec.id] = rec
 
+    package_ids = {r.package_id for r in renewals if r.package_id}
+    package_map: dict[int, Package] = {}
+    if package_ids:
+        for pkg in db.query(Package).filter(Package.id.in_(package_ids)).all():
+            package_map[pkg.id] = pkg
+
     for rr in renewals:
         st = students.get(rr.student_id)
         if not st:
@@ -141,6 +174,8 @@ def build_payment_records(
             rec_status = "missing_receipt"
         else:
             rec_status = "outstanding"
+        pkg = package_map.get(rr.package_id) if rr.package_id else None
+        category_name = extract_renewal_category_label(rr.remarks) or (pkg.name if pkg else None)
         rows.append(
             {
                 "id": f"renewal-{rr.id}",
@@ -154,7 +189,12 @@ def build_payment_records(
                 "status": rec_status,
                 "coach_id": rr.coach_id,
                 "coach_name": rr.coach_name,
-                "label": f"{rr.lessons} 堂 · {rr.remarks or '報 Course / 續會'}",
+                "label": build_renewal_payment_label(
+                    lessons=int(rr.lessons),
+                    remarks=rr.remarks,
+                    package_name=pkg.name if pkg else None,
+                ),
+                "category_name": category_name,
                 "receipt_id": rr.receipt_id,
                 "receipt_url": file_url_fn(rec.file_path) if rec and file_url_fn else None,
                 "created_at": payment_created_at_iso(rr.created_at),

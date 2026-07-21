@@ -142,6 +142,7 @@ from .payment_records import (
     build_payment_records,
     build_sales_report_rows,
     count_missing_receipt_renewals,
+    extract_renewal_category_label,
     student_onboarding_coach,
 )
 from .enrollment_schedule import (
@@ -2752,12 +2753,18 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
                 "package_id": rr.package_id,
                 "coach_id": rr.coach_id,
                 "branch_id": rr.branch_id,
-                "name": f"{rr.lessons} 堂",
+                "name": (
+                    f"{extract_renewal_category_label(rr.remarks)} · {rr.lessons} 堂"
+                    if extract_renewal_category_label(rr.remarks)
+                    else f"{rr.lessons} 堂"
+                ),
+                "category_name": extract_renewal_category_label(rr.remarks),
                 "lessons": rr.lessons,
                 "coach": rr.coach_name,
                 "payment_method": rr.payment_method,
                 "amount": float(rr.amount) if rr.amount is not None else None,
                 "renewal_date": rr.renewal_date.isoformat(),
+                "remarks": rr.remarks,
                 "created_at": rr.created_at.isoformat(),
             }
             for rr in renewals
