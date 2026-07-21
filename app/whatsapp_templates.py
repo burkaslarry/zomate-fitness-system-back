@@ -84,6 +84,18 @@ DEFAULT_WHATSAPP_TEMPLATES: list[dict[str, str]] = [
 尚欠: {{amount_owing}}
 {{installment_notes}}""",
     },
+    {
+        "key": "receipt_upload_request",
+        "audience": "student",
+        "title": "請學生上傳收據",
+        "body": """【Zomate Fitness】{{student_name}} 你好，
+
+我們已收到你的報名／付款記錄（{{course_title}}），請盡快上傳付款收據。
+可 WhatsApp 回覆此對話附上收據相片（FPS／轉數／現金收據均可）。
+
+如有疑問請聯絡我們，謝謝！
+— Zomate Fitness""",
+    },
 ]
 
 _PLACEHOLDER_RE = re.compile(r"\{\{(\w+)\}\}")

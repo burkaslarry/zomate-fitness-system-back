@@ -22,7 +22,7 @@ from urllib.parse import quote
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import distinct, func, or_, select, text
 from sqlalchemy.orm import Session, joinedload
@@ -133,7 +133,11 @@ from .medical_clearance import (
     parq_dict_any_yes,
     validate_medical_upload,
 )
-from .payment_notifications import apply_receipt_payment_match, send_payment_whatsapp_notifications
+from .payment_notifications import (
+    apply_receipt_payment_match,
+    send_payment_whatsapp_notifications,
+    send_receipt_upload_request_whatsapp,
+)
 from .payment_records import (
     build_payment_records,
     build_sales_report_rows,
@@ -1219,15 +1223,20 @@ def _signature_relative_path(stored: str | None) -> str | None:
 
 
 def _signature_image_for_member(student: Student) -> str | None:
-    """[F001][S004] Prefer disk URL via proxy; legacy blob fallback only."""
-    relative_path = _signature_relative_path(student.signature_image_url)
-    if relative_path and (UPLOADS_DIR / relative_path).is_file():
-        return _file_url(relative_path)
+    """[F001][S004] Stable API URL for canvas signature (blob or disk)."""
     blob = getattr(student, "signature_image_blob", None)
+    relative_path = _signature_relative_path(student.signature_image_url)
+    has_file = bool(relative_path and (UPLOADS_DIR / relative_path).is_file())
+    if not blob and not has_file:
+        return None
+    if student.id:
+        path = f"/api/members/by-id/{student.id}/signature"
+        public_base = settings.public_base_url.strip().rstrip("/")
+        return f"{public_base}{path}" if public_base else path
     if blob:
         encoded = base64.b64encode(blob).decode("ascii")
         return f"data:image/png;base64,{encoded}"
-    return None
+    return _file_url(relative_path)
 
 
 def _save_signature_image(data_url: str, student_id: int) -> str:
@@ -2782,6 +2791,27 @@ def get_member_full_by_id(student_id: int, db: Session = Depends(get_db)) -> dic
     return _member_full_payload(db, student)
 
 
+@app.get("/api/members/by-id/{student_id}/signature")
+def get_member_signature_image(student_id: int, db: Session = Depends(get_db)) -> Response:
+    """[F001][S004] Serve onboarding canvas signature PNG from DB blob or disk."""
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    blob = getattr(student, "signature_image_blob", None)
+    if blob:
+        return Response(
+            content=blob,
+            media_type="image/png",
+            headers={"Cache-Control": "private, max-age=3600"},
+        )
+    relative_path = _signature_relative_path(student.signature_image_url)
+    if relative_path:
+        path = UPLOADS_DIR / relative_path
+        if path.is_file():
+            return FileResponse(path, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Signature not found.")
+
+
 @app.patch("/api/members/by-id/{student_id}")
 def update_member_by_id(
     student_id: int,
@@ -4230,6 +4260,29 @@ def admin_send_payment_reminder(
         amount=payload.amount,
     )
     record_activity(db, student, "payment_whatsapp_reminder", payload.course_enrollment_id)
+    db.commit()
+    return {"ok": True, "whatsapp": result}
+
+
+@app.post("/api/admin/students/{student_id}/request-receipt-upload")
+def admin_request_receipt_upload(
+    student_id: int,
+    payload: PaymentNotificationSendBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F005][S003] WhatsApp template: ask student to upload payment receipt (wa.me for manual send)."""
+    _ = user
+    student = db.get(Student, student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    result = send_receipt_upload_request_whatsapp(
+        db,
+        log_whatsapp,
+        student=student,
+        course_enrollment_id=payload.course_enrollment_id,
+    )
+    record_activity(db, student, "receipt_upload_request_whatsapp", payload.course_enrollment_id)
     db.commit()
     return {"ok": True, "whatsapp": result}
 

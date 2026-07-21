@@ -337,3 +337,46 @@ def send_payment_whatsapp_notifications(
         }
 
     return result
+
+
+def send_receipt_upload_request_whatsapp(
+    db: Session,
+    log_whatsapp_fn,
+    *,
+    student: Student,
+    course_enrollment_id: int | None = None,
+) -> dict[str, Any]:
+    """[F005][S003] Log + return wa.me link asking student to upload payment receipt."""
+    enr = _resolve_course_enrollment(db, student.id, course_enrollment_id)
+    course_title = enr.title if enr else "—"
+    attended = count_course_checkins(db, student.id, enr.id if enr else None)
+    total_lessons = int(enr.total_lessons) if enr and enr.total_lessons else 0
+    remaining = max(0, total_lessons - attended) if total_lessons else 0
+    ctx = build_payment_context(
+        student=student,
+        course_title=course_title,
+        pin=enr.checkin_pin if enr else "—",
+        next_lesson_date=format_lesson_datetime(enr),
+        lessons_attended=attended,
+        lessons_remaining=remaining,
+        payment_status="待上傳收據",
+        amount_paid=None,
+        total_amount=None,
+        amount_owing=None,
+        installment_notes="",
+    )
+    template_key = "receipt_upload_request"
+    msg = render_whatsapp_template(get_template_body(db, template_key), ctx)
+    log_whatsapp_fn(
+        db,
+        student,
+        student.phone,
+        msg,
+        template_key=template_key,
+        template_context=ctx,
+    )
+    return {
+        "message": msg,
+        "wa_me_url": wa_me_link(student.phone, msg),
+        "template_key": template_key,
+    }
