@@ -2710,8 +2710,20 @@ def get_member(hkid: str, db: Session = Depends(get_db)) -> dict:
 
 def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | None = None) -> dict:
     """[F001][S002] Build student detail payload; route may lookup by id or HKID."""
-    receipts = db.query(Receipt).filter(Receipt.student_id == student.id).order_by(Receipt.created_at.desc()).all()
-    renewals = db.query(RenewalRecord).filter(RenewalRecord.student_id == student.id).order_by(RenewalRecord.created_at.desc()).all()
+    deleted_receipt_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "receipts")
+    deleted_renewal_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "renewal_records")
+    receipts = (
+        db.query(Receipt)
+        .filter(Receipt.student_id == student.id, ~Receipt.id.in_(deleted_receipt_ids))
+        .order_by(Receipt.created_at.desc())
+        .all()
+    )
+    renewals = (
+        db.query(RenewalRecord)
+        .filter(RenewalRecord.student_id == student.id, ~RenewalRecord.id.in_(deleted_renewal_ids))
+        .order_by(RenewalRecord.created_at.desc())
+        .all()
+    )
     trials = _trial_records_from_audit(db, student.id)
     trial_coach_ids = [t["coach_id"] for t in trials if t.get("coach_id") is not None]
     trial_branch_ids = [t["branch_id"] for t in trials if t.get("branch_id") is not None]
