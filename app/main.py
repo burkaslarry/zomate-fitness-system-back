@@ -3451,7 +3451,8 @@ def admin_create_system_user(
     uname = payload.username.strip().lower()
     if not uname:
         raise HTTPException(status_code=400, detail="Username required.")
-    if db.query(AppUser).filter(AppUser.username == uname).first():
+    existing = db.query(AppUser).filter(AppUser.username == uname).first()
+    if existing and existing.is_active:
         raise HTTPException(status_code=409, detail="Username already exists.")
     role = payload.role
     if role == "MASTER_ADMIN" and uname not in MASTER_ADMIN_USERNAMES:
@@ -3468,15 +3469,23 @@ def admin_create_system_user(
     elif coach_id:
         raise HTTPException(status_code=400, detail="coach_id only valid for COACH role.")
     salt, pwd = _make_password_record(payload.password)
-    row = AppUser(
-        username=uname,
-        role=role,
-        password_salt=salt,
-        password_hash=pwd,
-        coach_id=coach_id if role == "COACH" else None,
-        is_active=True,
-    )
-    db.add(row)
+    if existing and not existing.is_active:
+        existing.role = role
+        existing.password_salt = salt
+        existing.password_hash = pwd
+        existing.is_active = True
+        existing.coach_id = coach_id if role == "COACH" else None
+        row = existing
+    else:
+        row = AppUser(
+            username=uname,
+            role=role,
+            password_salt=salt,
+            password_hash=pwd,
+            coach_id=coach_id if role == "COACH" else None,
+            is_active=True,
+        )
+        db.add(row)
     log_event(
         "[F007][S003] system_user_create",
         username=uname,
