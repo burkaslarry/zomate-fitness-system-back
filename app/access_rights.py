@@ -173,7 +173,10 @@ def can_access_href(access_role: AccessRole, href: str) -> bool:
     if access_role == "MASTER_ADMIN":
         return True
     allowed = allowed_hrefs_for_role(access_role)
-    return any(href == h or href.startswith(f"{h}/") for h in allowed)
+    return any(
+        href == h or (h != "/admin" and href.startswith(f"{h}/"))
+        for h in allowed
+    )
 
 
 def access_matrix_rows() -> list[dict]:
