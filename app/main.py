@@ -3477,11 +3477,11 @@ def admin_create_system_user(
         is_active=True,
     )
     db.add(row)
-    db.add(
-        AuditLog(
-            action="system_user_create",
-            detail=json.dumps({"username": uname, "role": role, "by": actor.username}, ensure_ascii=False),
-        )
+    log_event(
+        "[F007][S003] system_user_create",
+        username=uname,
+        role=role,
+        by=actor.username,
     )
     db.commit()
     db.refresh(row)
@@ -3518,11 +3518,10 @@ def admin_update_system_user(
             db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
     if payload.coach_id is not None and row.role == "COACH":
         row.coach_id = payload.coach_id
-    db.add(
-        AuditLog(
-            action="system_user_update",
-            detail=json.dumps({"user_id": user_id, "by": actor.username}, ensure_ascii=False),
-        )
+    log_event(
+        "[F007][S003] system_user_update",
+        user_id=user_id,
+        by=actor.username,
     )
     db.commit()
     db.refresh(row)
@@ -3545,11 +3544,11 @@ def admin_delete_system_user(
         raise HTTPException(status_code=400, detail="Cannot delete master admin account.")
     row.is_active = False
     db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
-    db.add(
-        AuditLog(
-            action="system_user_delete",
-            detail=json.dumps({"user_id": user_id, "username": row.username, "by": actor.username}, ensure_ascii=False),
-        )
+    log_event(
+        "[F007][S003] system_user_delete",
+        user_id=user_id,
+        username=row.username,
+        by=actor.username,
     )
     db.commit()
     return {"ok": True, "user_id": user_id, "username": row.username}
