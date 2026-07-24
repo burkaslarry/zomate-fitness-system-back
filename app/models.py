@@ -6,7 +6,7 @@ Logic: SQLAlchemy ORM models for zomate_fs domain tables.
 
 from datetime import datetime, date
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, LargeBinary, Numeric, String, Text, UniqueConstraint
 from sqlalchemy import Date as DateColumn
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -400,6 +400,8 @@ class AppUser(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     #: When set, COACH login maps directly to this coach profile (replaces slug-only matching).
     coach_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=True, unique=True)
+    #: When set, replaces role-default Access Rights (list of feature keys).
+    custom_permissions: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

@@ -132,9 +132,11 @@ from .schemas import (
 from .access_rights import (
     MASTER_ADMIN_USERNAMES,
     access_matrix_rows,
+    effective_permissions_for_user,
     is_master_admin,
     normalize_access_role,
     permissions_for_role,
+    sanitize_custom_permissions,
 )
 from .medical_clearance import (
     compute_medical_clearance_status,
@@ -534,13 +536,14 @@ def _login_role_for_response(user: AppUser) -> str:
 def _login_session_payload(user: AppUser, token: str) -> LoginSession:
     """[F007][S003] Bearer session + Excel access matrix permissions."""
     access_role = normalize_access_role(user.role, user.username)
+    perms = effective_permissions_for_user(user.role, user.username, getattr(user, "custom_permissions", None))
     return LoginSession(
         token=token,
         username=user.username,
         role=_login_role_for_response(user),
         access_role=access_role,
         is_master_admin=is_master_admin(user.username, user.role),
-        permissions=permissions_for_role(access_role),
+        permissions=perms,
     )
 
 
@@ -2119,6 +2122,15 @@ def perform_lesson_checkin(
     )
 
 
+def _migrate_user_custom_permissions(db: Session) -> None:
+    """[F007][S003] Per-user Access Rights overrides (JSON feature keys)."""
+    try:
+        db.execute(text("ALTER TABLE zomate_fs_users ADD COLUMN IF NOT EXISTS custom_permissions JSONB NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _sync_startup() -> None:
     Base.metadata.create_all(bind=engine)
     with db_session() as db:
@@ -2130,6 +2142,7 @@ def _sync_startup() -> None:
         _backfill_medical_clearance_columns(db)
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
+        _migrate_user_custom_permissions(db)
         seed_whatsapp_templates(db)
         _seed_default_branches(db)
         _seed_management_defaults(db)
@@ -3410,6 +3423,8 @@ def auth_me(
 
 def _system_user_out(user: AppUser) -> SystemUserOut:
     access_role = normalize_access_role(user.role, user.username)
+    custom = getattr(user, "custom_permissions", None)
+    perms = effective_permissions_for_user(user.role, user.username, custom)
     return SystemUserOut(
         id=user.id,
         username=user.username,
@@ -3418,6 +3433,8 @@ def _system_user_out(user: AppUser) -> SystemUserOut:
         is_master_admin=is_master_admin(user.username, user.role),
         is_active=bool(user.is_active),
         coach_id=user.coach_id,
+        permissions=perms,
+        uses_custom_permissions=bool(isinstance(custom, list) and sanitize_custom_permissions(custom)),
         created_at=user.created_at,
     )
 
@@ -3469,12 +3486,16 @@ def admin_create_system_user(
     elif coach_id:
         raise HTTPException(status_code=400, detail="coach_id only valid for COACH role.")
     salt, pwd = _make_password_record(payload.password)
+    custom_perms = None
+    if payload.permissions is not None:
+        custom_perms = sanitize_custom_permissions(payload.permissions)
     if existing and not existing.is_active:
         existing.role = role
         existing.password_salt = salt
         existing.password_hash = pwd
         existing.is_active = True
         existing.coach_id = coach_id if role == "COACH" else None
+        existing.custom_permissions = custom_perms if custom_perms else None
         row = existing
     else:
         row = AppUser(
@@ -3484,6 +3505,7 @@ def admin_create_system_user(
             password_hash=pwd,
             coach_id=coach_id if role == "COACH" else None,
             is_active=True,
+            custom_permissions=custom_perms if custom_perms else None,
         )
         db.add(row)
     log_event(
@@ -3504,12 +3526,13 @@ def admin_update_system_user(
     db: Session = Depends(get_db),
     actor: AppUser = Depends(require_master_admin),
 ) -> SystemUserOut:
-    """[F007][S003] Set password, role, active flag."""
+    """[F007][S003] Set password, role, active flag, or custom permissions."""
     row = db.query(AppUser).filter(AppUser.id == user_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="User not found.")
     if row.username in MASTER_ADMIN_USERNAMES and actor.id != row.id and payload.is_active is False:
         raise HTTPException(status_code=400, detail="Cannot disable master admin account.")
+    permissions_changed = False
     if payload.password:
         salt, pwd = _make_password_record(payload.password)
         row.password_salt = salt
@@ -3527,6 +3550,17 @@ def admin_update_system_user(
             db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
     if payload.coach_id is not None and row.role == "COACH":
         row.coach_id = payload.coach_id
+    if row.username in MASTER_ADMIN_USERNAMES:
+        if payload.permissions is not None or payload.reset_permissions:
+            raise HTTPException(status_code=400, detail="Cannot customize master admin permissions.")
+    elif payload.reset_permissions:
+        row.custom_permissions = None
+        permissions_changed = True
+    elif payload.permissions is not None:
+        row.custom_permissions = sanitize_custom_permissions(payload.permissions)
+        permissions_changed = True
+    if permissions_changed:
+        db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
     log_event(
         "[F007][S003] system_user_update",
         user_id=user_id,

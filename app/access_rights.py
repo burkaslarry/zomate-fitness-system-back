@@ -165,6 +165,39 @@ def permissions_for_role(access_role: AccessRole) -> list[str]:
     return [f["key"] for f in ACCESS_FEATURES if access_role in f["roles"]]
 
 
+PERMISSION_KEYS: frozenset[str] = frozenset(str(f["key"]) for f in ACCESS_FEATURES)
+EDITABLE_PERMISSION_KEYS: frozenset[str] = frozenset(k for k in PERMISSION_KEYS if k != "system_users")
+
+
+def sanitize_custom_permissions(keys: list[str] | None) -> list[str]:
+    """Keep only known editable feature keys."""
+    if not keys:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in keys:
+        key = str(raw).strip()
+        if key in EDITABLE_PERMISSION_KEYS and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def effective_permissions_for_user(role: str | None, username: str | None, custom_permissions: list | None) -> list[str]:
+    """Role defaults unless master admin or custom_permissions JSON is set."""
+    if is_master_admin(username, role):
+        return permissions_for_role("MASTER_ADMIN")
+    custom = sanitize_custom_permissions(custom_permissions if isinstance(custom_permissions, list) else None)
+    if custom:
+        return custom
+    return permissions_for_role(normalize_access_role(role, username))
+
+
+def permissions_allow_href(permissions: list[str], href: str) -> bool:
+    allowed = {f["href"] for f in ACCESS_FEATURES if f["key"] in permissions}
+    return any(href == h or (h != "/admin" and href.startswith(f"{h}/")) for h in allowed)
+
+
 def allowed_hrefs_for_role(access_role: AccessRole) -> list[str]:
     return [str(f["href"]) for f in ACCESS_FEATURES if access_role in f["roles"]]
 

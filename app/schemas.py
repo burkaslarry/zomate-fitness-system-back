@@ -284,6 +284,8 @@ class SystemUserOut(BaseModel):
     is_master_admin: bool
     is_active: bool
     coach_id: int | None = None
+    permissions: list[str] = Field(default_factory=list)
+    uses_custom_permissions: bool = False
     created_at: datetime
 
 
@@ -292,6 +294,7 @@ class SystemUserCreate(BaseModel):
     password: str = Field(min_length=6, max_length=64)
     role: Literal["CLERK", "COACH", "MASTER_ADMIN"] = "CLERK"
     coach_id: int | None = Field(default=None, ge=1)
+    permissions: list[str] | None = None
 
 
 class SystemUserUpdate(BaseModel):
@@ -299,6 +302,8 @@ class SystemUserUpdate(BaseModel):
     role: Literal["CLERK", "COACH", "MASTER_ADMIN"] | None = None
     is_active: bool | None = None
     coach_id: int | None = Field(default=None, ge=1)
+    permissions: list[str] | None = None
+    reset_permissions: bool = False
 
 
 class BranchOut(BaseModel):
