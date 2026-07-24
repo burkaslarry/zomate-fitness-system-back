@@ -4,9 +4,11 @@ Step: (see Logic)
 Logic: SQLAlchemy engine, Base, session factory, get_db dependency.
 """
 
+from contextlib import contextmanager
+
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from .config import settings
 
@@ -42,7 +44,13 @@ _raw_url = settings.database_url
 DATABASE_URL = _normalize_database_url(_raw_url)
 
 _ca = _connect_args(_raw_url)
-_engine_kwargs = {"pool_pre_ping": True}
+_engine_kwargs: dict = {
+    "pool_pre_ping": True,
+    "pool_size": max(1, int(settings.database_pool_size)),
+    "max_overflow": max(0, int(settings.database_max_overflow)),
+    "pool_timeout": max(1, int(settings.database_pool_timeout)),
+    "pool_recycle": max(60, int(settings.database_pool_recycle)),
+}
 if _ca:
     _engine_kwargs["connect_args"] = _ca
 
@@ -55,5 +63,21 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@contextmanager
+def db_session() -> Session:
+    """[F007][S002] Explicit session scope for sync blocks outside FastAPI Depends."""
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
