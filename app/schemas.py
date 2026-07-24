@@ -266,6 +266,39 @@ class LoginSession(BaseModel):
     token: str
     username: str
     role: str
+    access_role: str = "CLERK"
+    is_master_admin: bool = False
+    permissions: list[str] = Field(default_factory=list)
+
+
+class AccessRightsMatrixOut(BaseModel):
+    rows: list[dict]
+    role_labels: dict[str, str]
+
+
+class SystemUserOut(BaseModel):
+    id: int
+    username: str
+    role: str
+    access_role: str
+    is_master_admin: bool
+    is_active: bool
+    coach_id: int | None = None
+    created_at: datetime
+
+
+class SystemUserCreate(BaseModel):
+    username: str = Field(min_length=2, max_length=80)
+    password: str = Field(min_length=6, max_length=64)
+    role: Literal["CLERK", "COACH", "MASTER_ADMIN"] = "CLERK"
+    coach_id: int | None = Field(default=None, ge=1)
+
+
+class SystemUserUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=6, max_length=64)
+    role: Literal["CLERK", "COACH", "MASTER_ADMIN"] | None = None
+    is_active: bool | None = None
+    coach_id: int | None = Field(default=None, ge=1)
 
 
 class BranchOut(BaseModel):
@@ -369,6 +402,8 @@ class CourseCreate(BaseModel):
     total_lessons: int = Field(default=10, ge=10, le=30)
     # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
     total_installments: int = Field(default=1, ge=1, le=3)
+    # Optional HKD split per installment (length must match total_installments when set).
+    installment_amounts: list[float] | None = None
     # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
     student_first_session_at: datetime | None = None
     coach_schedule_note: str | None = Field(default=None, max_length=500)
@@ -389,6 +424,11 @@ class CourseCreate(BaseModel):
     def validate_installments_vs_lessons(self) -> "CourseCreate":
         if self.total_installments > self.total_lessons:
             raise ValueError("total_installments cannot exceed total_lessons.")
+        if self.installment_amounts is not None:
+            if len(self.installment_amounts) != self.total_installments:
+                raise ValueError("installment_amounts length must match total_installments.")
+            if any(a <= 0 for a in self.installment_amounts):
+                raise ValueError("installment_amounts must be positive.")
         return self
 
 
@@ -570,6 +610,7 @@ class InstallmentSegmentPinOut(BaseModel):
     pin: str = Field(min_length=1, max_length=8)
     paid: bool = True
     reminder_lesson: int | None = Field(default=None, ge=1)
+    amount_hkd: float | None = Field(default=None, ge=0)
 
 
 class CourseInstallmentMarkPaid(BaseModel):

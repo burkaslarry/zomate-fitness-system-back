@@ -32,7 +32,7 @@ from reportlab.pdfgen.canvas import Canvas
 import qrcode
 
 from .config import settings
-from .database import Base, engine, get_db
+from .database import Base, db_session, engine, get_db
 from .health_app import liveness_payload
 from .keepalive import keepalive_loop
 from .logutil import configure_logging, instance_id, log_event
@@ -102,10 +102,14 @@ from .schemas import (
     CourseOut,
     CourseReschedule,
     FaceIdCheckinInput,
-    LoginInput,
-    LoginSession,
+    AccessRightsMatrixOut,
+    SystemUserCreate,
+    SystemUserOut,
+    SystemUserUpdate,
     ManualLessonRedeemInput,
     LedgerAdjustInput,
+    LoginInput,
+    LoginSession,
     ExpenseCreate,
     MemberCreate,
     MemberProspectDupCheck,
@@ -124,6 +128,13 @@ from .schemas import (
     WhatsAppStatusOut,
     WhatsAppTestSendBody,
     TrialPurchaseInput,
+)
+from .access_rights import (
+    MASTER_ADMIN_USERNAMES,
+    access_matrix_rows,
+    is_master_admin,
+    normalize_access_role,
+    permissions_for_role,
 )
 from .medical_clearance import (
     compute_medical_clearance_status,
@@ -393,7 +404,8 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
 def _seed_default_users(db: Session) -> None:
     # CF09:CoachSeedAccount — 種子 COACH 帳號：coachdemo／COACH 只可用「教練曆」（前端限 /coach/calendar）；worker／CLERK 仍為後台職員。
     users = [
-        ("masterzoe", "12345678", "ADMIN"),
+        ("masterzoe", "12345678", "MASTER_ADMIN"),
+        ("masterfung", "12345678", "MASTER_ADMIN"),
         ("worker", "12347890", "CLERK"),
         ("coachdemo", "12347890", "COACH"),
     ]
@@ -401,6 +413,11 @@ def _seed_default_users(db: Session) -> None:
         row = db.query(AppUser).filter(AppUser.username == username).first()
         if row:
             row.role = role
+            row.is_active = True
+            if username in MASTER_ADMIN_USERNAMES:
+                salt, pwd = _make_password_record(password)
+                row.password_salt = salt
+                row.password_hash = pwd
             continue
         salt, pwd = _make_password_record(password)
         db.add(AppUser(username=username, role=role, password_salt=salt, password_hash=pwd))
@@ -507,23 +524,43 @@ def _sync_coach_login(
 def _login_role_for_response(user: AppUser) -> str:
     """Map DB ``zomate_fs_users.role`` to API contract: ADMIN | CLERK | COACH."""
     r = (user.role or "").strip().upper()
-    if r == "ADMIN":
+    if r in {"ADMIN", "MASTER_ADMIN"}:
         return "ADMIN"
     if r == "COACH":
         return "COACH"
     return "CLERK"
 
 
+def _login_session_payload(user: AppUser, token: str) -> LoginSession:
+    """[F007][S003] Bearer session + Excel access matrix permissions."""
+    access_role = normalize_access_role(user.role, user.username)
+    return LoginSession(
+        token=token,
+        username=user.username,
+        role=_login_role_for_response(user),
+        access_role=access_role,
+        is_master_admin=is_master_admin(user.username, user.role),
+        permissions=permissions_for_role(access_role),
+    )
+
+
+def require_master_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """[F007][S003] Only masterzoe / masterfung (or MASTER_ADMIN role) manage system accounts."""
+    if not is_master_admin(user.username, user.role):
+        raise HTTPException(status_code=403, detail="Only master admin may manage system accounts.")
+    return user
+
+
 def require_admin_or_clerk(user: AppUser = Depends(get_current_user)) -> AppUser:
     """後台職員（不含 COACH）；COACH 帳號不可用依賴此注入的路由。"""
-    if user.role not in {"ADMIN", "CLERK"}:
+    if user.role not in {"ADMIN", "CLERK", "MASTER_ADMIN"}:
         raise HTTPException(status_code=403, detail="Role not allowed.")
     return user
 
 
 def require_staff_for_coach_routes(user: AppUser = Depends(get_current_user)) -> AppUser:
     """`/api/coach/courses*` — ADMIN／CLERK 全 coach_id；COACH 僅可查與 slug 對應之教練列。"""
-    if user.role not in {"ADMIN", "CLERK", "COACH"}:
+    if user.role not in {"ADMIN", "CLERK", "COACH", "MASTER_ADMIN"}:
         raise HTTPException(status_code=403, detail="Role not allowed.")
     return user
 
@@ -670,7 +707,7 @@ def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
 
 
 def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
-    if user.role != "ADMIN":
+    if user.role not in {"ADMIN", "MASTER_ADMIN"} and not is_master_admin(user.username, user.role):
         raise HTTPException(status_code=403, detail="Only ADMIN allowed.")
     return user
 
@@ -1957,7 +1994,7 @@ def apply_lesson_ledger_delta(
     return _lesson_balance_sum(db, student.id)
 
 
-async def perform_lesson_checkin(
+def perform_lesson_checkin(
     db: Session,
     student: Student,
     channel: str,
@@ -1966,7 +2003,7 @@ async def perform_lesson_checkin(
     resolved_enrollment: CourseEnrollment | None = None,
     notified_coach: Coach | None = None,
     pin_resolution: str = "unknown",
-) -> dict:
+) -> tuple[dict, dict]:
     if _lesson_balance_sum(db, student.id) <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
@@ -2060,30 +2097,31 @@ async def perform_lesson_checkin(
         "session_calendar_date": session_day.isoformat() if resolved_enrollment else None,
         "course_title": resolved_enrollment.title if resolved_enrollment else None,
     }
-    await manager.broadcast_json(event_payload)
 
-    return {
-        "message": "Check-in success",
-        "student": {
-            "id": student.id,
-            "full_name": student.full_name,
-            "phone": student.phone,
-            "lesson_balance": bal_after,
-            "channel": channel,
+    return (
+        {
+            "message": "Check-in success",
+            "student": {
+                "id": student.id,
+                "full_name": student.full_name,
+                "phone": student.phone,
+                "lesson_balance": bal_after,
+                "channel": channel,
+            },
+            "notified_coach": (
+                {"id": notified_coach.id, "full_name": notified_coach.full_name, "phone": notified_coach.phone}
+                if notified_coach
+                else None
+            ),
+            "resolved_course_id": resolved_enrollment.id if resolved_enrollment else None,
         },
-        "notified_coach": (
-            {"id": notified_coach.id, "full_name": notified_coach.full_name, "phone": notified_coach.phone}
-            if notified_coach
-            else None
-        ),
-        "resolved_course_id": resolved_enrollment.id if resolved_enrollment else None,
-    }
+        event_payload,
+    )
 
 
 def _sync_startup() -> None:
     Base.metadata.create_all(bind=engine)
-    db = next(get_db())
-    try:
+    with db_session() as db:
         _migrate_branch_extended_columns(db)
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
@@ -2097,8 +2135,6 @@ def _sync_startup() -> None:
         _seed_management_defaults(db)
         _seed_default_users(db)
         db.commit()
-    finally:
-        db.close()
 
 
 @app.on_event("startup")
@@ -3341,7 +3377,7 @@ def auth_login(payload: LoginInput, db: Session = Depends(get_db)) -> LoginSessi
         )
     )
     db.commit()
-    return LoginSession(token=token, username=user.username, role=_login_role_for_response(user))
+    return _login_session_payload(user, token)
 
 
 @app.get("/api/auth/me", response_model=LoginSession)
@@ -3369,7 +3405,154 @@ def auth_me(
         db.delete(auth_session)
         db.commit()
         raise HTTPException(status_code=401, detail="Session expired.")
-    return LoginSession(token=token, username=user.username, role=_login_role_for_response(user))
+    return _login_session_payload(user, token)
+
+
+def _system_user_out(user: AppUser) -> SystemUserOut:
+    access_role = normalize_access_role(user.role, user.username)
+    return SystemUserOut(
+        id=user.id,
+        username=user.username,
+        role=user.role,
+        access_role=access_role,
+        is_master_admin=is_master_admin(user.username, user.role),
+        is_active=bool(user.is_active),
+        coach_id=user.coach_id,
+        created_at=user.created_at,
+    )
+
+
+@app.get("/api/admin/access-rights", response_model=AccessRightsMatrixOut)
+def admin_access_rights_matrix(user: AppUser = Depends(require_master_admin)) -> AccessRightsMatrixOut:
+    """[F007][S003] Excel matrix — masterzoe / masterfung only."""
+    return AccessRightsMatrixOut(
+        rows=access_matrix_rows(),
+        role_labels={"MASTER_ADMIN": "Masteradmin", "COACH": "PT", "CLERK": "clerk"},
+    )
+
+
+@app.get("/api/admin/system-users", response_model=list[SystemUserOut])
+def admin_list_system_users(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_master_admin),
+) -> list[SystemUserOut]:
+    """[F007][S003] List staff logins for master admin."""
+    rows = db.query(AppUser).order_by(AppUser.username.asc()).all()
+    return [_system_user_out(r) for r in rows]
+
+
+@app.post("/api/admin/system-users", response_model=SystemUserOut)
+def admin_create_system_user(
+    payload: SystemUserCreate,
+    db: Session = Depends(get_db),
+    actor: AppUser = Depends(require_master_admin),
+) -> SystemUserOut:
+    """[F007][S003] Create clerk / coach login; master admin can bootstrap operations."""
+    uname = payload.username.strip().lower()
+    if not uname:
+        raise HTTPException(status_code=400, detail="Username required.")
+    if db.query(AppUser).filter(AppUser.username == uname).first():
+        raise HTTPException(status_code=409, detail="Username already exists.")
+    role = payload.role
+    if role == "MASTER_ADMIN" and uname not in MASTER_ADMIN_USERNAMES:
+        raise HTTPException(status_code=400, detail="Only masterzoe / masterfung may use MASTER_ADMIN role.")
+    coach_id = payload.coach_id
+    if role == "COACH":
+        if not coach_id:
+            raise HTTPException(status_code=400, detail="COACH login requires coach_id.")
+        coach = db.get(Coach, coach_id)
+        if not coach or _is_deleted(db, "coaches", coach.id):
+            raise HTTPException(status_code=400, detail="Invalid coach_id.")
+        if _coach_login_user(db, coach_id):
+            raise HTTPException(status_code=409, detail="Coach already has a login.")
+    elif coach_id:
+        raise HTTPException(status_code=400, detail="coach_id only valid for COACH role.")
+    salt, pwd = _make_password_record(payload.password)
+    row = AppUser(
+        username=uname,
+        role=role,
+        password_salt=salt,
+        password_hash=pwd,
+        coach_id=coach_id if role == "COACH" else None,
+        is_active=True,
+    )
+    db.add(row)
+    db.add(
+        AuditLog(
+            action="system_user_create",
+            detail=json.dumps({"username": uname, "role": role, "by": actor.username}, ensure_ascii=False),
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _system_user_out(row)
+
+
+@app.patch("/api/admin/system-users/{user_id}", response_model=SystemUserOut)
+def admin_update_system_user(
+    user_id: int,
+    payload: SystemUserUpdate,
+    db: Session = Depends(get_db),
+    actor: AppUser = Depends(require_master_admin),
+) -> SystemUserOut:
+    """[F007][S003] Set password, role, active flag."""
+    row = db.query(AppUser).filter(AppUser.id == user_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if row.username in MASTER_ADMIN_USERNAMES and actor.id != row.id and payload.is_active is False:
+        raise HTTPException(status_code=400, detail="Cannot disable master admin account.")
+    if payload.password:
+        salt, pwd = _make_password_record(payload.password)
+        row.password_salt = salt
+        row.password_hash = pwd
+        db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
+    if payload.role is not None:
+        if row.username in MASTER_ADMIN_USERNAMES and payload.role != "MASTER_ADMIN":
+            raise HTTPException(status_code=400, detail="Cannot change master admin role.")
+        if payload.role == "MASTER_ADMIN" and row.username not in MASTER_ADMIN_USERNAMES:
+            raise HTTPException(status_code=400, detail="Only masterzoe / masterfung may use MASTER_ADMIN.")
+        row.role = payload.role
+    if payload.is_active is not None:
+        row.is_active = payload.is_active
+        if not payload.is_active:
+            db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
+    if payload.coach_id is not None and row.role == "COACH":
+        row.coach_id = payload.coach_id
+    db.add(
+        AuditLog(
+            action="system_user_update",
+            detail=json.dumps({"user_id": user_id, "by": actor.username}, ensure_ascii=False),
+        )
+    )
+    db.commit()
+    db.refresh(row)
+    return _system_user_out(row)
+
+
+@app.delete("/api/admin/system-users/{user_id}")
+def admin_delete_system_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    actor: AppUser = Depends(require_master_admin),
+) -> dict:
+    """[F007][S003] Disable account and revoke sessions (soft operational delete)."""
+    if actor.id == user_id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account.")
+    row = db.query(AppUser).filter(AppUser.id == user_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if row.username in MASTER_ADMIN_USERNAMES:
+        raise HTTPException(status_code=400, detail="Cannot delete master admin account.")
+    row.is_active = False
+    db.query(AuthSession).filter(AuthSession.user_id == row.id).delete(synchronize_session=False)
+    db.add(
+        AuditLog(
+            action="system_user_delete",
+            detail=json.dumps({"user_id": user_id, "username": row.username, "by": actor.username}, ensure_ascii=False),
+        )
+    )
+    db.commit()
+    return {"ok": True, "user_id": user_id, "username": row.username}
 
 
 @app.post("/api/auth/logout")
@@ -3424,32 +3607,35 @@ def trial_purchase(payload: TrialPurchaseInput, db: Session = Depends(get_db)) -
 
 
 @app.post("/api/checkin")
-async def checkin(payload: CheckinInput, db: Session = Depends(get_db)) -> dict:
-    if payload.student_id is not None:
-        student = db.query(Student).filter(Student.id == payload.student_id).first()
-    else:
-        student = db.query(Student).filter(Student.phone == str(payload.phone).strip()).first()
-    if student and _is_deleted(db, "students", student.id):
-        student = None
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found.")
-    ctx = resolve_checkin_pin_context(db, student, payload.pin_code)
-    if ctx == "blocked_installment_unpaid":
-        raise HTTPException(
-            status_code=403,
-            detail="此方分期 PIN 尚未啟用 — 請先完成該期付款或由櫃台標記已找數後再試。",
+async def checkin(payload: CheckinInput) -> dict:
+    with db_session() as db:
+        if payload.student_id is not None:
+            student = db.query(Student).filter(Student.id == payload.student_id).first()
+        else:
+            student = db.query(Student).filter(Student.phone == str(payload.phone).strip()).first()
+        if student and _is_deleted(db, "students", student.id):
+            student = None
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found.")
+        ctx = resolve_checkin_pin_context(db, student, payload.pin_code)
+        if ctx == "blocked_installment_unpaid":
+            raise HTTPException(
+                status_code=403,
+                detail="此方分期 PIN 尚未啟用 — 請先完成該期付款或由櫃台標記已找數後再試。",
+            )
+        if ctx is None:
+            raise HTTPException(status_code=400, detail="Invalid PIN.")
+        enrollment, coach, pin_kind = ctx
+        result, event_payload = perform_lesson_checkin(
+            db,
+            student,
+            channel="qr_pin",
+            resolved_enrollment=enrollment,
+            notified_coach=coach,
+            pin_resolution=pin_kind,
         )
-    if ctx is None:
-        raise HTTPException(status_code=400, detail="Invalid PIN.")
-    enrollment, coach, pin_kind = ctx
-    return await perform_lesson_checkin(
-        db,
-        student,
-        channel="qr_pin",
-        resolved_enrollment=enrollment,
-        notified_coach=coach,
-        pin_resolution=pin_kind,
-    )
+    await manager.broadcast_json(event_payload)
+    return result
 
 
 @app.post("/api/admin/students/{student_id}/manual-redeem")
@@ -3586,26 +3772,29 @@ def bind_face(student_id: int, face_id_external: str, db: Session = Depends(get_
 
 
 @app.post("/api/faceid-checkin")
-async def faceid_checkin(payload: FaceIdCheckinInput, db: Session = Depends(get_db)) -> dict:
-    student = (
-        db.query(Student)
-        .filter(Student.face_id_external == payload.face_id_external)
-        .first()
-    )
-    if not student:
-        raise HTTPException(status_code=404, detail="Face not recognized.")
-    if _is_deleted(db, "students", student.id):
-        raise HTTPException(status_code=404, detail="Student not found.")
-    enrollment, coach = resolve_today_primary_enrollment_for_student(db, student)
-    return await perform_lesson_checkin(
-        db,
-        student,
-        channel="hikvision_faceid",
-        remarks="simulated",
-        resolved_enrollment=enrollment,
-        notified_coach=coach,
-        pin_resolution="faceid",
-    )
+async def faceid_checkin(payload: FaceIdCheckinInput) -> dict:
+    with db_session() as db:
+        student = (
+            db.query(Student)
+            .filter(Student.face_id_external == payload.face_id_external)
+            .first()
+        )
+        if not student:
+            raise HTTPException(status_code=404, detail="Face not recognized.")
+        if _is_deleted(db, "students", student.id):
+            raise HTTPException(status_code=404, detail="Student not found.")
+        enrollment, coach = resolve_today_primary_enrollment_for_student(db, student)
+        result, event_payload = perform_lesson_checkin(
+            db,
+            student,
+            channel="hikvision_faceid",
+            remarks="simulated",
+            resolved_enrollment=enrollment,
+            notified_coach=coach,
+            pin_resolution="faceid",
+        )
+    await manager.broadcast_json(event_payload)
+    return result
 
 
 # [F002][S001]
@@ -5405,6 +5594,9 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
     note_trim = (payload.coach_schedule_note or "").strip()
     n_inst = max(1, min(3, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
+    inst_amounts = getattr(payload, "installment_amounts", None)
+    if inst_amounts is not None and len(inst_amounts) != n_inst:
+        raise HTTPException(status_code=400, detail="installment_amounts length must match total_installments.")
     first_created: CourseEnrollment | None = None
 
     for sid in payload.student_ids:
@@ -5438,6 +5630,11 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                         "reminder_lesson": _default_installment_reminder_lesson(lo, hi),
                         "pin": p,
                         "paid": idx == 0,
+                        **(
+                            {"amount_hkd": float(inst_amounts[idx])}
+                            if inst_amounts is not None and idx < len(inst_amounts)
+                            else {}
+                        ),
                     }
                 )
             seg_json = json.dumps(seg_payload, ensure_ascii=False)
