@@ -686,6 +686,8 @@ class CoachSessionOut(BaseModel):
     coach_time_confirmed: bool
     attendance_status: str
     course_title: str
+    lesson_no: int | None = None
+    total_lessons: int | None = None
 
 
 class CoachAttendanceReportRowOut(BaseModel):

@@ -123,7 +123,13 @@ def build_coach_session_rows(
 
         student = enr.student
         branch = enr.branch
-        for session_date in get_lesson_dates_for_enrollment(enr):
+        lesson_dates = get_lesson_dates_for_enrollment(enr)
+        try:
+            total_lessons = max(1, min(30, int(enr.total_lessons)))
+        except (TypeError, ValueError):
+            total_lessons = max(1, len(lesson_dates))
+
+        for session_date in lesson_dates:
             if day is not None and session_date != day:
                 continue
             if from_date is not None and to_date is not None:
@@ -134,6 +140,7 @@ def build_coach_session_rows(
             if interval is None:
                 continue
             start_dt, end_dt = interval
+            lesson_no = lesson_dates.index(session_date) + 1 if session_date in lesson_dates else None
 
             rows.append(
                 {
@@ -156,6 +163,8 @@ def build_coach_session_rows(
                         session_date=session_date,
                     ),
                     "course_title": enr.title,
+                    "lesson_no": lesson_no,
+                    "total_lessons": total_lessons,
                 }
             )
 

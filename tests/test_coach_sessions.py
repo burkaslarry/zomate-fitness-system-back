@@ -65,6 +65,10 @@ def test_build_coach_session_rows_single_day(db_session):
     assert rows[0]["student_name"] == "Lee"
     assert rows[0]["category_name"] == "新學生一對一"
     assert rows[0]["attendance_status"] == "未簽到"
+    assert rows[0]["lesson_no"] == 1
+    assert rows[0]["total_lessons"] == 1
+    assert rows[0]["start_time"] == "10:00"
+    assert rows[0]["end_time"] == "11:00"
 
 
 def test_build_coach_session_rows_skips_unresolved_category(db_session):
