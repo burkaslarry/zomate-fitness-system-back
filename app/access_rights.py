@@ -86,22 +86,8 @@ ACCESS_FEATURES: list[dict] = [
         "remark": None,
     },
     {
-        "key": "finance_sales",
-        "label_zh": "銷售與分期",
-        "href": "/admin/finance/sales",
-        "roles": ("MASTER_ADMIN",),
-        "remark": None,
-    },
-    {
-        "key": "finance_expenses",
-        "label_zh": "支出管理",
-        "href": "/admin/finance/expenses",
-        "roles": ("MASTER_ADMIN",),
-        "remark": None,
-    },
-    {
         "key": "finance_payroll",
-        "label_zh": "薪酬 / 出勤報表",
+        "label_zh": "教練出勤收入匯出",
         "href": "/admin/finance/payroll",
         "roles": ("MASTER_ADMIN",),
         "remark": None,
@@ -132,13 +118,6 @@ ACCESS_FEATURES: list[dict] = [
         "label_zh": "付款紀錄",
         "href": "/admin/payments",
         "roles": ("MASTER_ADMIN", "CLERK"),
-        "remark": None,
-    },
-    {
-        "key": "coach_attendance",
-        "label_zh": "教練出勤",
-        "href": "/coach/attendance",
-        "roles": ("MASTER_ADMIN",),
         "remark": None,
     },
 ]
