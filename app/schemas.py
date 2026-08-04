@@ -333,6 +333,7 @@ class BranchCreate(BaseModel):
 class BranchUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     address: str | None = Field(default=None, min_length=1, max_length=255)
+    code: str | None = Field(default=None, min_length=1, max_length=32)
     business_start_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     business_end_time: str | None = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     remarks: str | None = None
@@ -681,6 +682,7 @@ class CoachSessionOut(BaseModel):
     session_date: str
     start_time: str
     end_time: str
+    branch_id: int | None = None
     branch_name: str
     checkin_pin: str
     coach_time_confirmed: bool
@@ -705,6 +707,32 @@ class CoachAttendanceReportOut(BaseModel):
     from_date: date
     to_date: date
     rows: list[CoachAttendanceReportRowOut] = Field(default_factory=list)
+
+
+class CoachAttendanceLedgerRowOut(BaseModel):
+    """[F008][S005] One coached session row for attendance ledger table."""
+
+    branch_id: int | None = None
+    branch_name: str
+    coach_id: int
+    coach_name: str
+    coach_username: str | None = None
+    session_date: str
+    check_in_time: str
+    check_out_time: str
+    lessons_hours: str
+    course_type: str
+    status: str
+    remarks: str = ""
+
+
+class CoachAttendanceLedgerOut(BaseModel):
+    """[F008][S005] Filterable coach attendance ledger for admin / coach UI."""
+
+    month: str
+    from_date: date
+    to_date: date
+    rows: list[CoachAttendanceLedgerRowOut] = Field(default_factory=list)
 
 
 class CourseCategoryCreate(BaseModel):

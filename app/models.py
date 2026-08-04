@@ -235,7 +235,9 @@ class Attendance(Base):
         ForeignKey("zomate_fs_course_enrollments.id", ondelete="SET NULL"), nullable=True
     )
     attended_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    checked_out_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     session_calendar_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
+    remarks: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

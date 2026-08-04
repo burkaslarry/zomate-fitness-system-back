@@ -6,12 +6,13 @@ Logic: Expand enrollments into per-session rows with category resolution and att
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, time
 
 from sqlalchemy.orm import Session, joinedload
 
 from .enrollment_schedule import get_lesson_dates_for_enrollment
 from .models import Attendance, CategoryEnrollment, CourseCategory, CourseEnrollment
+from .timezone import hk_calendar_date, now_hk, utc_to_hk
 
 
 def coach_skill_category_ids(db: Session, coach_id: int) -> list[int]:
@@ -154,6 +155,7 @@ def build_coach_session_rows(
                     "start_time": start_dt.strftime("%H:%M"),
                     "end_time": end_dt.strftime("%H:%M"),
                     "branch_name": branch.name if branch else "—",
+                    "branch_id": branch.id if branch else None,
                     "checkin_pin": enr.checkin_pin,
                     "coach_time_confirmed": bool(enr.coach_time_confirmed),
                     "attendance_status": session_attendance_status(
@@ -202,3 +204,129 @@ def build_coach_attendance_report_rows(session_rows: list[dict]) -> list[dict]:
         )
     report.sort(key=lambda r: r["course_type"])
     return report
+
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    parts = str(value or "00:00").split(":")
+    h = int(parts[0]) if parts and parts[0].isdigit() else 0
+    m = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return h, m
+
+
+def _format_hkt_time(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    local = utc_to_hk(dt)
+    return local.strftime("%H:%M")
+
+
+def _session_duration_hours(start_time: str, end_time: str) -> float:
+    sh, sm = _parse_hhmm(start_time)
+    eh, em = _parse_hhmm(end_time)
+    start_m = sh * 60 + sm
+    end_m = eh * 60 + em
+    if end_m <= start_m:
+        end_m += 24 * 60
+    return round(max(0, end_m - start_m) / 60, 1)
+
+
+def _attendance_for_session(
+    db: Session, *, enrollment_id: int, student_id: int, session_date: date
+) -> Attendance | None:
+    return (
+        db.query(Attendance)
+        .filter(
+            Attendance.course_id == enrollment_id,
+            Attendance.student_id == student_id,
+            Attendance.session_calendar_date == session_date,
+        )
+        .first()
+    )
+
+
+def _derive_ledger_status(
+    *,
+    attended: bool,
+    attended_at: datetime | None,
+    session_date: date,
+    start_time: str,
+    today: date,
+) -> str:
+    """[F008][S005] normal | late | absent | upcoming"""
+    if not attended:
+        return "upcoming" if session_date > today else "absent"
+    if attended_at is None:
+        return "normal"
+    sh, sm = _parse_hhmm(start_time)
+    scheduled = datetime.combine(session_date, time(sh, sm))
+    actual = utc_to_hk(attended_at)
+    actual_local = datetime.combine(session_date, actual.time())
+    if actual_local > scheduled + timedelta(minutes=5):
+        return "late"
+    return "normal"
+
+
+def build_coach_attendance_ledger_rows(
+    db: Session,
+    session_rows: list[dict],
+    *,
+    coach_id: int,
+    coach_name: str,
+    coach_username: str | None,
+) -> list[dict]:
+    """[F008][S005] Flat ledger rows: branch, coach, times, status, remarks."""
+    today = now_hk().date()
+    ledger: list[dict] = []
+    for row in session_rows:
+        session_date = date.fromisoformat(str(row["session_date"]))
+        att = _attendance_for_session(
+            db,
+            enrollment_id=int(row["enrollment_id"]),
+            student_id=int(row["student_id"]),
+            session_date=session_date,
+        )
+        attended = att is not None or str(row.get("attendance_status")) == "已簽到"
+        status = _derive_ledger_status(
+            attended=attended,
+            attended_at=att.attended_at if att else None,
+            session_date=session_date,
+            start_time=str(row.get("start_time") or "00:00"),
+            today=today,
+        )
+        check_in = _format_hkt_time(att.attended_at if att else None) or "--:--"
+        check_out = _format_hkt_time(att.checked_out_at if att else None) or "--:--"
+        hours = _session_duration_hours(str(row.get("start_time") or ""), str(row.get("end_time") or ""))
+        remarks = (att.remarks or "").strip() if att and att.remarks else ""
+        ledger.append(
+            {
+                "branch_id": row.get("branch_id"),
+                "branch_name": str(row.get("branch_name") or "—"),
+                "coach_id": coach_id,
+                "coach_name": coach_name,
+                "coach_username": coach_username,
+                "session_date": session_date.isoformat(),
+                "check_in_time": check_in,
+                "check_out_time": check_out,
+                "lessons_hours": f"1堂 · {hours:g}hr",
+                "course_type": str(row.get("category_name") or "—"),
+                "status": status,
+                "remarks": remarks,
+            }
+        )
+    return ledger
+
+
+def sort_coach_attendance_ledger_rows(
+    rows: list[dict], *, sort_by: str, order: str
+) -> list[dict]:
+    """[F008][S005] Server-side sort for ledger API."""
+    key_map = {
+        "branch": lambda r: (r.get("branch_name") or "").lower(),
+        "coach": lambda r: (r.get("coach_name") or "").lower(),
+        "date": lambda r: (r.get("session_date") or "", r.get("check_in_time") or ""),
+        "check_in": lambda r: (r.get("session_date") or "", r.get("check_in_time") or ""),
+        "status": lambda r: (r.get("status") or "").lower(),
+    }
+    key_fn = key_map.get(sort_by, key_map["date"])
+    reverse = order.lower() == "desc"
+    return sorted(rows, key=key_fn, reverse=reverse)

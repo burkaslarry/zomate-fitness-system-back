@@ -88,6 +88,8 @@ from .schemas import (
     CoachRemindPaymentOut,
     CoachSessionOut,
     CoachAttendanceReportOut,
+    CoachAttendanceLedgerOut,
+    CoachAttendanceLedgerRowOut,
     CoachAttendanceReportRowOut,
     CoachBookSession,
     CoachEnrollmentCancelBody,
@@ -166,7 +168,12 @@ from .enrollment_schedule import (
     parse_lesson_weekdays_str,
     parse_segment_pins_json,
 )
-from .coach_sessions import build_coach_attendance_report_rows, build_coach_session_rows
+from .coach_sessions import (
+    build_coach_attendance_ledger_rows,
+    build_coach_attendance_report_rows,
+    build_coach_session_rows,
+    sort_coach_attendance_ledger_rows,
+)
 from .whatsapp_templates import seed_whatsapp_templates
 from .whatsapp_business import dispatch_reminder, get_whatsapp_client
 from .storage import FileStorageService
@@ -1651,6 +1658,21 @@ def _migrate_branch_extended_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_branch_sw_code(db: Session) -> None:
+    """[F002][S001] Normalize legacy 上環 branch code SHEUNGWAN → SW."""
+    try:
+        legacy = db.query(Branch).filter(Branch.code == "SHEUNGWAN").first()
+        if legacy is None:
+            return
+        conflict = db.query(Branch).filter(Branch.code == "SW", Branch.id != legacy.id).first()
+        if conflict:
+            return
+        legacy.code = "SW"
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _migrate_management_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS hkid VARCHAR(32) NULL",
@@ -1689,6 +1711,20 @@ def _migrate_member_profile_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS nickname VARCHAR(80) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS gender VARCHAR(20) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR(80) NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _migrate_attendance_ledger_columns(db: Session) -> None:
+    """[F008][S005] Coach attendance ledger: check-out time and remarks on attendance rows."""
+    stmts = [
+        "ALTER TABLE zomate_fs_attendance ADD COLUMN IF NOT EXISTS checked_out_at TIMESTAMP NULL",
+        "ALTER TABLE zomate_fs_attendance ADD COLUMN IF NOT EXISTS remarks TEXT NULL",
     ]
     try:
         for s in stmts:
@@ -1803,7 +1839,7 @@ def _seed_default_branches(db: Session) -> None:
             "remarks": "近佐敦地鐵站D出口",
         },
         {
-            "code": "SHEUNGWAN",
+            "code": "SW",
             "name": "上環分店",
             "address": "宏基商業大廈一樓全層",
             "business_start_time": "09:00",
@@ -2135,10 +2171,12 @@ def _sync_startup() -> None:
     Base.metadata.create_all(bind=engine)
     with db_session() as db:
         _migrate_branch_extended_columns(db)
+        _migrate_branch_sw_code(db)
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
         _migrate_medical_clearance_columns(db)
         _migrate_member_profile_columns(db)
+        _migrate_attendance_ledger_columns(db)
         _backfill_medical_clearance_columns(db)
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
@@ -3862,12 +3900,12 @@ def list_public_branches(active: bool | None = True, db: Session = Depends(get_d
 
 
 @app.post("/api/branches", response_model=BranchOut)
-def create_public_branch(payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Branch:
+def create_public_branch(payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin)) -> Branch:
     return create_branch(payload, db, user)
 
 
 @app.patch("/api/branches/{branch_id}", response_model=BranchOut)
-def update_public_branch(branch_id: int, payload: BranchUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> Branch:
+def update_public_branch(branch_id: int, payload: BranchUpdate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin)) -> Branch:
     return update_branch(branch_id, payload, db, user)
 
 
@@ -4643,7 +4681,7 @@ def list_checkins(
 
 
 @app.get("/api/admin/branches", response_model=list[BranchOut])
-def list_branches(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> list[Branch]:
+def list_branches(db: Session = Depends(get_db), user: AppUser = Depends(require_admin)) -> list[Branch]:
     return (
         db.query(Branch)
         .filter(~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")))
@@ -4654,13 +4692,15 @@ def list_branches(db: Session = Depends(get_db), user: AppUser = Depends(require
 
 @app.post("/api/admin/branches", response_model=BranchOut)
 def create_branch(
-    payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+    payload: BranchCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin)
 ) -> Branch:
     data = payload.model_dump()
     data["name"] = data["name"].strip()
     data["address"] = data["address"].strip()
     data["remarks"] = data["remarks"].strip() if data.get("remarks") else None
     data["code"] = allocate_branch_code(db, data.get("code"), data["name"])
+    if data.get("code"):
+        data["code"] = str(data["code"]).strip().upper()
     if not data["name"] or not data["address"]:
         raise HTTPException(status_code=400, detail="Branch name and address are required.")
     b = Branch(**data)
@@ -4675,7 +4715,7 @@ def update_branch(
     branch_id: int,
     payload: BranchUpdate,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_admin),
 ) -> Branch:
     branch = db.query(Branch).filter(Branch.id == branch_id).first()
     if not branch or _is_deleted(db, "branches", branch.id):
@@ -4683,6 +4723,19 @@ def update_branch(
     data = payload.model_dump(exclude_unset=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update.")
+    if "code" in data and data["code"] is not None:
+        code = str(data["code"]).strip().upper()
+        if not code:
+            raise HTTPException(status_code=400, detail="code cannot be empty.")
+        other = (
+            db.query(Branch)
+            .filter(Branch.code == code, Branch.id != branch_id)
+            .filter(_active_branches_filter())
+            .first()
+        )
+        if other:
+            raise HTTPException(status_code=409, detail="Branch code already exists.")
+        branch.code = code
     for key in ("name", "address", "business_start_time", "business_end_time", "remarks", "active"):
         if key not in data:
             continue
@@ -4702,7 +4755,7 @@ def update_branch(
 
 @app.get("/api/admin/branches/export.csv")
 def export_branches_csv(
-    db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+    db: Session = Depends(get_db), user: AppUser = Depends(require_admin)
 ) -> PlainTextResponse:
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -4732,7 +4785,7 @@ def export_branches_csv(
 
 @app.post("/api/admin/branches/import")
 def import_branches_csv(
-    file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+    file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin)
 ) -> dict:
     raw = file.file.read().decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(raw))
@@ -5300,7 +5353,7 @@ def delete_branch(
     branch_id: int,
     hard: bool = False,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_admin),
 ) -> dict:
     branch = db.query(Branch).filter(Branch.id == branch_id).first()
     if not branch or _is_deleted(db, "branches", branch.id):
@@ -6194,6 +6247,86 @@ def coach_attendance_report(
         from_date=from_d,
         to_date=to_d,
         rows=[CoachAttendanceReportRowOut.model_validate(r) for r in report_rows],
+    )
+
+
+def _parse_branch_filter(branch: str | None) -> set[str] | None:
+    raw = (branch or "").strip()
+    if not raw or raw.lower() in {"all", "*"}:
+        return None
+    names = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    return names or None
+
+
+@app.get("/api/coach/attendance-ledger", response_model=CoachAttendanceLedgerOut)
+def coach_attendance_ledger(
+    month: str | None = Query(default=None, description="yyyy-MM; default current month"),
+    coach_id: int | None = None,
+    branch: str | None = Query(default=None, description="Branch name filter: All or comma-separated"),
+    branch_id: str | None = Query(default=None, description="Comma-separated branch ids"),
+    category_ids: str | None = Query(default=None, description="Comma-separated CourseCategory ids"),
+    sort_by: str = Query(default="date", description="branch|coach|date|check_in|status"),
+    order: str = Query(default="asc", description="asc|desc"),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CoachAttendanceLedgerOut:
+    """[F008][S005] Session-level coach attendance ledger with branch column and sorting."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    month_key, from_d, to_d = _parse_month_param(month)
+    cat_filter = _parse_category_ids_param(category_ids)
+    branch_names = _parse_branch_filter(branch)
+    branch_ids: set[int] | None = None
+    if branch_id:
+        try:
+            branch_ids = {int(x.strip()) for x in branch_id.split(",") if x.strip()}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="branch_id must be comma-separated integers.") from exc
+
+    coach_row = db.query(Coach).filter(Coach.id == cid).first()
+    if not coach_row or _is_deleted(db, "coaches", cid):
+        raise HTTPException(status_code=404, detail="Coach not found.")
+    login_user = _coach_login_user(db, cid)
+
+    enrollments = _coach_enrollments_for_sessions(db, cid, from_date=from_d, to_date=to_d)
+    session_rows = build_coach_session_rows(
+        db,
+        enrollments,
+        coach_id=cid,
+        from_date=from_d,
+        to_date=to_d,
+        category_ids=cat_filter,
+    )
+    ledger_rows = build_coach_attendance_ledger_rows(
+        db,
+        session_rows,
+        coach_id=cid,
+        coach_name=coach_row.full_name,
+        coach_username=login_user.username if login_user else None,
+    )
+
+    if branch_ids is not None:
+        ledger_rows = [r for r in ledger_rows if r.get("branch_id") in branch_ids]
+    if branch_names is not None:
+        ledger_rows = [
+            r for r in ledger_rows if str(r.get("branch_name") or "").lower() in branch_names
+        ]
+
+    ledger_rows = sort_coach_attendance_ledger_rows(
+        ledger_rows, sort_by=sort_by.strip().lower() or "date", order=order
+    )
+    log_event(
+        "coach_attendance_ledger",
+        coach_id=cid,
+        month=month_key,
+        count=len(ledger_rows),
+        sort_by=sort_by,
+        order=order,
+    )
+    return CoachAttendanceLedgerOut(
+        month=month_key,
+        from_date=from_d,
+        to_date=to_d,
+        rows=[CoachAttendanceLedgerRowOut.model_validate(r) for r in ledger_rows],
     )
 
 
