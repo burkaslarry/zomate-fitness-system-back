@@ -220,6 +220,7 @@ def build_payment_records(
                 "category_name": category_name,
                 "receipt_id": rr.receipt_id,
                 "receipt_url": file_url_fn(rec.file_path) if rec and file_url_fn else None,
+                "receipt_file_path": rec.file_path if rec else None,
                 "download_url": f"/api/receipts/{rr.receipt_id}/download" if rr.receipt_id else None,
                 "created_at": payment_created_at_iso(rr.created_at),
             }
@@ -255,6 +256,7 @@ def build_payment_records(
                 "label": humanize_payment_source_label(rec.note or rec.source),
                 "receipt_id": rec.id,
                 "receipt_url": file_url_fn(rec.file_path) if file_url_fn else None,
+                "receipt_file_path": rec.file_path,
                 "download_url": f"/api/receipts/{rec.id}/download",
                 "created_at": payment_created_at_iso(rec.created_at),
             }
@@ -299,6 +301,7 @@ def build_payment_records(
                         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
                         "receipt_id": None,
                         "receipt_url": None,
+                        "receipt_file_path": None,
                         "created_at": payment_created_at_iso(
                             pay.paid_at or pay.due_date or ce.started_at
                         ),

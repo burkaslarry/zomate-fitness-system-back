@@ -13,9 +13,12 @@ import json
 import hashlib
 import hmac
 import os
+import re
 import secrets
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, time, timezone
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
@@ -4153,6 +4156,336 @@ def admin_payment_records(
     rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
     return {"records": rows, "total": len(rows)}
 
+
+_PAYMENT_CSV_HEADERS = [
+    "id",
+    "record_type",
+    "ref_id",
+    "student_id",
+    "student_name",
+    "student_phone",
+    "amount",
+    "payment_method",
+    "status",
+    "coach_id",
+    "coach_name",
+    "label",
+    "category_name",
+    "receipt_id",
+    "receipt_url",
+    "receipt_file_path",
+    "download_url",
+    "installment_no",
+    "installment_plan_id",
+    "category_enrollment_id",
+    "due_date",
+    "paid_at",
+    "created_at",
+]
+
+
+def _payment_records_csv_text(
+    db: Session,
+    *,
+    status: str | None = None,
+    q: str | None = None,
+) -> tuple[str, list[dict]]:
+    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(_PAYMENT_CSV_HEADERS)
+    for r in rows:
+        w.writerow([r.get(h, "") if r.get(h) is not None else "" for h in _PAYMENT_CSV_HEADERS])
+    return buf.getvalue(), rows
+
+
+@app.get("/api/admin/payment-records/export.csv")
+def export_payment_records_csv(
+    status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> PlainTextResponse:
+    """[F004][S002] Export payment records (full detail columns) as CSV."""
+    text, _ = _payment_records_csv_text(db, status=status, q=q)
+    return PlainTextResponse(
+        text,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="payment-records.csv"'},
+    )
+
+
+@app.get("/api/admin/payment-records/export.zip")
+def export_payment_records_zip(
+    status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> Response:
+    """[F004][S002] Export payment CSV + related receipt photo/PDF folders as ZIP."""
+    csv_text, rows = _payment_records_csv_text(db, status=status, q=q)
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("payment-records.csv", csv_text.encode("utf-8-sig"))
+        added: set[str] = set()
+        for r in rows:
+            rel = (r.get("receipt_file_path") or "").strip()
+            if not rel or rel in added:
+                continue
+            path = (UPLOADS_DIR / rel).resolve()
+            if not str(path).startswith(str(UPLOADS_DIR)) or not path.is_file():
+                continue
+            # Keep folder layout: receipts/{HKID}/filename
+            arc = rel if rel.startswith("receipts/") else f"receipts/{rel}"
+            zf.write(path, arcname=arc)
+            added.add(rel)
+        zf.writestr(
+            "README.txt",
+            (
+                "Zomate payment-records export\n"
+                "- payment-records.csv: full payment / renewal / installment rows\n"
+                "- receipts/: receipt images & PDFs linked from receipt_file_path\n"
+                "Import: upload this ZIP (or CSV alone) via 付款紀錄 → 匯入.\n"
+            ),
+        )
+    mem.seek(0)
+    return Response(
+        content=mem.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="payment-records-export.zip"'},
+    )
+
+
+def _find_student_for_payment_import(db: Session, phone: str, student_id: str | None) -> Student | None:
+    deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    if student_id and str(student_id).strip().isdigit():
+        st = (
+            db.query(Student)
+            .filter(~Student.id.in_(deleted), Student.id == int(student_id))
+            .first()
+        )
+        if st:
+            return st
+    local = normalize_hk_phone_local_eight((phone or "").strip())
+    if not local:
+        return None
+    variants = _hk_phone_lookup_variants(local)
+    return db.query(Student).filter(~Student.id.in_(deleted), Student.phone.in_(variants)).first()
+
+
+@app.post("/api/admin/payment-records/import")
+async def import_payment_records(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F004][S002] Import payment CSV or ZIP (CSV + receipts/ photos).
+
+    - CSV alone: create/update renewal rows by student phone; link existing receipt_id when present.
+    - ZIP: expects ``payment-records.csv`` plus optional ``receipts/...`` files; creates Receipt rows and links renewals.
+    """
+    raw_bytes = await file.read()
+    name = (file.filename or "").lower()
+    csv_text = ""
+    receipt_blobs: dict[str, bytes] = {}
+
+    if name.endswith(".zip") or raw_bytes[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    entry = info.filename.replace("\\", "/")
+                    data = zf.read(info)
+                    base = Path(entry).name.lower()
+                    if base == "payment-records.csv" or entry.endswith("/payment-records.csv"):
+                        csv_text = data.decode("utf-8-sig")
+                    elif "/receipts/" in f"/{entry}" or entry.startswith("receipts/"):
+                        # Normalize to receipts/...
+                        idx = entry.find("receipts/")
+                        key = entry[idx:] if idx >= 0 else f"receipts/{Path(entry).name}"
+                        receipt_blobs[key] = data
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="Invalid ZIP file.") from exc
+    else:
+        csv_text = raw_bytes.decode("utf-8-sig")
+
+    if not csv_text.strip():
+        raise HTTPException(status_code=400, detail="Missing payment-records.csv in upload.")
+
+    reader = csv.DictReader(io.StringIO(csv_text))
+    imported = 0
+    updated = 0
+    receipts_saved = 0
+    skipped = 0
+
+    for row in reader:
+        record_type = (row.get("record_type") or "renewal").strip().lower()
+        phone = (row.get("student_phone") or "").strip()
+        student = _find_student_for_payment_import(db, phone, row.get("student_id"))
+        if not student:
+            skipped += 1
+            continue
+
+        amount_raw = (row.get("amount") or "").strip()
+        try:
+            amount = float(amount_raw) if amount_raw else None
+        except ValueError:
+            amount = None
+        payment_method = (row.get("payment_method") or "cash").strip() or "cash"
+        label = (row.get("label") or "").strip() or None
+        coach_name = (row.get("coach_name") or "").strip() or None
+        coach_id_raw = (row.get("coach_id") or "").strip()
+        coach_id = int(coach_id_raw) if coach_id_raw.isdigit() else None
+
+        # Persist receipt file from ZIP when path present
+        receipt_rel = (row.get("receipt_file_path") or "").strip().replace("\\", "/")
+        linked_receipt_id: int | None = None
+        if receipt_rel:
+            blob_key = receipt_rel if receipt_rel.startswith("receipts/") else f"receipts/{receipt_rel}"
+            blob = receipt_blobs.get(blob_key) or receipt_blobs.get(receipt_rel)
+            # Also try by basename
+            if blob is None:
+                base = Path(receipt_rel).name
+                for k, v in receipt_blobs.items():
+                    if Path(k).name == base:
+                        blob = v
+                        blob_key = k
+                        break
+            if blob is not None:
+                member_key = student.hkid or student.phone or str(student.id)
+                suffix = Path(blob_key).suffix.lower() or ".bin"
+                safe = "".join(ch for ch in Path(blob_key).name if ch.isalnum() or ch in "._-")
+                stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+                rel_dir = Path("receipts") / "".join(member_key.upper().split())
+                out_dir = UPLOADS_DIR / rel_dir
+                out_dir.mkdir(parents=True, exist_ok=True)
+                rel_path = rel_dir / f"{stamp}-{safe or ('receipt' + suffix)}"
+                (UPLOADS_DIR / rel_path).write_bytes(blob)
+                rec = Receipt(
+                    student_id=student.id,
+                    member_hkid=student.hkid or member_key,
+                    file_path=str(rel_path).replace("\\", "/"),
+                    amount=amount,
+                    payment_method=payment_method,
+                    note=label,
+                    source="RENEWAL",
+                )
+                db.add(rec)
+                db.flush()
+                linked_receipt_id = rec.id
+                receipts_saved += 1
+
+        if record_type == "renewal":
+            ref_raw = (row.get("ref_id") or "").strip()
+            existing = None
+            if ref_raw.isdigit():
+                existing = db.query(RenewalRecord).filter(RenewalRecord.id == int(ref_raw)).first()
+                if existing and existing.student_id != student.id:
+                    existing = None
+            if existing and not _is_deleted(db, "renewal_records", existing.id):
+                if amount is not None:
+                    existing.amount = amount
+                if payment_method:
+                    existing.payment_method = payment_method
+                if coach_name:
+                    existing.coach_name = coach_name
+                if coach_id is not None:
+                    existing.coach_id = coach_id
+                if label:
+                    existing.remarks = label
+                if linked_receipt_id is not None:
+                    existing.receipt_id = linked_receipt_id
+                elif (row.get("receipt_id") or "").strip().isdigit() and not existing.receipt_id:
+                    rid = int(row["receipt_id"])
+                    if db.get(Receipt, rid):
+                        existing.receipt_id = rid
+                updated += 1
+            else:
+                lessons = 10
+                # Try parse "30 堂" from label
+                if label:
+                    m = re.search(r"(\d+)\s*堂", label)
+                    if m:
+                        lessons = max(1, min(30, int(m.group(1))))
+                rr = RenewalRecord(
+                    student_id=student.id,
+                    student_name=student.full_name,
+                    phone=student.phone,
+                    course_ratio="1:1",
+                    lessons=lessons,
+                    payment_method=payment_method,
+                    coach_name=coach_name,
+                    coach_id=coach_id,
+                    amount=amount,
+                    receipt_id=linked_receipt_id,
+                    remarks=label,
+                    applicant_name=student.full_name,
+                    signature=student.full_name,
+                    renewal_date=date.today(),
+                )
+                db.add(rr)
+                imported += 1
+        elif record_type == "receipt":
+            if linked_receipt_id is None and amount is not None:
+                # Create receipt row without file
+                rec = Receipt(
+                    student_id=student.id,
+                    member_hkid=student.hkid or student.phone or str(student.id),
+                    file_path="receipts/_imported/placeholder.txt",
+                    amount=amount,
+                    payment_method=payment_method,
+                    note=label,
+                    source="RENEWAL",
+                )
+                # Prefer not creating placeholder files without bytes — skip if no file
+                skipped += 1
+                continue
+            elif linked_receipt_id is not None:
+                imported += 1
+            else:
+                skipped += 1
+        else:
+            # installment rows: skip create (require live enrollments)
+            skipped += 1
+
+    db.commit()
+    log_event(
+        "payment_records_imported",
+        imported=imported,
+        updated=updated,
+        receipts_saved=receipts_saved,
+        skipped=skipped,
+    )
+    return {
+        "imported": imported,
+        "updated": updated,
+        "receipts_saved": receipts_saved,
+        "skipped": skipped,
+    }
+
+
+@app.get("/api/admin/course-categories/export.csv")
+def export_course_categories_csv(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> PlainTextResponse:
+    """[F011][S001] Export course category names only."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["name"])
+    for c in (
+        db.query(CourseCategory)
+        .filter(CourseCategory.is_deleted.is_(False))
+        .order_by(CourseCategory.id.asc())
+        .all()
+    ):
+        w.writerow([c.name])
+    return PlainTextResponse(
+        buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="course-categories.csv"'},
+    )
 
 @app.delete("/api/admin/payment-records/{record_type}/{ref_id}")
 def admin_delete_payment_record(
