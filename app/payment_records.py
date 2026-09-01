@@ -38,6 +38,25 @@ def extract_renewal_category_label(remarks: str | None) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def humanize_payment_source_label(raw: str | None) -> str:
+    """[F004][S002] Map machine source codes to staff-facing Chinese labels."""
+    text = (raw or "").strip()
+    if not text:
+        return "收據"
+    upper = text.upper()
+    if upper in {"RENEWAL", "RENEW"}:
+        return "續會"
+    if upper in {"REGISTER", "REGISTRATION", "NEW"}:
+        return "新登記"
+    # "[Category: Yoga 瑜珈] …" → "Yoga 瑜珈 · …"
+    cat = extract_renewal_category_label(text)
+    if cat:
+        rest = _RENEWAL_CATEGORY_RE.sub("", text, count=1).strip()
+        cat_clean = re.sub(r"^Category:\s*", "", cat, flags=re.I).strip() or cat
+        return f"{cat_clean} · {rest}" if rest else cat_clean
+    return text
+
+
 def build_renewal_payment_label(
     *,
     lessons: int,
@@ -48,11 +67,15 @@ def build_renewal_payment_label(
     category = package_name or extract_renewal_category_label(remarks)
     if category:
         rest = _RENEWAL_CATEGORY_RE.sub("", (remarks or "").strip(), count=1).strip()
-        label = f"{lessons} 堂 · {category}"
+        cat_clean = re.sub(r"^Category:\s*", "", category, flags=re.I).strip() or category
+        label = f"{lessons} 堂 · {cat_clean}"
         if rest:
             label += f" · {rest}"
         return label
-    return f"{lessons} 堂 · {remarks or '報 Course / 續會'}"
+    remarks_h = humanize_payment_source_label(remarks) if remarks else None
+    if remarks_h and remarks_h not in {"收據", "續會", "新登記"}:
+        return f"{lessons} 堂 · {remarks_h}"
+    return f"{lessons} 堂 · 續會"
 
 
 def _coach_slug(full_name: str) -> str:
@@ -228,7 +251,7 @@ def build_payment_records(
                 "status": "paid",
                 "coach_id": None,
                 "coach_name": None,
-                "label": rec.note or rec.source or "收據",
+                "label": humanize_payment_source_label(rec.note or rec.source),
                 "receipt_id": rec.id,
                 "receipt_url": file_url_fn(rec.file_path) if file_url_fn else None,
                 "created_at": payment_created_at_iso(rec.created_at),
