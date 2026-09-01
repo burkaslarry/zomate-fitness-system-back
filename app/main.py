@@ -127,6 +127,7 @@ from .schemas import (
     PaymentNotificationSendBody,
     WhatsAppTemplateOut,
     WhatsAppTemplateUpdate,
+    WhatsAppAnalyticsOut,
     WhatsAppStatusOut,
     WhatsAppTestSendBody,
     TrialPurchaseInput,
@@ -4140,6 +4141,10 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
     )
     total_checkins = db.query(func.count(CheckinLog.id)).scalar() or 0
     total_messages = db.query(func.count(WhatsAppLog.id)).scalar() or 0
+    seven_days_ago = datetime.utcnow() - timedelta(days=7)
+    whatsapp_messages_7d = (
+        db.query(func.count(WhatsAppLog.id)).filter(WhatsAppLog.created_at >= seven_days_ago).scalar() or 0
+    )
     audit_rows = db.query(func.count(AuditLog.id)).scalar() or 0
     ledger_positive = (
         select(LessonLedgerEntry.student_id.label("sid"))
@@ -4203,6 +4208,7 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         "active_students": active_students,
         "total_checkins": total_checkins,
         "whatsapp_messages": total_messages,
+        "whatsapp_messages_7d": whatsapp_messages_7d,
         "audit_logs": audit_rows,
         "branches": branches,
         "coaches": coaches,
@@ -4445,8 +4451,12 @@ def admin_grant_coach_trial_quota(
 
 
 @app.get("/api/admin/whatsapp-logs")
-def whatsapp_logs(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> list[dict]:
-    logs = db.query(WhatsAppLog).order_by(WhatsAppLog.id.desc()).limit(30).all()
+def whatsapp_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> list[dict]:
+    logs = db.query(WhatsAppLog).order_by(WhatsAppLog.id.desc()).limit(limit).all()
     return [
         {
             "id": item.id,
@@ -4548,6 +4558,40 @@ def admin_whatsapp_status(user: AppUser = Depends(require_admin_or_clerk)) -> Wh
     _ = user
     snap = get_whatsapp_client().status()
     return WhatsAppStatusOut(**snap)
+
+
+@app.get("/api/admin/whatsapp/analytics", response_model=WhatsAppAnalyticsOut)
+def admin_whatsapp_analytics(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> WhatsAppAnalyticsOut:
+    """[F005][S003] WhatsApp log counts + API readiness for admin settings and dashboard."""
+    _ = user
+    now = datetime.utcnow()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    seven_days_ago = now - timedelta(days=7)
+    total_logs = db.query(func.count(WhatsAppLog.id)).scalar() or 0
+    logs_today = (
+        db.query(func.count(WhatsAppLog.id)).filter(WhatsAppLog.created_at >= today_start).scalar() or 0
+    )
+    logs_last_7_days = (
+        db.query(func.count(WhatsAppLog.id)).filter(WhatsAppLog.created_at >= seven_days_ago).scalar() or 0
+    )
+    unique_recipients = db.query(func.count(distinct(WhatsAppLog.recipient))).scalar() or 0
+    templates_count = db.query(func.count(WhatsAppMessageTemplate.id)).scalar() or 0
+    last_row = db.query(WhatsAppLog).order_by(WhatsAppLog.id.desc()).first()
+    snap = get_whatsapp_client().status()
+    return WhatsAppAnalyticsOut(
+        total_logs=total_logs,
+        logs_today=logs_today,
+        logs_last_7_days=logs_last_7_days,
+        unique_recipients=unique_recipients,
+        templates_count=templates_count,
+        last_sent_at=last_row.created_at if last_row else None,
+        enabled=snap["enabled"],
+        configured=snap["configured"],
+        template_map_keys=snap["template_map_keys"],
+    )
 
 
 @app.post("/api/admin/whatsapp/test-send")

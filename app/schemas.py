@@ -794,6 +794,20 @@ class WhatsAppStatusOut(BaseModel):
     template_map_keys: list[str]
 
 
+class WhatsAppAnalyticsOut(BaseModel):
+    """[F005][S003] Basic WhatsApp log analytics for admin dashboard."""
+
+    total_logs: int
+    logs_today: int
+    logs_last_7_days: int
+    unique_recipients: int
+    templates_count: int
+    last_sent_at: datetime | None = None
+    enabled: bool
+    configured: bool
+    template_map_keys: list[str]
+
+
 class WhatsAppTestSendBody(BaseModel):
     """[F005][S003] Admin test send using a Meta-approved template name."""
 
