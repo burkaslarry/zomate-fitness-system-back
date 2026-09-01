@@ -769,8 +769,9 @@ def _save_member_receipt_row(
     full_payment: bool = False,
     send_whatsapp: bool = True,
     notify_coach: bool = True,
+    renewal_id: int | None = None,
 ) -> dict:
-    """[F004][S002] Persist receipt, optionally match installment, and log WhatsApp payment reminders."""
+    """[F004][S002] Persist receipt, optionally match installment/renewal, and log WhatsApp payment reminders."""
     path = _save_upload_file(file, "receipts", member_key, 5 * 1024 * 1024)
     note_text = (note or "").strip()
     context_text = (context or "").strip()
@@ -787,6 +788,22 @@ def _save_member_receipt_row(
     )
     db.add(receipt)
     db.flush()
+
+    linked_renewal_id: int | None = None
+    if renewal_id is not None:
+        renewal = (
+            db.query(RenewalRecord)
+            .filter(
+                RenewalRecord.id == renewal_id,
+                RenewalRecord.student_id == student.id,
+            )
+            .first()
+        )
+        if renewal is None:
+            raise HTTPException(status_code=404, detail="Renewal record not found for this student.")
+        renewal.receipt_id = receipt.id
+        linked_renewal_id = renewal.id
+
     match_result = apply_receipt_payment_match(
         db,
         student=student,
@@ -801,7 +818,12 @@ def _save_member_receipt_row(
             action="receipt_upload",
             student_id=student.id,
             detail=json.dumps(
-                {"receipt_id": receipt.id, "source": receipt.source, **match_result},
+                {
+                    "receipt_id": receipt.id,
+                    "source": receipt.source,
+                    "renewal_id": linked_renewal_id,
+                    **match_result,
+                },
                 ensure_ascii=False,
             ),
         )
@@ -824,6 +846,8 @@ def _save_member_receipt_row(
         "id": receipt.id,
         "file_path": path,
         "file_url": _file_url(path),
+        "download_url": f"/api/receipts/{receipt.id}/download",
+        "renewal_id": linked_renewal_id,
         "installment_match": match_result,
         "whatsapp": whatsapp_result,
     }
@@ -3054,6 +3078,7 @@ def upload_member_receipt(
     full_payment: str | None = Form(default="false"),
     send_whatsapp: str | None = Form(default="true"),
     notify_coach: str | None = Form(default="true"),
+    renewal_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
     """[F004][S002] Receipt upload with optional installment match + WhatsApp payment reminder."""
@@ -3074,6 +3099,7 @@ def upload_member_receipt(
         full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
+        renewal_id=renewal_id,
     )
     db.commit()
     return result
@@ -3094,6 +3120,7 @@ def upload_member_receipt_by_id(
     full_payment: str | None = Form(default="false"),
     send_whatsapp: str | None = Form(default="true"),
     notify_coach: str | None = Form(default="true"),
+    renewal_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
@@ -3118,9 +3145,64 @@ def upload_member_receipt_by_id(
         full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
+        renewal_id=renewal_id,
     )
     db.commit()
     return result
+
+
+@app.get("/api/receipts/{receipt_id}/download")
+def download_receipt(
+    receipt_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> FileResponse:
+    """[F004][S002] Authenticated receipt download (PDF / image) for admin & portal users."""
+    receipt = db.get(Receipt, receipt_id)
+    if receipt is None or _is_deleted(db, "receipts", receipt.id):
+        raise HTTPException(status_code=404, detail="Receipt not found.")
+    if user.role == "COACH":
+        coach = _coach_row_for_user(db, user)
+        if coach is None:
+            raise HTTPException(status_code=403, detail="Coach profile not linked.")
+        allowed = (
+            db.query(CourseEnrollment.id)
+            .filter(
+                CourseEnrollment.student_id == receipt.student_id,
+                CourseEnrollment.coach_id == coach.id,
+            )
+            .first()
+            is not None
+        ) or (
+            db.query(RenewalRecord.id)
+            .filter(
+                RenewalRecord.student_id == receipt.student_id,
+                RenewalRecord.coach_id == coach.id,
+            )
+            .first()
+            is not None
+        )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Not allowed to download this receipt.")
+    rel = _signature_relative_path(receipt.file_path) or str(receipt.file_path).lstrip("/")
+    path = (UPLOADS_DIR / rel).resolve()
+    if not str(path).startswith(str(UPLOADS_DIR)) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Receipt file missing on disk.")
+    suffix = path.suffix.lower()
+    media = {
+        ".pdf": "application/pdf",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(suffix, "application/octet-stream")
+    filename = path.name
+    return FileResponse(
+        path,
+        media_type=media,
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/api/members/by-id/{student_id}/medical-clearance")
