@@ -175,7 +175,7 @@ from .coach_sessions import (
     sort_coach_attendance_ledger_rows,
 )
 from .whatsapp_templates import seed_whatsapp_templates
-from .whatsapp_business import dispatch_reminder, get_whatsapp_client
+from .whatsapp_business import dispatch_reminder, get_whatsapp_client, verify_whatsapp_webhook_signature
 from .storage import FileStorageService
 
 # -----------------------------------------------------------------------------
@@ -4479,9 +4479,20 @@ def whatsapp_webhook_verify(
 @app.post("/api/webhooks/whatsapp")
 async def whatsapp_webhook_event(request: Request) -> dict:
     """[F005][S004] Receive Meta webhook events (incoming messages and status updates)."""
+    app_secret = settings.whatsapp_app_secret.strip()
+    if not app_secret:
+        log_event("[F005][S004] whatsapp_webhook_missing_app_secret")
+        raise HTTPException(status_code=503, detail="WHATSAPP_APP_SECRET is not configured.")
+
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not verify_whatsapp_webhook_signature(body, signature, app_secret):
+        log_event("[F005][S004] whatsapp_webhook_signature_invalid")
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
+
     try:
-        payload = await request.json()
-    except Exception:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
         log_event("[F005][S004] whatsapp_webhook_event_invalid_json")
         return {"ok": True}
     if isinstance(payload, dict):

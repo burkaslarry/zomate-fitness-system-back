@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+import hashlib
+import hmac
 from typing import Any
 
 import httpx
@@ -16,6 +18,24 @@ from .config import settings
 from .logutil import log_event
 
 GRAPH_API_VERSION = "v21.0"
+WHATSAPP_SIGNATURE_HEADER = "x-hub-signature-256"
+
+
+def verify_whatsapp_webhook_signature(
+    body: bytes,
+    signature_header: str | None,
+    app_secret: str,
+) -> bool:
+    """[F005][S004] Validate Meta X-Hub-Signature-256 (HMAC-SHA256 of raw body)."""
+    secret = app_secret.strip()
+    if not secret or not signature_header:
+        return False
+    header = signature_header.strip()
+    if not header.startswith("sha256="):
+        return False
+    expected_hex = header[7:]
+    computed_hex = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(computed_hex, expected_hex)
 
 
 @dataclass(frozen=True)

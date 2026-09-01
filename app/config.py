@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     whatsapp_graph_api_base: str = Field(default="https://graph.facebook.com", alias="WHATSAPP_GRAPH_API_BASE")
     whatsapp_template_map: str = Field(default="", alias="WHATSAPP_TEMPLATE_MAP")
     whatsapp_webhook_verify_token: str = Field(default="", alias="WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+    whatsapp_app_secret: str = Field(default="", alias="WHATSAPP_APP_SECRET")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
