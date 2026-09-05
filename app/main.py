@@ -36,6 +36,22 @@ import qrcode
 
 from .config import settings
 from .database import Base, db_session, engine, get_db
+from .excel_csv_compat import (
+    FUNG_PAYMENT_HEADERS,
+    FUNG_STUDENT_HEADERS,
+    csv_cell,
+    format_emergency_contact,
+    gender_label_zh,
+    is_fung_payment_headers,
+    is_fung_student_headers,
+    normalize_gender,
+    parse_amount,
+    parse_emergency_contact,
+    parse_flexible_date,
+    parse_installment_label,
+    phone_display_member_code,
+    upload_bytes_to_csv_text,
+)
 from .health_app import liveness_payload
 from .keepalive import keepalive_loop
 from .logutil import configure_logging, instance_id, log_event
@@ -1418,8 +1434,10 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "full_name": student.full_name,
         "phone": student.phone,
         "email": student.email,
+        "gender": student.gender,
         "date_of_birth": student.date_of_birth.isoformat() if student.date_of_birth else None,
         "emergency_contact_name": student.emergency_contact_name,
+        "emergency_contact_relationship": student.emergency_contact_relationship,
         "emergency_contact_phone": student.emergency_contact_phone,
         "lesson_balance": _lesson_balance_sum(db, student.id),
         "coach_trial_quota_remaining": int(trial_q),
@@ -1888,6 +1906,30 @@ def _seed_default_branches(db: Session) -> None:
         row.active = True
 
 
+def _hard_delete_course_category_by_name(db: Session, name: str) -> bool:
+    """[F011][S001] Hard-delete a course category after clearing CoachSkill + CategoryEnrollment trees."""
+    cat = db.query(CourseCategory).filter(CourseCategory.name == name).first()
+    if cat is None:
+        return False
+    db.query(CoachSkill).filter(CoachSkill.course_category_id == cat.id).delete(synchronize_session=False)
+    enrollments = (
+        db.query(CategoryEnrollment).filter(CategoryEnrollment.course_category_id == cat.id).all()
+    )
+    for en in enrollments:
+        plans = db.query(InstallmentPlan).filter(InstallmentPlan.enrollment_id == en.id).all()
+        for plan in plans:
+            db.query(InstallmentPayment).filter(InstallmentPayment.installment_plan_id == plan.id).delete(
+                synchronize_session=False
+            )
+            db.delete(plan)
+        db.delete(en)
+    db.flush()
+    cat_id = cat.id
+    db.delete(cat)
+    log_event("course_category_hard_deleted", name=name, category_id=cat_id)
+    return True
+
+
 def _seed_management_defaults(db: Session) -> None:
     packages = [
         {"name": "10 堂套票", "sessions": 10, "price": 0},
@@ -1902,6 +1944,10 @@ def _seed_management_defaults(db: Session) -> None:
             row.price = item["price"]
             row.active = True
 
+    # [F011][S001] Remove legacy 泰拳 1:1/1:2 names (hard delete); keep Thai Boxing.
+    for doomed in ("泰拳一對一", "泰拳一對二"):
+        _hard_delete_course_category_by_name(db, doomed)
+
     for category_name in [
         "新學生一對一",
         "新學生一對二",
@@ -1909,11 +1955,13 @@ def _seed_management_defaults(db: Session) -> None:
         "續會學生一對二",
         "自帶學生一對一",
         "自帶學生一對二",
-        "泰拳一對一",
-        "泰拳一對二",
         "Yoga 瑜珈",
         "Stretching 拉伸",
         "Pilates 普拉提",
+        "Thai Boxing",
+        "紮肚",
+        "Group Class",
+        "1:1 Pilates 4堂",
     ]:
         category = db.query(CourseCategory).filter(CourseCategory.name == category_name).first()
         if category is None:
@@ -4256,6 +4304,59 @@ def export_payment_records_zip(
     )
 
 
+@app.get("/api/admin/payment-records/export.fung.csv")
+def export_payment_records_fung_csv(
+    status: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> PlainTextResponse:
+    """[F004][S002] Fung 收錢template-compatible payment CSV for re-import."""
+    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(FUNG_PAYMENT_HEADERS)
+    for r in rows:
+        paid = r.get("paid_at") or r.get("created_at") or ""
+        date_cell = ""
+        if paid:
+            try:
+                date_cell = datetime.fromisoformat(str(paid).replace("Z", "+00:00")).strftime("%m/%d")
+            except ValueError:
+                date_cell = str(paid)[:10]
+        label = (r.get("label") or "").strip()
+        nr = "Renewal"
+        low = label.lower()
+        if "new" in low or label.startswith("NEW"):
+            nr = "New"
+        inst_no = r.get("installment_no")
+        inst_total = None
+        # installment_total not always on row — leave blank or parse from label
+        installment_cell = ""
+        if inst_no is not None:
+            installment_cell = f"{inst_no}/? payment" if not inst_total else f"{inst_no}/{inst_total} payment"
+        phone = (r.get("student_phone") or "").strip()
+        w.writerow(
+            [
+                date_cell,
+                phone_display_member_code(phone),
+                r.get("student_name") or "",
+                phone,
+                r.get("category_name") or label,
+                r.get("coach_name") or "",
+                nr,
+                r.get("amount") if r.get("amount") is not None else "",
+                r.get("payment_method") or "",
+                installment_cell,
+            ]
+        )
+    return PlainTextResponse(
+        "\ufeff" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="payment-records-fung.csv"'},
+    )
+
+
 def _find_student_for_payment_import(db: Session, phone: str, student_id: str | None) -> Student | None:
     deleted = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     if student_id and str(student_id).strip().isdigit():
@@ -4279,47 +4380,126 @@ async def import_payment_records(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    """[F004][S002] Import payment CSV or ZIP (CSV + receipts/ photos).
+    """[F004][S002] Import payment CSV, Excel (.xlsx/.xls first sheet), or ZIP (CSV + receipts/).
 
-    - CSV alone: create/update renewal rows by student phone; link existing receipt_id when present.
-    - ZIP: expects ``payment-records.csv`` plus optional ``receipts/...`` files; creates Receipt rows and links renewals.
+    - CSV / Excel: create/update renewal rows by student phone; Fung 收錢 columns supported.
+    - ZIP: expects ``payment-records.csv`` plus optional ``receipts/...`` files.
     """
     raw_bytes = await file.read()
     name = (file.filename or "").lower()
     csv_text = ""
     receipt_blobs: dict[str, bytes] = {}
 
-    if name.endswith(".zip") or raw_bytes[:2] == b"PK":
-        try:
-            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    entry = info.filename.replace("\\", "/")
-                    data = zf.read(info)
-                    base = Path(entry).name.lower()
-                    if base == "payment-records.csv" or entry.endswith("/payment-records.csv"):
-                        csv_text = data.decode("utf-8-sig")
-                    elif "/receipts/" in f"/{entry}" or entry.startswith("receipts/"):
-                        # Normalize to receipts/...
-                        idx = entry.find("receipts/")
-                        key = entry[idx:] if idx >= 0 else f"receipts/{Path(entry).name}"
-                        receipt_blobs[key] = data
-        except zipfile.BadZipFile as exc:
-            raise HTTPException(status_code=400, detail="Invalid ZIP file.") from exc
+    # xlsx is also a ZIP (PK…); only treat as payment ZIP when extension is .zip
+    is_zip_upload = name.endswith(".zip")
+    if is_zip_upload or (raw_bytes[:2] == b"PK" and not name.endswith((".xlsx", ".xlsm", ".xls"))):
+        # Heuristic: if PK but looks like xlsx content type via [Content_Types], prefer Excel
+        looks_xlsx = b"[Content_Types].xml" in raw_bytes[:8000] or b"xl/workbook" in raw_bytes[:8000]
+        if looks_xlsx and not is_zip_upload:
+            try:
+                csv_text = upload_bytes_to_csv_text(raw_bytes, file.filename or "upload.xlsx")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Cannot read Excel/CSV: {exc}") from exc
+        else:
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        entry = info.filename.replace("\\", "/")
+                        data = zf.read(info)
+                        base = Path(entry).name.lower()
+                        if base == "payment-records.csv" or entry.endswith("/payment-records.csv"):
+                            csv_text = data.decode("utf-8-sig")
+                        elif "/receipts/" in f"/{entry}" or entry.startswith("receipts/"):
+                            # Normalize to receipts/...
+                            idx = entry.find("receipts/")
+                            key = entry[idx:] if idx >= 0 else f"receipts/{Path(entry).name}"
+                            receipt_blobs[key] = data
+            except zipfile.BadZipFile as exc:
+                raise HTTPException(status_code=400, detail="Invalid ZIP file.") from exc
     else:
-        csv_text = raw_bytes.decode("utf-8-sig")
+        try:
+            csv_text = upload_bytes_to_csv_text(raw_bytes, file.filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Cannot read Excel/CSV: {exc}") from exc
 
     if not csv_text.strip():
-        raise HTTPException(status_code=400, detail="Missing payment-records.csv in upload.")
+        raise HTTPException(status_code=400, detail="Missing payment CSV/Excel data in upload.")
 
     reader = csv.DictReader(io.StringIO(csv_text))
+    fung_mode = is_fung_payment_headers(list(reader.fieldnames or []))
     imported = 0
     updated = 0
     receipts_saved = 0
     skipped = 0
 
     for row in reader:
+        if fung_mode:
+            phone = csv_cell(row, "電話號碼", "MemberCode", "student_phone")
+            student = _find_student_for_payment_import(db, phone, None)
+            if not student:
+                skipped += 1
+                continue
+            amount = parse_amount(csv_cell(row, "收費", "amount"))
+            payment_method = csv_cell(row, "付款方法", "payment_method") or "cash"
+            course_label = csv_cell(row, "課程", "label", "category_name")
+            coach_name = csv_cell(row, "教練", "coach_name") or None
+            nr = csv_cell(row, "New/Renewal", "New/ Renewal", "label")
+            inst_raw = csv_cell(row, "分期付款")
+            inst_no, inst_total = parse_installment_label(inst_raw)
+            remarks_parts = []
+            if nr:
+                remarks_parts.append(nr.strip())
+            if course_label:
+                remarks_parts.append(course_label)
+            if inst_raw:
+                remarks_parts.append(inst_raw)
+            label = " · ".join(remarks_parts) if remarks_parts else None
+            _ = (inst_no, inst_total)  # parsed for future installment plan link
+            # Fung header may be 日期 or 日期yyyy/mm/dd
+            date_raw = csv_cell(row, "日期", "paid_at", "created_at")
+            if not date_raw:
+                for k, v in row.items():
+                    if k and str(k).strip().startswith("日期") and v is not None and str(v).strip():
+                        date_raw = str(v).strip()
+                        break
+            pay_date = parse_flexible_date(date_raw) or date.today()
+            coach_id = None
+            if coach_name:
+                c = db.query(Coach).filter(Coach.full_name == coach_name).first()
+                if c:
+                    coach_id = c.id
+            lessons = 10
+            if course_label:
+                m = re.search(r"(\d+)\s*堂", course_label)
+                if m:
+                    lessons = max(1, min(30, int(m.group(1))))
+            # Fung sheet has no system ref_id — always create renewal rows
+            rr = RenewalRecord(
+                student_id=student.id,
+                student_name=student.full_name,
+                phone=student.phone,
+                course_ratio="1:1" if "1:2" not in (course_label or "") else "1:2",
+                lessons=lessons,
+                payment_method=payment_method,
+                coach_name=coach_name,
+                coach_id=coach_id,
+                amount=amount,
+                receipt_id=None,
+                remarks=label,
+                applicant_name=student.full_name,
+                signature=student.full_name,
+                renewal_date=pay_date,
+            )
+            db.add(rr)
+            imported += 1
+            continue
+
         record_type = (row.get("record_type") or "renewal").strip().lower()
         phone = (row.get("student_phone") or "").strip()
         student = _find_student_for_payment_import(db, phone, row.get("student_id"))
@@ -4456,12 +4636,14 @@ async def import_payment_records(
         updated=updated,
         receipts_saved=receipts_saved,
         skipped=skipped,
+        format="fung" if fung_mode else "system",
     )
     return {
         "imported": imported,
         "updated": updated,
         "receipts_saved": receipts_saved,
         "skipped": skipped,
+        "format": "fung" if fung_mode else "system",
     }
 
 
@@ -5616,32 +5798,37 @@ def import_coaches_csv(
 
 # -----------------------------------------------------------------------------
 # Students CSV — PostgreSQL table ``zomate_fs_students``
-# GET ``/api/admin/students/export.csv`` · POST ``/api/admin/students/import``
-# Column layout shared with Next.js mock routes when API base is empty (dev only).
+# GET ``/api/admin/students/export.csv`` · ``export.fung.csv`` · POST ``/api/admin/students/import``
+# Dual headers: system English + Fung Excel (MemberCode / Name / Gender 男女 …)
 # Auth: ``require_admin_or_clerk``.
 # -----------------------------------------------------------------------------
+
+_STUDENT_CSV_HEADERS = [
+    "full_name",
+    "phone",
+    "hkid",
+    "gender",
+    "date_of_birth",
+    "email",
+    "health_notes",
+    "disclaimer_accepted",
+    "lesson_balance",
+    "emergency_contact_name",
+    "emergency_contact_relationship",
+    "emergency_contact_phone",
+    "face_id_external",
+    "created_at",
+]
 
 
 @app.get("/api/admin/students/export.csv")
 def export_students_csv(
     db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> PlainTextResponse:
+    """[F001][S003] System-format student CSV (includes gender + emergency contacts)."""
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(
-        [
-            "full_name",
-            "phone",
-            "hkid",
-            "date_of_birth",
-            "email",
-            "health_notes",
-            "disclaimer_accepted",
-            "lesson_balance",
-            "face_id_external",
-            "created_at",
-        ]
-    )
+    w.writerow(_STUDENT_CSV_HEADERS)
     for s in (
         db.query(Student)
         .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
@@ -5653,11 +5840,15 @@ def export_students_csv(
                 s.full_name,
                 s.phone,
                 s.hkid or "",
+                s.gender or "",
                 s.date_of_birth.isoformat() if s.date_of_birth else "",
                 s.email or "",
                 s.health_notes or "",
                 "1" if s.disclaimer_accepted else "0",
                 _lesson_balance_sum(db, s.id),
+                s.emergency_contact_name or "",
+                s.emergency_contact_relationship or "",
+                s.emergency_contact_phone or "",
                 s.face_id_external or "",
                 s.created_at.isoformat(),
             ]
@@ -5669,37 +5860,108 @@ def export_students_csv(
     )
 
 
+@app.get("/api/admin/students/export.fung.csv")
+def export_students_fung_csv(
+    db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+) -> PlainTextResponse:
+    """[F001][S003] Fung Excel-compatible student CSV for direct re-import."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(FUNG_STUDENT_HEADERS)
+    for s in (
+        db.query(Student)
+        .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
+        .order_by(Student.id)
+        .all()
+    ):
+        w.writerow(
+            [
+                phone_display_member_code(s.phone),
+                "",
+                s.full_name,
+                gender_label_zh(s.gender),
+                s.phone or "",
+                s.date_of_birth.isoformat() if s.date_of_birth else "",
+                s.hkid or "",
+                format_emergency_contact(s.emergency_contact_name, s.emergency_contact_relationship),
+                s.emergency_contact_phone or "",
+            ]
+        )
+    return PlainTextResponse(
+        "\ufeff" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="students-fung.csv"'},
+    )
+
+
 @app.post("/api/admin/students/import")
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
-    """批次新增／更新：僅當 CSV 的姓名（標準化）與電話（八位／+852 變體）皆與同一筆學員吻合時才更新；電話已存在但姓名不同則略過。"""
-    raw = file.file.read().decode("utf-8-sig")
+    """[F001][S003] Batch upsert. Accepts CSV or Excel (.xlsx/.xls first sheet).
+
+    Headers: system English or Fung Excel. Update only when name + phone match.
+    """
+    raw_bytes = file.file.read()
+    try:
+        raw = upload_bytes_to_csv_text(raw_bytes, file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot read Excel/CSV: {exc}") from exc
     reader = csv.DictReader(io.StringIO(raw))
     added = 0
     updated = 0
     skipped = 0
     active_students_sq = ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
+    fung_mode = is_fung_student_headers(list(reader.fieldnames or []))
 
     for row in reader:
-        full_name = (row.get("full_name") or "").strip()
-        phone_raw = (row.get("phone") or "").strip()
-        hkid_raw = (row.get("hkid") or "").strip()
+        if fung_mode:
+            full_name = csv_cell(row, "Name", "full_name")
+            phone_raw = csv_cell(row, "phone number", "phone", "MemberCode")
+            hkid_raw = csv_cell(row, "ID Number", "hkid")
+            dob_raw = csv_cell(row, "Date of Birth", "date_of_birth")
+            gender_raw = csv_cell(row, "Gender", "gender")
+            emerg_raw = csv_cell(row, "Emergency Contact")
+            emerg_name, emerg_rel = parse_emergency_contact(emerg_raw)
+            if not emerg_name:
+                emerg_name = csv_cell(row, "emergency_contact_name") or None
+                emerg_rel = csv_cell(row, "emergency_contact_relationship") or None
+            emerg_phone = csv_cell(row, "Emergency Contact Number", "emergency_contact_phone") or None
+            email = csv_cell(row, "email") or None
+            health_notes = csv_cell(row, "health_notes") or None
+            disc = csv_cell(row, "disclaimer_accepted") or "1"
+            face = csv_cell(row, "face_id_external") or None
+            balance_raw = csv_cell(row, "lesson_balance") or "0"
+        else:
+            full_name = csv_cell(row, "full_name", "Name")
+            phone_raw = csv_cell(row, "phone", "phone number", "MemberCode")
+            hkid_raw = csv_cell(row, "hkid", "ID Number")
+            dob_raw = csv_cell(row, "date_of_birth", "Date of Birth")
+            gender_raw = csv_cell(row, "gender", "Gender")
+            emerg_name = csv_cell(row, "emergency_contact_name") or None
+            emerg_rel = csv_cell(row, "emergency_contact_relationship") or None
+            if not emerg_name:
+                emerg_name, emerg_rel = parse_emergency_contact(csv_cell(row, "Emergency Contact"))
+            emerg_phone = csv_cell(row, "emergency_contact_phone", "Emergency Contact Number") or None
+            email = csv_cell(row, "email") or None
+            health_notes = csv_cell(row, "health_notes") or None
+            disc = csv_cell(row, "disclaimer_accepted") or "1"
+            face = csv_cell(row, "face_id_external") or None
+            balance_raw = csv_cell(row, "lesson_balance") or "0"
+
         hkid_norm = normalize_hkid(hkid_raw) if hkid_raw else None
-        dob_raw = (row.get("date_of_birth") or "").strip()
-        try:
-            dob = date.fromisoformat(dob_raw) if dob_raw else None
-        except ValueError:
+        dob = parse_flexible_date(dob_raw)
+        if dob_raw and dob is None:
             skipped += 1
             continue
-        email = (row.get("email") or "").strip() or None
-        health_notes = (row.get("health_notes") or "").strip() or None
-        disc = (row.get("disclaimer_accepted") or "1").strip() in ("1", "true", "True", "yes")
+        gender = normalize_gender(gender_raw)
+        disc_bool = disc.strip().lower() in ("1", "true", "yes", "y")
         try:
-            balance = int((row.get("lesson_balance") or "0").strip() or 0)
+            balance = int(balance_raw.strip() or 0)
         except ValueError:
             balance = 0
-        face = (row.get("face_id_external") or "").strip() or None
 
         local_eight = normalize_hk_phone_local_eight(phone_raw) if phone_raw else None
         variants = _hk_phone_lookup_variants(local_eight) if local_eight else []
@@ -5730,9 +5992,17 @@ def import_students_csv(
                 existing.hkid = hkid_norm
             if dob is not None:
                 existing.date_of_birth = dob
+            if gender:
+                existing.gender = gender
+            if emerg_name is not None:
+                existing.emergency_contact_name = emerg_name
+            if emerg_rel is not None:
+                existing.emergency_contact_relationship = emerg_rel
+            if emerg_phone is not None:
+                existing.emergency_contact_phone = emerg_phone
             existing.email = email
             existing.health_notes = health_notes
-            existing.disclaimer_accepted = disc
+            existing.disclaimer_accepted = disc_bool
             ledger_sum = _lesson_balance_sum(db, existing.id)
             adj = int(balance) - ledger_sum
             if adj != 0:
@@ -5767,11 +6037,15 @@ def import_students_csv(
             full_name=full_name,
             phone=canonical,
             hkid=hkid_norm,
+            gender=gender,
             date_of_birth=dob,
             email=email,
             health_notes=health_notes,
-            disclaimer_accepted=disc,
+            disclaimer_accepted=disc_bool if csv_cell(row, "disclaimer_accepted") else True,
             face_id_external=face,
+            emergency_contact_name=emerg_name,
+            emergency_contact_relationship=emerg_rel,
+            emergency_contact_phone=emerg_phone,
         )
         db.add(st)
         db.flush()
@@ -5789,7 +6063,7 @@ def import_students_csv(
         added += 1
 
     db.commit()
-    return {"imported": added, "updated": updated, "skipped": skipped}
+    return {"imported": added, "updated": updated, "skipped": skipped, "format": "fung" if fung_mode else "system"}
 
 
 @app.delete("/api/admin/students/{student_id}")

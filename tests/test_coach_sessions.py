@@ -10,13 +10,13 @@ from app.models import Branch, Coach, CourseCategory, CourseEnrollment, RenewalR
 def test_resolve_enrollment_category_from_title(db_session):
     branch = Branch(name="TST", code="TST2", address="a", active=True)
     coach = Coach(full_name="C", phone="90000002", branch=branch, active=True)
-    cat = CourseCategory(name="泰拳一對一", is_active=True, is_deleted=False, created_by_role="test")
+    cat = CourseCategory(name="Thai Boxing", is_active=True, is_deleted=False, created_by_role="test")
     student = Student(full_name="S", phone="91111111", hkid="A111")
     db_session.add_all([branch, coach, cat, student])
     db_session.flush()
 
     enr = CourseEnrollment(
-        title="泰拳一對一 · S",
+        title="Thai Boxing · S",
         branch_id=branch.id,
         coach_id=coach.id,
         student_id=student.id,
@@ -30,7 +30,7 @@ def test_resolve_enrollment_category_from_title(db_session):
 
     cid, name = resolve_enrollment_category(db_session, enr)
     assert cid == cat.id
-    assert name == "泰拳一對一"
+    assert name == "Thai Boxing"
 
 
 def test_build_coach_session_rows_single_day(db_session):
