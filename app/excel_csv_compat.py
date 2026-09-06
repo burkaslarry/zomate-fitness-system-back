@@ -225,26 +225,79 @@ def _is_xls_bytes(raw: bytes) -> bool:
     return len(raw) >= 8 and raw[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
-def xlsx_first_sheet_to_csv(raw: bytes) -> str:
-    """[F001][S003] Read first worksheet of an .xlsx into CSV text."""
+def xlsx_first_sheet_to_csv(raw: bytes, *, prefer_student_sheet: bool = False) -> str:
+    """[F001][S003] Read a worksheet of an .xlsx into CSV text.
+
+    When ``prefer_student_sheet`` is True, prefer sheets named 學生資料 / 學生
+    or whose header looks like a student roster; reject payment-only first sheets
+    with a clear error if no student sheet is found.
+    """
     try:
         from openpyxl import load_workbook
     except ImportError as exc:
         raise ValueError("Server missing openpyxl; cannot read .xlsx.") from exc
-    wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    wb = load_workbook(io.BytesIO(raw), read_only=False, data_only=True)
     try:
         if not wb.worksheets:
             raise ValueError("Excel workbook has no sheets.")
-        ws = wb.worksheets[0]
-        rows: list[list[Any]] = [list(r) for r in ws.iter_rows(values_only=True)]
+        chosen = wb.worksheets[0]
+        if prefer_student_sheet:
+            chosen = None
+            for ws in wb.worksheets:
+                title = (ws.title or "").strip()
+                if title in ("學生資料", "學生", "Students", "students", "Student"):
+                    chosen = ws
+                    break
+            if chosen is None:
+                for ws in wb.worksheets:
+                    peek = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+                    headers = [str(c).strip() if c is not None else "" for c in (peek or [])]
+                    if looks_like_student_headers(headers):
+                        chosen = ws
+                        break
+                    if looks_like_payment_headers(headers):
+                        continue
+            if chosen is None:
+                first_peek = next(wb.worksheets[0].iter_rows(min_row=1, max_row=1, values_only=True), None)
+                first_headers = [str(c).strip() if c is not None else "" for c in (first_peek or [])]
+                if looks_like_payment_headers(first_headers):
+                    raise ValueError(
+                        "此 Excel 第一頁似係收錢紀錄，請用「學生資料」sheet，"
+                        "或將學生 sheet 移去最前後再匯入學生名單。"
+                    )
+                chosen = wb.worksheets[0]
+        rows: list[list[Any]] = [list(r) for r in chosen.iter_rows(values_only=True)]
     finally:
         wb.close()
     # Drop fully empty trailing rows
     while rows and all(c is None or str(c).strip() == "" for c in rows[-1]):
         rows.pop()
     if not rows:
-        raise ValueError("Excel first sheet is empty.")
+        raise ValueError("Excel sheet is empty.")
     return _rows_to_csv_text(rows)
+
+
+def looks_like_student_headers(headers: list[str]) -> bool:
+    keys = {h.strip().lower() for h in headers if h}
+    raw = {h.strip() for h in headers if h}
+    if "name" in keys and ("phone number" in keys or "phone" in keys or "membercode" in keys):
+        return True
+    if "full_name" in keys and "phone" in keys:
+        return True
+    if "姓名" in raw or ("會員" in raw and "Gender" in raw):
+        return True
+    if "Gender" in raw and ("phone number" in keys or "電話號碼" in raw):
+        return True
+    return False
+
+
+def looks_like_payment_headers(headers: list[str]) -> bool:
+    raw = {h.strip() for h in headers if h}
+    if "收費" in raw or "付款方法" in raw:
+        return True
+    if any(h.startswith("日期") for h in raw) and ("課程" in raw or "New/ Renewal" in raw or "New/Renewal" in raw):
+        return True
+    return False
 
 
 def xls_first_sheet_to_csv(raw: bytes) -> str:
@@ -277,20 +330,24 @@ def xls_first_sheet_to_csv(raw: bytes) -> str:
     return _rows_to_csv_text(rows)
 
 
-def upload_bytes_to_csv_text(raw: bytes, filename: str | None = None) -> str:
-    """[F001][S003] CSV passthrough, or convert first sheet of .xlsx / .xls to CSV text."""
+def upload_bytes_to_csv_text(
+    raw: bytes,
+    filename: str | None = None,
+    *,
+    prefer_student_sheet: bool = False,
+) -> str:
+    """[F001][S003] CSV passthrough, or convert .xlsx / .xls sheet to CSV text."""
     name = (filename or "").lower().strip()
     if name.endswith((".xlsx", ".xlsm")) or (
         not name.endswith((".csv", ".txt", ".xls")) and _is_xlsx_bytes(raw)
     ):
-        return xlsx_first_sheet_to_csv(raw)
+        return xlsx_first_sheet_to_csv(raw, prefer_student_sheet=prefer_student_sheet)
     if name.endswith(".xls") or _is_xls_bytes(raw):
-        # Some misnamed files are actually xlsx
         if _is_xlsx_bytes(raw):
-            return xlsx_first_sheet_to_csv(raw)
+            return xlsx_first_sheet_to_csv(raw, prefer_student_sheet=prefer_student_sheet)
         return xls_first_sheet_to_csv(raw)
     if _is_xlsx_bytes(raw):
-        return xlsx_first_sheet_to_csv(raw)
+        return xlsx_first_sheet_to_csv(raw, prefer_student_sheet=prefer_student_sheet)
     if _is_xls_bytes(raw):
         return xls_first_sheet_to_csv(raw)
     return raw.decode("utf-8-sig")

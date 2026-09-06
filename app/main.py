@@ -44,6 +44,8 @@ from .excel_csv_compat import (
     gender_label_zh,
     is_fung_payment_headers,
     is_fung_student_headers,
+    looks_like_payment_headers,
+    looks_like_student_headers,
     normalize_gender,
     parse_amount,
     parse_emergency_contact,
@@ -751,7 +753,33 @@ def log_whatsapp(
     template_key: str | None = None,
     template_context: dict[str, str] | None = None,
 ) -> None:
-    """[F005][S003] Persist WhatsApp log row and optionally dispatch via Meta Cloud API."""
+    """[F005][S003] Persist WhatsApp log row and optionally dispatch via Meta Cloud API.
+
+    Skips dispatch to the student's own phone when ``whatsapp_reminder_opt_in`` is False.
+    Coach / staff recipients are unaffected.
+    """
+    recip = (recipient or "").strip()
+    student_phone = (student.phone or "").strip()
+    student_digits = re.sub(r"\D", "", student_phone)
+    recip_digits = re.sub(r"\D", "", recip)
+    is_student_recipient = bool(
+        recip_digits
+        and student_digits
+        and (
+            recip_digits == student_digits
+            or recip_digits.endswith(student_digits[-8:])
+            or student_digits.endswith(recip_digits[-8:])
+        )
+    )
+    if is_student_recipient and not bool(getattr(student, "whatsapp_reminder_opt_in", True)):
+        db.add(
+            WhatsAppLog(
+                student_id=student.id,
+                recipient=recip,
+                message=f"[skipped:whatsapp_opt_out] {message}",
+            )
+        )
+        return
     log = WhatsAppLog(student_id=student.id, recipient=recipient, message=message)
     db.add(log)
     dispatch_reminder(
@@ -760,6 +788,12 @@ def log_whatsapp(
         template_key=template_key,
         template_context=template_context,
     )
+
+
+def _set_whatsapp_reminder_opt_in(student: Student, opted_in: bool) -> None:
+    """[F005][S003] Persist WhatsApp booking/reminder consent on the student row."""
+    student.whatsapp_reminder_opt_in = bool(opted_in)
+    student.whatsapp_reminder_opt_in_at = datetime.utcnow() if opted_in else None
 
 
 def _form_bool(value: str | bool | None, default: bool = True) -> bool:
@@ -1453,6 +1487,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "parq_any_yes": _student_parq_any_yes(student),
         "onboarding_coach_id": ob_coach_id,
         "onboarding_coach_name": ob_coach_name,
+        "whatsapp_reminder_opt_in": bool(getattr(student, "whatsapp_reminder_opt_in", False)),
     }
 
 
@@ -1757,6 +1792,8 @@ def _migrate_member_profile_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS nickname VARCHAR(80) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS gender VARCHAR(20) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR(80) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in_at TIMESTAMP NULL",
     ]
     try:
         for s in stmts:
@@ -2728,6 +2765,8 @@ def _create_member_impl(
         medical_clearance_status=clearance_status,
         medical_clearance_path=medical_path,
         disclaimer_accepted=True,
+        whatsapp_reminder_opt_in=bool(payload.whatsapp_reminder_opt_in),
+        whatsapp_reminder_opt_in_at=datetime.utcnow() if payload.whatsapp_reminder_opt_in else None,
     )
     db.add(student)
     db.flush()
@@ -2785,6 +2824,7 @@ def create_member(
     pdpo_acknowledged: str = Form(default="false"),
     cooling_off_acknowledged: str = Form(default="false"),
     disclaimer_accepted: str = Form(default="false"),
+    whatsapp_reminder_opt_in: str = Form(default="false"),
     digital_signature: str = Form(...),
     coach_id: int | None = Form(default=None),
     coach_username: str | None = Form(default=None),
@@ -2817,6 +2857,7 @@ def create_member(
             pdpo_acknowledged=_form_bool(pdpo_acknowledged, default=False),
             cooling_off_acknowledged=_form_bool(cooling_off_acknowledged, default=False),
             disclaimer_accepted=_form_bool(disclaimer_accepted, default=False),
+            whatsapp_reminder_opt_in=_form_bool(whatsapp_reminder_opt_in, default=False),
             digital_signature=digital_signature,
             coach_id=coach_id,
             coach_username=coach_username,
@@ -3313,6 +3354,7 @@ def create_renewal_multipart(
     course_package_type_label: str | None = Form(default=None),
     note: str | None = Form(default=None),
     skip_lesson_ledger: bool = Form(default=False),
+    whatsapp_reminder_opt_in: str = Form(default="false"),
     receipt: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -3333,6 +3375,12 @@ def create_renewal_multipart(
         student = db.query(Student).filter(~Student.id.in_(deleted_ids_sq), Student.phone.in_(variants)).first()
     if student is None:
         raise HTTPException(status_code=400, detail="請提供 student_id、member_hkid 或 student_phone。")
+    if not _form_bool(whatsapp_reminder_opt_in, default=False):
+        raise HTTPException(
+            status_code=400,
+            detail="請同意接收 Zomate Fitness 經 WhatsApp 發出嘅預約確認及上課提醒。",
+        )
+    _set_whatsapp_reminder_opt_in(student, True)
     receipt_tag = student.hkid or student.phone or str(student.id)
     if total_lessons < 1 or total_lessons > 30:
         raise HTTPException(status_code=400, detail="total_lessons must be between 1 and 30.")
@@ -3463,6 +3511,13 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=400, detail="Phone does not match the selected student.")
     if student.full_name.strip() != full_name:
         raise HTTPException(status_code=400, detail="Name does not match the selected student.")
+
+    if not payload.whatsapp_reminder_opt_in:
+        raise HTTPException(
+            status_code=400,
+            detail="請同意接收 Zomate Fitness 經 WhatsApp 發出嘅預約確認及上課提醒。",
+        )
+    _set_whatsapp_reminder_opt_in(student, True)
 
     bal_after = apply_lesson_ledger_delta(db, student, int(payload.lessons), "renewal_package", created_by_role="renewal")
     renewal_record = RenewalRecord(
@@ -5898,66 +5953,64 @@ def export_students_fung_csv(
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
-    """[F001][S003] Batch upsert. Accepts CSV or Excel (.xlsx/.xls first sheet).
+    """[F001][S003] Batch upsert. Accepts CSV or Excel (.xlsx/.xls; prefers 學生資料 sheet).
 
-    Headers: system English or Fung Excel. Update only when name + phone match.
+    Headers: system English or Fung Excel. Returns skip_reasons for diagnostics.
     """
     raw_bytes = file.file.read()
     try:
-        raw = upload_bytes_to_csv_text(raw_bytes, file.filename)
+        raw = upload_bytes_to_csv_text(raw_bytes, file.filename, prefer_student_sheet=True)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot read Excel/CSV: {exc}") from exc
     reader = csv.DictReader(io.StringIO(raw))
+    fieldnames = list(reader.fieldnames or [])
+    if looks_like_payment_headers(fieldnames) and not looks_like_student_headers(fieldnames):
+        raise HTTPException(
+            status_code=400,
+            detail="此檔似係收錢紀錄，唔係學生名單。請用「學生資料」sheet 或學生範本再匯入。",
+        )
     added = 0
     updated = 0
     skipped = 0
+    skip_reasons: list[dict] = []
     active_students_sq = ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
-    fung_mode = is_fung_student_headers(list(reader.fieldnames or []))
+    fung_mode = is_fung_student_headers(fieldnames)
 
-    for row in reader:
-        if fung_mode:
-            full_name = csv_cell(row, "Name", "full_name")
-            phone_raw = csv_cell(row, "phone number", "phone", "MemberCode")
-            hkid_raw = csv_cell(row, "ID Number", "hkid")
-            dob_raw = csv_cell(row, "Date of Birth", "date_of_birth")
-            gender_raw = csv_cell(row, "Gender", "gender")
-            emerg_raw = csv_cell(row, "Emergency Contact")
-            emerg_name, emerg_rel = parse_emergency_contact(emerg_raw)
-            if not emerg_name:
-                emerg_name = csv_cell(row, "emergency_contact_name") or None
-                emerg_rel = csv_cell(row, "emergency_contact_relationship") or None
-            emerg_phone = csv_cell(row, "Emergency Contact Number", "emergency_contact_phone") or None
-            email = csv_cell(row, "email") or None
-            health_notes = csv_cell(row, "health_notes") or None
-            disc = csv_cell(row, "disclaimer_accepted") or "1"
-            face = csv_cell(row, "face_id_external") or None
-            balance_raw = csv_cell(row, "lesson_balance") or "0"
-        else:
-            full_name = csv_cell(row, "full_name", "Name")
-            phone_raw = csv_cell(row, "phone", "phone number", "MemberCode")
-            hkid_raw = csv_cell(row, "hkid", "ID Number")
-            dob_raw = csv_cell(row, "date_of_birth", "Date of Birth")
-            gender_raw = csv_cell(row, "gender", "Gender")
+    def _skip(row_no: int, reason: str, *, name: str = "", phone: str = "") -> None:
+        nonlocal skipped
+        skipped += 1
+        if len(skip_reasons) < 20:
+            skip_reasons.append(
+                {"row": row_no, "reason": reason, "name": name or None, "phone": phone or None}
+            )
+
+    for row_idx, row in enumerate(reader, start=2):
+        full_name = csv_cell(row, "Name", "full_name", "會員", "姓名")
+        phone_raw = csv_cell(row, "phone number", "phone", "電話號碼", "MemberCode")
+        hkid_raw = csv_cell(row, "ID Number", "hkid")
+        dob_raw = csv_cell(row, "Date of Birth", "date_of_birth")
+        gender_raw = csv_cell(row, "Gender", "gender")
+        emerg_raw = csv_cell(row, "Emergency Contact")
+        emerg_name, emerg_rel = parse_emergency_contact(emerg_raw)
+        if not emerg_name:
             emerg_name = csv_cell(row, "emergency_contact_name") or None
             emerg_rel = csv_cell(row, "emergency_contact_relationship") or None
-            if not emerg_name:
-                emerg_name, emerg_rel = parse_emergency_contact(csv_cell(row, "Emergency Contact"))
-            emerg_phone = csv_cell(row, "emergency_contact_phone", "Emergency Contact Number") or None
-            email = csv_cell(row, "email") or None
-            health_notes = csv_cell(row, "health_notes") or None
-            disc = csv_cell(row, "disclaimer_accepted") or "1"
-            face = csv_cell(row, "face_id_external") or None
-            balance_raw = csv_cell(row, "lesson_balance") or "0"
+        emerg_phone = csv_cell(row, "Emergency Contact Number", "emergency_contact_phone") or None
+        email = csv_cell(row, "email") or None
+        health_notes = csv_cell(row, "health_notes") or None
+        disc = csv_cell(row, "disclaimer_accepted") or "1"
+        wa_raw = csv_cell(row, "whatsapp_reminder_opt_in")
+        face = csv_cell(row, "face_id_external") or None
+        balance_raw = csv_cell(row, "lesson_balance") or "0"
 
         hkid_norm = normalize_hkid(hkid_raw) if hkid_raw else None
-        dob = parse_flexible_date(dob_raw)
-        if dob_raw and dob is None:
-            skipped += 1
-            continue
+        # Incomplete DOB should not block import — leave null
+        dob = parse_flexible_date(dob_raw) if dob_raw else None
         gender = normalize_gender(gender_raw)
         disc_bool = disc.strip().lower() in ("1", "true", "yes", "y")
+        wa_bool = True if not wa_raw else wa_raw.strip().lower() in ("1", "true", "yes", "y")
         try:
             balance = int(balance_raw.strip() or 0)
         except ValueError:
@@ -5973,10 +6026,15 @@ def import_students_csv(
         if existing is not None:
             csv_name_key = _normalize_student_csv_name(full_name)
             if not csv_name_key:
-                skipped += 1
+                _skip(row_idx, "missing_name", phone=phone_raw)
                 continue
             if _normalize_student_csv_name(existing.full_name) != csv_name_key:
-                skipped += 1
+                _skip(
+                    row_idx,
+                    f"phone_exists_name_mismatch (db={existing.full_name})",
+                    name=full_name,
+                    phone=phone_raw,
+                )
                 continue
             if full_name:
                 existing.full_name = full_name.strip()
@@ -5987,7 +6045,7 @@ def import_students_csv(
                     .first()
                 )
                 if other_hk:
-                    skipped += 1
+                    _skip(row_idx, "hkid_conflict", name=full_name, phone=phone_raw)
                     continue
                 existing.hkid = hkid_norm
             if dob is not None:
@@ -6003,6 +6061,8 @@ def import_students_csv(
             existing.email = email
             existing.health_notes = health_notes
             existing.disclaimer_accepted = disc_bool
+            if wa_raw:
+                _set_whatsapp_reminder_opt_in(existing, wa_bool)
             ledger_sum = _lesson_balance_sum(db, existing.id)
             adj = int(balance) - ledger_sum
             if adj != 0:
@@ -6022,15 +6082,18 @@ def import_students_csv(
             updated += 1
             continue
 
-        if not full_name or not local_eight:
-            skipped += 1
+        if not full_name:
+            _skip(row_idx, "missing_name", phone=phone_raw)
+            continue
+        if not local_eight:
+            _skip(row_idx, "missing_phone", name=full_name)
             continue
 
         canonical = f"+852{local_eight}"
         if hkid_norm:
             hk_dup = db.query(Student).filter(active_students_sq, Student.hkid == hkid_norm).first()
             if hk_dup:
-                skipped += 1
+                _skip(row_idx, "hkid_conflict", name=full_name, phone=phone_raw)
                 continue
 
         st = Student(
@@ -6042,6 +6105,8 @@ def import_students_csv(
             email=email,
             health_notes=health_notes,
             disclaimer_accepted=disc_bool if csv_cell(row, "disclaimer_accepted") else True,
+            whatsapp_reminder_opt_in=wa_bool,
+            whatsapp_reminder_opt_in_at=datetime.utcnow() if wa_bool else None,
             face_id_external=face,
             emergency_contact_name=emerg_name,
             emergency_contact_relationship=emerg_rel,
@@ -6063,7 +6128,13 @@ def import_students_csv(
         added += 1
 
     db.commit()
-    return {"imported": added, "updated": updated, "skipped": skipped, "format": "fung" if fung_mode else "system"}
+    return {
+        "imported": added,
+        "updated": updated,
+        "skipped": skipped,
+        "format": "fung" if fung_mode else "system",
+        "skip_reasons": skip_reasons,
+    }
 
 
 @app.delete("/api/admin/students/{student_id}")

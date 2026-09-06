@@ -45,19 +45,34 @@ def test_header_detect():
     assert not is_fung_payment_headers(["student_phone", "amount"])
 
 
-def test_xlsx_first_sheet_to_csv():
+def test_xlsx_prefers_student_sheet():
     from openpyxl import Workbook
+
+    wb = Workbook()
+    pay = wb.active
+    pay.title = "工作表1"
+    pay.append(["電話號碼", "收費", "付款方法"])
+    pay.append(["91111111", "100", "FPS"])
+    stu = wb.create_sheet("學生資料")
+    stu.append(["Name", "Gender", "phone number"])
+    stu.append(["Belle", "女", "92222222"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    text = upload_bytes_to_csv_text(buf.getvalue(), "fung.xlsx", prefer_student_sheet=True)
+    assert "Belle" in text
+    assert "FPS" not in text
+
+
+def test_xlsx_rejects_payment_only_workbook():
+    from openpyxl import Workbook
+    import pytest
 
     wb = Workbook()
     ws = wb.active
     ws.title = "工作表1"
-    ws.append(["Name", "Gender", "phone number"])
-    ws.append(["Ada", "女", "9123 4567"])
-    ws2 = wb.create_sheet("學生資料")
-    ws2.append(["ignored"])
+    ws.append(["電話號碼", "收費", "付款方法", "課程"])
+    ws.append(["91111111", "100", "FPS", "1:1 10堂"])
     buf = io.BytesIO()
     wb.save(buf)
-    text = upload_bytes_to_csv_text(buf.getvalue(), "students.xlsx")
-    assert "Name" in text and "Gender" in text
-    assert "Ada" in text
-    assert "ignored" not in text
+    with pytest.raises(ValueError, match="收錢"):
+        upload_bytes_to_csv_text(buf.getvalue(), "pay.xlsx", prefer_student_sheet=True)

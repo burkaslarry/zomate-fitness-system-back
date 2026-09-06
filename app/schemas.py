@@ -94,6 +94,7 @@ class RenewalCreate(BaseModel):
     applicant_name: str = Field(min_length=1, max_length=120)
     signature: str = Field(min_length=1, max_length=120)
     renewal_date: date
+    whatsapp_reminder_opt_in: bool = True
 
 
 class MemberCreate(BaseModel):
@@ -113,6 +114,7 @@ class MemberCreate(BaseModel):
     pdpo_acknowledged: bool = True
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
+    whatsapp_reminder_opt_in: bool = False
     digital_signature: str = Field(min_length=20, max_length=400_000)
     coach_id: int | None = Field(default=None, ge=1)
     coach_username: str | None = Field(default=None, min_length=1, max_length=120)
@@ -129,6 +131,8 @@ class MemberCreate(BaseModel):
     def validate_ack_and_clearance(self) -> "MemberCreate":
         if not self.pdpo_acknowledged or not self.cooling_off_acknowledged or not self.disclaimer_accepted:
             raise ValueError("請確認收集個人資料聲明、冷靜期條款及免責聲明。")
+        if not self.whatsapp_reminder_opt_in:
+            raise ValueError("請同意接收 WhatsApp 預約確認及上課提醒。")
         return self
 
 
