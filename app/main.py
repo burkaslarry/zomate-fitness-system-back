@@ -1764,7 +1764,10 @@ def _migrate_management_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS photo_path VARCHAR(512) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS signature_image_url VARCHAR(512) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS signature_image_blob BYTEA NULL",
-        "CREATE UNIQUE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
+        # Phone remains the unique member key; HKID may repeat (簡填 / family).
+        "DROP INDEX IF EXISTS ix_zomate_fs_students_hkid",
+        "ALTER TABLE zomate_fs_students DROP CONSTRAINT IF EXISTS zomate_fs_students_hkid_key",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS specialty VARCHAR(160) NULL",
         "ALTER TABLE zomate_fs_coaches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS package_id INTEGER NULL REFERENCES zomate_fs_packages(id)",
@@ -1794,6 +1797,10 @@ def _migrate_member_profile_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR(80) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in BOOLEAN NOT NULL DEFAULT TRUE",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in_at TIMESTAMP NULL",
+        # [F001][S003] HKID not unique — phone is the unique key.
+        "DROP INDEX IF EXISTS ix_zomate_fs_students_hkid",
+        "ALTER TABLE zomate_fs_students DROP CONSTRAINT IF EXISTS zomate_fs_students_hkid_key",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_students_hkid ON zomate_fs_students (hkid)",
     ]
     try:
         for s in stmts:
@@ -2546,16 +2553,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     existing = (
         db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first()
     )
-    if hkid and (
-        db.query(Student)
-        .filter(
-            Student.hkid == hkid,
-            ~Student.phone.in_(phone_vars),
-            ~Student.id.in_(deleted_ids_sq),
-        )
-        .first()
-    ):
-        raise HTTPException(status_code=409, detail="HKID already registered.")
+    # HKID is not unique — only phone blocks duplicate registration.
     expiry_iso = _membership_expiry_iso(payload.package_sessions)
 
     if existing is not None and _is_deleted(db, "students", existing.id):
@@ -2664,16 +2662,12 @@ def member_duplicate_check(payload: MemberProspectDupCheck, db: Session = Depend
             detail="電話須為香港 8 位手機號碼（預設 +852，只可填數字八位亦可）。",
         )
     variants = _hk_phone_lookup_variants(phone_local)
-    dup_hkid = base.filter(Student.hkid == hkid_n).first()
     dup_phone = base.filter(Student.phone.in_(variants)).first()
-    if dup_hkid or dup_phone:
-        parts: list[str] = []
-        if dup_hkid:
-            parts.append("此證件號碼（HKID／簡填格式）已被登記")
-        if dup_phone:
-            parts.append("此電話號碼已被登記")
-        message = "；".join(parts) + "。請改用「續會」或聯絡櫃台。"
-        return {"blocked": True, "message": message}
+    if dup_phone:
+        return {
+            "blocked": True,
+            "message": "此電話號碼已被登記。請改用「續會」或聯絡櫃台。",
+        }
     return {"blocked": False, "message": None}
 
 
@@ -2715,8 +2709,7 @@ def _create_member_impl(
     if not eco_raw:
         raise HTTPException(status_code=400, detail="緊急聯絡電話須為香港 8 位手機號碼。")
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
-    if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.hkid == hkid).first():
-        raise HTTPException(status_code=409, detail="HKID already registered.")
+    # HKID may repeat; phone is the unique identity key.
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
         raise HTTPException(status_code=409, detail="Phone already registered.")
 
@@ -6039,14 +6032,6 @@ def import_students_csv(
             if full_name:
                 existing.full_name = full_name.strip()
             if hkid_norm:
-                other_hk = (
-                    db.query(Student)
-                    .filter(active_students_sq, Student.hkid == hkid_norm, Student.id != existing.id)
-                    .first()
-                )
-                if other_hk:
-                    _skip(row_idx, "hkid_conflict", name=full_name, phone=phone_raw)
-                    continue
                 existing.hkid = hkid_norm
             if dob is not None:
                 existing.date_of_birth = dob
@@ -6090,11 +6075,6 @@ def import_students_csv(
             continue
 
         canonical = f"+852{local_eight}"
-        if hkid_norm:
-            hk_dup = db.query(Student).filter(active_students_sq, Student.hkid == hkid_norm).first()
-            if hk_dup:
-                _skip(row_idx, "hkid_conflict", name=full_name, phone=phone_raw)
-                continue
 
         st = Student(
             full_name=full_name,

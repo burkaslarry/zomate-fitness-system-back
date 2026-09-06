@@ -104,7 +104,7 @@ class Student(Base):
     chinese_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     nickname: Mapped[str | None] = mapped_column(String(80), nullable=True)
     gender: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True, index=True)
+    hkid: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=False, index=True)
     phone: Mapped[str] = mapped_column(String(30), nullable=False, unique=True, index=True)
     email: Mapped[str | None] = mapped_column(String(120), nullable=True)
     # [F001][S001] Required client onboarding identity field; nullable keeps existing records deployable.
