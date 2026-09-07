@@ -330,6 +330,50 @@ def xls_first_sheet_to_csv(raw: bytes) -> str:
     return _rows_to_csv_text(rows)
 
 
+def _zip_is_apple_numbers(raw: bytes) -> bool:
+    """[F001][S003] Apple Numbers (.numbers) is ZIP-based but not openpyxl-compatible."""
+    if not _is_xlsx_bytes(raw):
+        return False
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            names = z.namelist()
+            if any(n.startswith("Index/") for n in names):
+                return True
+            if any(n.endswith(".iwa") for n in names) and not any(
+                n.startswith("xl/") for n in names
+            ):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def fix_fung_student_csv_headers(raw: str) -> str:
+    """[F001][S003] Normalize Fung/Numbers quirks: Member Code alias, duplicate Emergency Contact."""
+    buf = io.StringIO(raw)
+    rows = list(csv.reader(buf))
+    if not rows:
+        return raw
+    header = rows[0]
+    ec_count = 0
+    for i, cell in enumerate(header):
+        key = (cell or "").strip().lstrip("\ufeff")
+        header[i] = key
+        lower = key.lower()
+        if lower in ("member code", "mem code", "membercode"):
+            header[i] = "MemberCode"
+        if key == "Emergency Contact":
+            ec_count += 1
+            if ec_count >= 2:
+                header[i] = "Emergency Contact Number"
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerows(rows)
+    return out.getvalue()
+
+
 def upload_bytes_to_csv_text(
     raw: bytes,
     filename: str | None = None,
@@ -338,6 +382,12 @@ def upload_bytes_to_csv_text(
 ) -> str:
     """[F001][S003] CSV passthrough, or convert .xlsx / .xls sheet to CSV text."""
     name = (filename or "").lower().strip()
+    if name.endswith(".numbers") or _zip_is_apple_numbers(raw):
+        raise ValueError(
+            "Apple Numbers（.numbers）唔可以直接匯入。"
+            "請在 Numbers 選「檔案 → 輸出至 → Excel…」或「CSV…」，"
+            "匯出後喺「學生管理 → 匯入 CSV／Excel」再上傳。"
+        )
     if name.endswith((".xlsx", ".xlsm")) or (
         not name.endswith((".csv", ".txt", ".xls")) and _is_xlsx_bytes(raw)
     ):

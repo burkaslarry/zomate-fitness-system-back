@@ -40,6 +40,7 @@ from .excel_csv_compat import (
     FUNG_PAYMENT_HEADERS,
     FUNG_STUDENT_HEADERS,
     csv_cell,
+    fix_fung_student_csv_headers,
     format_emergency_contact,
     gender_label_zh,
     is_fung_payment_headers,
@@ -1109,6 +1110,41 @@ def normalize_hk_phone_local_eight(raw: str | None) -> str | None:
 def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
     """比對資料庫內現有紀錄可能存 8 位、+852 或 852 前置。"""
     return [local_eight, f"+852{local_eight}", f"852{local_eight}"]
+
+
+def _student_import_has_name_column(fieldnames: list[str]) -> bool:
+    """[F001][S003] Detect whether uploaded headers include a student name column."""
+    keys = {(h or "").strip().lstrip("\ufeff").lower() for h in fieldnames if h}
+    return bool(keys & {"name", "full_name", "會員", "姓名"})
+
+
+def _student_import_skip_message(
+    row_no: int,
+    code: str,
+    *,
+    field: str = "",
+    name: str = "",
+    phone: str = "",
+    detail: str = "",
+) -> str:
+    """[F001][S003] Human-readable skip reason for admin import feedback."""
+    labels = {
+        "missing_name": "缺少姓名",
+        "missing_phone": "缺少有效電話",
+        "phone_exists_name_mismatch": "電話已存在但姓名唔同",
+    }
+    parts = [f"第{row_no}行", labels.get(code, code)]
+    if field:
+        parts.append(f"欄位「{field}」")
+    if phone:
+        parts.append(f"電話 {phone}")
+    if name:
+        parts.append(f"CSV 姓名 {name}")
+    if detail:
+        parts.append(detail)
+    head = "：".join(parts[:2])
+    tail = "；".join(parts[2:])
+    return f"{head} — {tail}" if tail else head
 
 
 def _normalize_student_csv_name(name: str | None) -> str:
@@ -5953,6 +5989,7 @@ def import_students_csv(
     raw_bytes = file.file.read()
     try:
         raw = upload_bytes_to_csv_text(raw_bytes, file.filename, prefer_student_sheet=True)
+        raw = fix_fung_student_csv_headers(raw)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -5964,6 +6001,14 @@ def import_students_csv(
             status_code=400,
             detail="此檔似係收錢紀錄，唔係學生名單。請用「學生資料」sheet 或學生範本再匯入。",
         )
+    if not _student_import_has_name_column(fieldnames):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "搵唔到姓名欄。請確認第一行表頭包含 Name、full_name 或 姓名。"
+                f" 目前讀到：{', '.join(h for h in fieldnames[:12] if h) or '（空白）'}"
+            ),
+        )
     added = 0
     updated = 0
     skipped = 0
@@ -5971,18 +6016,38 @@ def import_students_csv(
     active_students_sq = ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
     fung_mode = is_fung_student_headers(fieldnames)
 
-    def _skip(row_no: int, reason: str, *, name: str = "", phone: str = "") -> None:
+    def _skip(
+        row_no: int,
+        code: str,
+        *,
+        field: str = "",
+        name: str = "",
+        phone: str = "",
+        detail: str = "",
+    ) -> None:
         nonlocal skipped
         skipped += 1
         if len(skip_reasons) < 20:
             skip_reasons.append(
-                {"row": row_no, "reason": reason, "name": name or None, "phone": phone or None}
+                {
+                    "row": row_no,
+                    "code": code,
+                    "field": field or None,
+                    "reason": code,
+                    "message": _student_import_skip_message(
+                        row_no, code, field=field, name=name, phone=phone, detail=detail
+                    ),
+                    "name": name or None,
+                    "phone": phone or None,
+                }
             )
 
     for row_idx, row in enumerate(reader, start=2):
         full_name = csv_cell(row, "Name", "full_name", "會員", "姓名")
-        phone_raw = csv_cell(row, "phone number", "phone", "電話號碼", "MemberCode")
+        phone_raw = csv_cell(row, "phone number", "phone", "電話號碼", "MemberCode", "Member Code")
         hkid_raw = csv_cell(row, "ID Number", "hkid")
+        if not full_name and not phone_raw and not hkid_raw:
+            continue
         dob_raw = csv_cell(row, "Date of Birth", "date_of_birth")
         gender_raw = csv_cell(row, "Gender", "gender")
         emerg_raw = csv_cell(row, "Emergency Contact")
@@ -5991,6 +6056,10 @@ def import_students_csv(
             emerg_name = csv_cell(row, "emergency_contact_name") or None
             emerg_rel = csv_cell(row, "emergency_contact_relationship") or None
         emerg_phone = csv_cell(row, "Emergency Contact Number", "emergency_contact_phone") or None
+        if not emerg_phone and emerg_raw and re.sub(r"\D", "", emerg_raw).isdigit():
+            emerg_phone = re.sub(r"\D", "", emerg_raw)
+            emerg_raw = ""
+            emerg_name, emerg_rel = None, None
         email = csv_cell(row, "email") or None
         health_notes = csv_cell(row, "health_notes") or None
         disc = csv_cell(row, "disclaimer_accepted") or "1"
@@ -6019,14 +6088,22 @@ def import_students_csv(
         if existing is not None:
             csv_name_key = _normalize_student_csv_name(full_name)
             if not csv_name_key:
-                _skip(row_idx, "missing_name", phone=phone_raw)
+                _skip(
+                    row_idx,
+                    "missing_name",
+                    field="Name / full_name / 姓名",
+                    phone=phone_raw,
+                    detail="電話已在系統，但 CSV 姓名欄空白",
+                )
                 continue
             if _normalize_student_csv_name(existing.full_name) != csv_name_key:
                 _skip(
                     row_idx,
-                    f"phone_exists_name_mismatch (db={existing.full_name})",
+                    "phone_exists_name_mismatch",
+                    field="Name / phone number",
                     name=full_name,
                     phone=phone_raw,
+                    detail=f"系統已有 {existing.full_name}",
                 )
                 continue
             if full_name:
@@ -6068,10 +6145,22 @@ def import_students_csv(
             continue
 
         if not full_name:
-            _skip(row_idx, "missing_name", phone=phone_raw)
+            _skip(
+                row_idx,
+                "missing_name",
+                field="Name / full_name / 姓名",
+                phone=phone_raw,
+                detail="請填學員姓名",
+            )
             continue
         if not local_eight:
-            _skip(row_idx, "missing_phone", name=full_name)
+            _skip(
+                row_idx,
+                "missing_phone",
+                field="phone number / MemberCode",
+                name=full_name,
+                detail="須為香港 8 位數字",
+            )
             continue
 
         canonical = f"+852{local_eight}"
