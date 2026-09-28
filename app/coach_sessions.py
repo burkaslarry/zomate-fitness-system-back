@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, time
 from sqlalchemy.orm import Session, joinedload
 
 from .enrollment_schedule import get_lesson_dates_for_enrollment
-from .models import Attendance, CategoryEnrollment, CourseCategory, CourseEnrollment
+from .models import Attendance, CategoryEnrollment, CourseCategory, CourseEnrollment, CourseSessionOverride
 from .timezone import hk_calendar_date, now_hk, utc_to_hk
 
 
@@ -114,6 +114,15 @@ def build_coach_session_rows(
     filter_cats = set(category_ids) if category_ids else None
     skill_ids = set(coach_skill_category_ids(db, coach_id))
     rows: list[dict] = []
+    enrollment_ids = [enr.id for enr in enrollments]
+    overrides: dict[tuple[int, date], CourseSessionOverride] = {}
+    if enrollment_ids:
+        for override in (
+            db.query(CourseSessionOverride)
+            .filter(CourseSessionOverride.enrollment_id.in_(enrollment_ids))
+            .all()
+        ):
+            overrides[(override.enrollment_id, override.original_date)] = override
 
     for enr in enrollments:
         cat_id, cat_name = resolve_enrollment_category(db, enr, skill_ids=skill_ids)
@@ -130,18 +139,30 @@ def build_coach_session_rows(
         except (TypeError, ValueError):
             total_lessons = max(1, len(lesson_dates))
 
-        for session_date in lesson_dates:
+        for original_date in lesson_dates:
+            override = overrides.get((enr.id, original_date))
+            if override and override.action == "cancelled":
+                continue
+
+            session_date = original_date
+            start_dt = datetime.combine(original_date, enr.scheduled_start.time())
+            end_dt = datetime.combine(original_date, enr.scheduled_end.time())
+            override_label: str | None = None
+            if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
+                session_date = override.rescheduled_start.date()
+                start_dt = override.rescheduled_start
+                end_dt = override.rescheduled_end
+                override_label = "rescheduled"
+
             if day is not None and session_date != day:
                 continue
             if from_date is not None and to_date is not None:
                 if session_date < from_date or session_date > to_date:
                     continue
 
-            interval = enrollment_interval_on_date(enr, session_date)
-            if interval is None:
-                continue
-            start_dt, end_dt = interval
-            lesson_no = lesson_dates.index(session_date) + 1 if session_date in lesson_dates else None
+            if end_dt <= start_dt:
+                end_dt = start_dt + timedelta(hours=1)
+            lesson_no = lesson_dates.index(original_date) + 1
 
             rows.append(
                 {
@@ -167,6 +188,8 @@ def build_coach_session_rows(
                     "course_title": enr.title,
                     "lesson_no": lesson_no,
                     "total_lessons": total_lessons,
+                    "original_session_date": original_date.isoformat(),
+                    "session_override": override_label,
                 }
             )
 

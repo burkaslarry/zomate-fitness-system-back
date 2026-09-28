@@ -73,6 +73,7 @@ from .models import (
     CoachSkill,
     CourseCategory,
     CourseEnrollment,
+    CourseSessionOverride,
     DeletedRecord,
     Expense,
     InstallmentPayment,
@@ -115,6 +116,8 @@ from .schemas import (
     CoachAttendanceReportRowOut,
     CoachBookSession,
     CoachEnrollmentCancelBody,
+    CoachSessionCancelBody,
+    CoachSessionRescheduleBody,
     CoachTrialGrantBody,
     CoachUpdate,
     CourseCategoryCreate,
@@ -184,7 +187,6 @@ from .payment_records import (
     student_onboarding_coach,
 )
 from .enrollment_schedule import (
-    enrollment_active_at_now,
     enrollment_to_out,
     enumerate_lesson_dates,
     get_lesson_dates_for_enrollment,
@@ -684,8 +686,81 @@ def _enrollment_interval_on_date(enr: CourseEnrollment, day: date) -> tuple[date
     return start, end
 
 
+def _session_policy_now() -> datetime:
+    """[F003][S004] Current HKT wall clock for 72h booking / 24h change rules."""
+    return now_hk().replace(tzinfo=None)
+
+
+def _assert_booking_notice(start: datetime) -> None:
+    """[F003][S004] New bookings and replacement slots require at least 72 hours' notice."""
+    if start < _session_policy_now() + timedelta(hours=72):
+        raise HTTPException(status_code=400, detail="預約必須最少提前 72 小時。")
+
+
+def _assert_change_notice(start: datetime) -> None:
+    """[F003][S004] Changes/cancellations require at least 24 hours' notice."""
+    if start < _session_policy_now() + timedelta(hours=24):
+        raise HTTPException(status_code=400, detail="改期或取消必須最少提前 24 小時；逾時請聯絡管理員處理。")
+
+
+def _session_override_map(db: Session, enrollment_id: int) -> dict[date, CourseSessionOverride]:
+    """[F003][S009] Session exceptions keyed by the immutable original lesson date."""
+    return {
+        row.original_date: row
+        for row in db.query(CourseSessionOverride)
+        .filter(CourseSessionOverride.enrollment_id == enrollment_id)
+        .all()
+    }
+
+
+def _effective_intervals_for_enrollment_on_day(
+    db: Session, enr: CourseEnrollment, day: date
+) -> list[tuple[datetime, datetime, date]]:
+    """[F003][S009] Effective slots on a day after one-lesson cancel/reschedule overrides."""
+    overrides = _session_override_map(db, enr.id)
+    slots: list[tuple[datetime, datetime, date]] = []
+    for original_date in get_lesson_dates_for_enrollment(enr):
+        override = overrides.get(original_date)
+        if override and override.action == "cancelled":
+            continue
+        if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
+            if override.rescheduled_start.date() == day:
+                slots.append((override.rescheduled_start, override.rescheduled_end, original_date))
+            continue
+        if original_date == day:
+            start = datetime.combine(day, enr.scheduled_start.time())
+            end = datetime.combine(day, enr.scheduled_end.time())
+            if end <= start:
+                end = start + timedelta(hours=1)
+            slots.append((start, end, original_date))
+    return slots
+
+
+def _next_effective_session_start(db: Session, enr: CourseEnrollment) -> datetime | None:
+    """[F003][S009] Find the next uncancelled lesson, including rescheduled overrides."""
+    now = _session_policy_now()
+    overrides = _session_override_map(db, enr.id)
+    starts: list[datetime] = []
+    for original_date in get_lesson_dates_for_enrollment(enr):
+        override = overrides.get(original_date)
+        if override and override.action == "cancelled":
+            continue
+        if override and override.action == "rescheduled" and override.rescheduled_start:
+            start = override.rescheduled_start
+        else:
+            start = datetime.combine(original_date, enr.scheduled_start.time())
+        if start >= now:
+            starts.append(start)
+    return min(starts) if starts else None
+
+
 def _coach_confirmed_intervals_on_day(
-    db: Session, coach_id: int, day: date, *, exclude_enrollment_id: int | None = None
+    db: Session,
+    coach_id: int,
+    day: date,
+    *,
+    exclude_enrollment_id: int | None = None,
+    exclude_original_date: date | None = None,
 ) -> list[tuple[datetime, datetime]]:
     deleted_e = _deleted_course_enrollment_ids()
     rows = (
@@ -699,11 +774,14 @@ def _coach_confirmed_intervals_on_day(
     )
     out: list[tuple[datetime, datetime]] = []
     for enr in rows:
-        if exclude_enrollment_id is not None and enr.id == exclude_enrollment_id:
-            continue
-        slot = _enrollment_interval_on_date(enr, day)
-        if slot:
-            out.append(slot)
+        for start, end, original_date in _effective_intervals_for_enrollment_on_day(db, enr, day):
+            if (
+                exclude_enrollment_id is not None
+                and enr.id == exclude_enrollment_id
+                and (exclude_original_date is None or original_date == exclude_original_date)
+            ):
+                continue
+            out.append((start, end))
     return out
 
 
@@ -715,9 +793,14 @@ def _assert_coach_slot_available(
     end: datetime,
     *,
     exclude_enrollment_id: int | None = None,
+    exclude_original_date: date | None = None,
 ) -> None:
     for a0, a1 in _coach_confirmed_intervals_on_day(
-        db, coach_id, day, exclude_enrollment_id=exclude_enrollment_id
+        db,
+        coach_id,
+        day,
+        exclude_enrollment_id=exclude_enrollment_id,
+        exclude_original_date=exclude_original_date,
     ):
         if start < a1 and a0 < end:
             raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
@@ -2105,19 +2188,20 @@ def resolve_today_primary_enrollment_for_student(
         )
         .all()
     )
-    candidates: list[tuple[CourseEnrollment, Coach]] = []
+    candidates: list[tuple[CourseEnrollment, Coach, datetime, datetime]] = []
+    now_naive = now.replace(tzinfo=None)
     for enr in rows:
         coach = enr.coach
-        if coach and enrollment_active_at_now(enr, now):
-            candidates.append((enr, coach))
+        if not coach:
+            continue
+        for start, end, _original_date in _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
+            if start <= now_naive <= end:
+                candidates.append((enr, coach, start, end))
     if not candidates:
         return None, None
     if len(candidates) == 1:
         return candidates[0][0], candidates[0][1]
-    for enr, coach in candidates:
-        if enr.scheduled_start <= now <= enr.scheduled_end:
-            return enr, coach
-    best = min(candidates, key=lambda r: abs((r[0].scheduled_start - now).total_seconds()))
+    best = min(candidates, key=lambda r: abs((r[2] - now_naive).total_seconds()))
     return best[0], best[1]
 
 
@@ -2140,7 +2224,7 @@ def resolve_checkin_pin_context(
             continue
         if not _segment_paid_for_matched_pin(enr, pin):
             return "blocked_installment_unpaid"
-        if now.date() in get_lesson_dates_for_enrollment(enr):
+        if _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
             return enr, enr.coach, "class_pin"
         return None
     return None
@@ -2506,18 +2590,20 @@ def public_student_today_lessons(
     )
     out: list[dict] = []
     for enr in rows:
-        if today not in get_lesson_dates_for_enrollment(enr):
+        slots = _effective_intervals_for_enrollment_on_day(db, enr, today)
+        if not slots:
             continue
         coach = enr.coach
-        out.append(
-            {
-                "course_id": enr.id,
-                "title": enr.title or "Course",
-                "coach_name": coach.full_name if coach else "—",
-                "scheduled_start": enr.scheduled_start.isoformat(),
-                "scheduled_end": enr.scheduled_end.isoformat(),
-            }
-        )
+        for start, end, _original_date in slots:
+            out.append(
+                {
+                    "course_id": enr.id,
+                    "title": enr.title or "Course",
+                    "coach_name": coach.full_name if coach else "—",
+                    "scheduled_start": start.isoformat(),
+                    "scheduled_end": end.isoformat(),
+                }
+            )
     out.sort(key=lambda x: x["scheduled_start"])
     return out
 
@@ -2678,7 +2764,12 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         db,
         student,
         phone_raw,
-        f"歡迎 {student.full_name}！已存入 {payload.package_sessions} 堂。簽到請使用課程專屬 PIN（報名課程後將以 WhatsApp 發送）。",
+        (
+            f"歡迎 {student.full_name}！已存入 {payload.package_sessions} 堂。"
+            "簽到請使用課程專屬 PIN（報名課程後將以 WhatsApp 發送）。\n\n"
+            "預約須最少提前 72 小時；改期或取消須最少於課堂開始前 24 小時通知，"
+            "否則照計一堂及不設補堂。"
+        ),
     )
     db.commit()
     db.refresh(student)
@@ -6672,7 +6763,9 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
             f"課堂確認：{payload.title} @ {branch.name} "
             f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
             f"{pin_txt}"
-            f" 餘額已加 {credit_delta} 堂（套餐堂數），現有 {bal_msg} 堂。"
+            f" 餘額已加 {credit_delta} 堂（套餐堂數），現有 {bal_msg} 堂。\n\n"
+            "預約須最少提前 72 小時；改期或取消須最少於課堂開始前 24 小時通知，"
+            "否則照計一堂及不設補堂。"
         )
         log_whatsapp(db, student, student.phone, msg)
 
@@ -6955,17 +7048,13 @@ def _coach_enrollments_for_sessions(
         .all()
     )
     if day:
-        return [e for e in rows_raw if day in get_lesson_dates_for_enrollment(e)][:400]
+        # [F003][S009] Keep all enrollments here: a rescheduled override may move a lesson onto ``day``.
+        return rows_raw[:800]
     if from_date is not None and to_date is not None:
         if to_date < from_date:
             raise HTTPException(status_code=400, detail="to_date must be >= from_date.")
-        picked: list[CourseEnrollment] = []
-        for enr in rows_raw:
-            for ld in get_lesson_dates_for_enrollment(enr):
-                if from_date <= ld <= to_date:
-                    picked.append(enr)
-                    break
-        return picked[:400]
+        # Filtering happens after session overrides are applied in ``build_coach_session_rows``.
+        return rows_raw[:800]
     return rows_raw[:200]
 
 
@@ -7730,7 +7819,7 @@ def coach_book_session(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> CourseOut:
-    """[F003][S007] Coach books (pending) or reschedules (confirmed) 0.5–2h with conflict guard."""
+    """[F003][S007] Coach books a pending enrollment; confirmed lessons use the one-session API."""
     confirm_payload = CoachScheduleConfirm(
         coach_id=payload.coach_id,
         enrollment_id=payload.enrollment_id,
@@ -7750,27 +7839,18 @@ def coach_book_session(
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    if enr.coach_time_confirmed:
+        raise HTTPException(status_code=400, detail="請喺日曆揀指定一堂改期；系統不會一次改動整個課程。")
     start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
+    _assert_booking_notice(start)
     _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
-    if not enr.coach_time_confirmed:
-        return coach_confirm_enrollment_schedule(
-            enrollment_id=payload.enrollment_id,
-            payload=confirm_payload,
-            db=db,
-            user=user,
-        )
-    enr.scheduled_start = start
-    enr.scheduled_end = end
-    db.commit()
-    full = (
-        db.query(CourseEnrollment)
-        .options(*_enrollment_load_options())
-        .filter(CourseEnrollment.id == enr.id)
-        .first()
+    return coach_confirm_enrollment_schedule(
+        enrollment_id=payload.enrollment_id,
+        payload=confirm_payload,
+        db=db,
+        user=user,
     )
-    assert full is not None
-    return enrollment_to_out(full)
 
 
 @app.post("/api/coach/enrollments/{enrollment_id}/confirm-schedule", response_model=CourseOut)
@@ -7799,6 +7879,7 @@ def coach_confirm_enrollment_schedule(
     first_day = payload.day
     start = datetime.combine(first_day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
+    _assert_booking_notice(start)
     _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id)
     # [F003][S002] First booking uses coach-picked calendar day (not legacy placeholder weekday).
     ws_raw = [first_day.weekday()]
@@ -7811,6 +7892,28 @@ def coach_confirm_enrollment_schedule(
     enr.scheduled_start = datetime.combine(first_day, start.time())
     enr.scheduled_end = datetime.combine(first_day, end.time())
     enr.coach_time_confirmed = True
+    booking_message = (
+        f"【Zomate Fitness】預約確認：{enr.title}\n"
+        f"日期時間：{start.strftime('%Y-%m-%d %H:%M')}–{end.strftime('%H:%M')}\n"
+        f"課堂 PIN：{enr.checkin_pin}\n\n"
+        "預約須最少提前 72 小時；如需改期或取消，請最少於課堂開始前 24 小時通知，"
+        "否則將照計一堂及不設補堂。"
+    )
+    log_whatsapp(
+        db,
+        enr.student,
+        enr.student.phone,
+        booking_message,
+        template_key="booking_confirmation",
+        template_context={
+            "student_name": enr.student.full_name,
+            "course_title": enr.title,
+            "lesson_date": start.strftime("%Y-%m-%d"),
+            "lesson_time": f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}",
+            "pin": enr.checkin_pin,
+        },
+    )
+    record_activity(db, enr.student, "coach_confirm_schedule", enr.id)
     db.commit()
     full = (
         db.query(CourseEnrollment)
@@ -7841,10 +7944,180 @@ def coach_cancel_enrollment(
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    next_session_start = _next_effective_session_start(db, enr)
+    if next_session_start is not None:
+        _assert_change_notice(next_session_start)
     _record_soft_delete(db, "course_enrollments", enr.id, user)
     record_activity(db, enr.student, "coach_cancel_enrollment", enr.id)
     db.commit()
     return {"ok": True, "enrollment_id": enr.id}
+
+
+def _require_enrollment_session(
+    db: Session,
+    user: AppUser,
+    enrollment_id: int,
+    original_date: date,
+    coach_id: int | None,
+) -> tuple[int, CourseEnrollment, CourseSessionOverride | None, datetime, datetime]:
+    """[F003][S009] Resolve one immutable series date and its current effective slot."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    enr = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == enrollment_id)
+        .first()
+    )
+    if not enr or _is_deleted(db, "course_enrollments", enrollment_id):
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    if enr.coach_id != cid:
+        raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    if original_date not in get_lesson_dates_for_enrollment(enr):
+        raise HTTPException(status_code=404, detail="Lesson date not found in this course.")
+    override = (
+        db.query(CourseSessionOverride)
+        .filter(
+            CourseSessionOverride.enrollment_id == enrollment_id,
+            CourseSessionOverride.original_date == original_date,
+        )
+        .first()
+    )
+    if override and override.action == "cancelled":
+        raise HTTPException(status_code=409, detail="This lesson is already cancelled.")
+    start = datetime.combine(original_date, enr.scheduled_start.time())
+    end = datetime.combine(original_date, enr.scheduled_end.time())
+    if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
+        start = override.rescheduled_start
+        end = override.rescheduled_end
+    return cid, enr, override, start, end
+
+
+@app.patch("/api/coach/enrollments/{enrollment_id}/sessions/{original_date}/reschedule")
+def coach_reschedule_one_session(
+    enrollment_id: int,
+    original_date: date,
+    payload: CoachSessionRescheduleBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F003][S009] Reschedule one lesson only; preserve PIN, package and all other dates."""
+    cid, enr, override, current_start, _current_end = _require_enrollment_session(
+        db, user, enrollment_id, original_date, payload.coach_id
+    )
+    _assert_change_notice(current_start)
+    _assert_booking_notice(payload.scheduled_start)
+    _assert_coach_slot_available(
+        db,
+        cid,
+        payload.scheduled_start.date(),
+        payload.scheduled_start,
+        payload.scheduled_end,
+        exclude_enrollment_id=enrollment_id,
+        exclude_original_date=original_date,
+    )
+    row = override or CourseSessionOverride(enrollment_id=enrollment_id, original_date=original_date)
+    row.action = "rescheduled"
+    row.rescheduled_start = payload.scheduled_start
+    row.rescheduled_end = payload.scheduled_end
+    row.reason = (payload.reason or "").strip() or None
+    row.created_by_username = user.username
+    if override is None:
+        db.add(row)
+    message = (
+        f"【Zomate Fitness】改期確認：{enr.title}\n"
+        f"原定：{current_start.strftime('%Y-%m-%d %H:%M')}\n"
+        f"新時間：{payload.scheduled_start.strftime('%Y-%m-%d %H:%M')}–{payload.scheduled_end.strftime('%H:%M')}\n"
+        f"課堂 PIN：{enr.checkin_pin}\n\n"
+        "如需再次改期或取消，請最少於課堂開始前 24 小時通知。"
+    )
+    log_whatsapp(
+        db,
+        enr.student,
+        enr.student.phone,
+        message,
+        template_key="booking_rescheduled",
+        template_context={
+            "student_name": enr.student.full_name,
+            "course_title": enr.title,
+            "old_datetime": current_start.strftime("%Y-%m-%d %H:%M"),
+            "new_datetime": payload.scheduled_start.strftime("%Y-%m-%d %H:%M"),
+            "pin": enr.checkin_pin,
+        },
+    )
+    record_activity(db, enr.student, "coach_reschedule_session", enr.id)
+    db.add(
+        AuditLog(
+            action="coach_reschedule_session",
+            student_id=enr.student_id,
+            course_id=enr.id,
+            coach_id=cid,
+            detail=json.dumps(
+                {
+                    "original_date": original_date.isoformat(),
+                    "from": current_start.isoformat(),
+                    "to": payload.scheduled_start.isoformat(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    return {"ok": True, "enrollment_id": enr.id, "original_date": original_date, "session_date": payload.scheduled_start.date()}
+
+
+@app.post("/api/coach/enrollments/{enrollment_id}/sessions/{original_date}/cancel")
+def coach_cancel_one_session(
+    enrollment_id: int,
+    original_date: date,
+    payload: CoachSessionCancelBody,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F003][S009] Cancel one lesson only; Steven's remaining lesson dates stay on the calendar."""
+    cid, enr, override, current_start, _current_end = _require_enrollment_session(
+        db, user, enrollment_id, original_date, payload.coach_id
+    )
+    _assert_change_notice(current_start)
+    row = override or CourseSessionOverride(enrollment_id=enrollment_id, original_date=original_date)
+    row.action = "cancelled"
+    row.rescheduled_start = None
+    row.rescheduled_end = None
+    row.reason = (payload.reason or "").strip() or None
+    row.created_by_username = user.username
+    if override is None:
+        db.add(row)
+    message = (
+        f"【Zomate Fitness】取消課堂確認：{enr.title}\n"
+        f"已取消：{current_start.strftime('%Y-%m-%d %H:%M')}\n\n"
+        "只取消今堂，其餘已預約課堂及課堂 PIN 不受影響。"
+    )
+    log_whatsapp(
+        db,
+        enr.student,
+        enr.student.phone,
+        message,
+        template_key="booking_cancelled",
+        template_context={
+            "student_name": enr.student.full_name,
+            "course_title": enr.title,
+            "lesson_datetime": current_start.strftime("%Y-%m-%d %H:%M"),
+        },
+    )
+    record_activity(db, enr.student, "coach_cancel_session", enr.id)
+    db.add(
+        AuditLog(
+            action="coach_cancel_session",
+            student_id=enr.student_id,
+            course_id=enr.id,
+            coach_id=cid,
+            detail=json.dumps(
+                {"original_date": original_date.isoformat(), "cancelled_slot": current_start.isoformat()},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    return {"ok": True, "enrollment_id": enr.id, "original_date": original_date}
 
 
 @app.patch("/api/coach/students/{student_id}/signature")

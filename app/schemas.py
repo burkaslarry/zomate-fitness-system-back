@@ -674,6 +674,37 @@ class CoachEnrollmentCancelBody(BaseModel):
     coach_id: int | None = None
 
 
+class CoachSessionCancelBody(BaseModel):
+    """[F003][S009] Cancel exactly one lesson date while preserving the enrollment and other lessons."""
+
+    coach_id: int | None = None
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class CoachSessionRescheduleBody(BaseModel):
+    """[F003][S009] Move exactly one lesson; 72h booking and 24h change rules are enforced server-side."""
+
+    coach_id: int | None = None
+    scheduled_start: datetime
+    scheduled_end: datetime
+    reason: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_interval(self) -> "CoachSessionRescheduleBody":
+        if self.scheduled_end <= self.scheduled_start:
+            raise ValueError("scheduled_end must be after scheduled_start.")
+        duration = (self.scheduled_end - self.scheduled_start).total_seconds() / 3600
+        if duration not in {0.5, 1.0, 1.5, 2.0}:
+            raise ValueError("Session duration must be 0.5, 1, 1.5, or 2 hours.")
+        if self.scheduled_start.minute not in {0, 15, 30, 45}:
+            raise ValueError("Session start must use a 15-minute interval.")
+        if self.scheduled_start.hour < 9 or self.scheduled_end.hour > 19 or (
+            self.scheduled_end.hour == 19 and self.scheduled_end.minute > 0
+        ):
+            raise ValueError("Session must stay within 09:00–19:00.")
+        return self
+
+
 class CoachSessionOut(BaseModel):
     """[F008][S002] One coach session row (student + date + category)."""
 
@@ -694,6 +725,8 @@ class CoachSessionOut(BaseModel):
     course_title: str
     lesson_no: int | None = None
     total_lessons: int | None = None
+    original_session_date: str | None = None
+    session_override: Literal["rescheduled"] | None = None
 
 
 class CoachAttendanceReportRowOut(BaseModel):

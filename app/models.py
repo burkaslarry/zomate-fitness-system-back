@@ -96,6 +96,28 @@ class CourseEnrollment(Base):
     student: Mapped["Student"] = relationship(back_populates="course_enrollments")
 
 
+class CourseSessionOverride(Base):
+    """[F003][S009] One-lesson cancel/reschedule override; never deletes the enrollment series."""
+
+    __tablename__ = "zomate_fs_course_session_overrides"
+    __table_args__ = (
+        UniqueConstraint("enrollment_id", "original_date", name="uq_zomate_fs_session_override"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    enrollment_id: Mapped[int] = mapped_column(
+        ForeignKey("zomate_fs_course_enrollments.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    original_date: Mapped[date] = mapped_column(DateColumn, nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(24), nullable=False)  # cancelled | rescheduled
+    rescheduled_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rescheduled_end: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by_username: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Student(Base):
     __tablename__ = "zomate_fs_students"
 
