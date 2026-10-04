@@ -97,3 +97,8 @@ The F01-F04 verifier creates unique test data and checks:
 - Student account PIN is legacy display only; check-in now uses **one class PIN per course enrollment**.
 - Coach/admin trial quota is stored on the student as `coach_trial_quota_remaining` and defaults to `1`.
 - Keepalive liveness uses `/api/health`; readiness with DB remains `/api/health/db`.
+
+<!--
+Repository maintenance: GitHub remotes use the burkaslarry-GitHub SSH alias,
+which selects this account's SSH key and connects over port 443.
+-->
