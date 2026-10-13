@@ -117,6 +117,23 @@ Quick check / 快速驗證：log in as `masterzoe`, then POST `/api/admin/whatsa
 
 Run `python -m pytest tests/ -q` in the project virtual environment. Test database fixtures use isolated SQLite, never production PostgreSQL. Template-send tests verify authentication, recipient normalization, variable order, and whitespace handling without contacting Meta.
 
+### Trigger rules / 實際觸發
+
+`POST /api/renewals`, member/staff receipt upload, and `/api/admin/students/{student_id}/send-payment-reminder` invoke `send_payment_whatsapp_notifications`. Coach receipt upload uses the same helper with `notify_coach=false`. Receipt uploads respect `send_whatsapp`; student consent is checked by `log_whatsapp`.
+
+| Condition | Internal template key |
+|---|---|
+| `receipt_confirmed=false` | `payment_student_pending` |
+| `receipt_confirmed=true`, installment recognized | `payment_student_installment` |
+| `receipt_confirmed=true`, no installment recognized | `payment_student_full` |
+| Notifications enabled, `notify_coach=true`, matching enrollment/coach/phone present | Additional `payment_coach` |
+
+Receipt upload sets `receipt_confirmed=true` immediately; it does not wait for independent finance approval. The registration wizard calls `/api/renewals` before creating the new enrollment, so initial notifications may use a previous enrollment or lack the new PIN/installment state. Do not treat these four send tests as acceptance of enrollment association or monetary calculations. These templates have no daily/check-in scheduler; installment notes are message text only.
+
+以上係現時程式行為，唔係「會計確認後先發」嘅承諾。上傳收據預設可即時發學生／教練通知；教練自行上傳只發學生版。正式報 Course 流程仍須驗收新課程、PIN、分期及金額。發送測試只限 masterzoe，正常業務通知沿用原權限。
+
+Release `c4368e206466a59729f4d11ed37f409f0f67ab42` was pushed and deployed Live on Render on 2026-10-13. All 50 tests passed and requirements audit was clean. All four test calls returned `ok=true`, `dry_run=false` and message IDs; the user confirmed all four handset deliveries. Synthetic test bodies did not create real payment records. Course title remains a dynamic context parameter, not a fixed test label.
+
 <!--
 Repository maintenance: GitHub remotes use the burkaslarry-GitHub SSH alias,
 which selects this account's SSH key and connects over port 443.
