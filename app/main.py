@@ -5366,12 +5366,19 @@ def admin_whatsapp_analytics(
     )
 
 
+def require_whatsapp_test_masterzoe(user: AppUser = Depends(get_current_user)) -> AppUser:
+    """[F005][S003] Only the masterzoe administrator may invoke live WhatsApp test sends."""
+    if user.username != "masterzoe" or user.role not in {"ADMIN", "MASTER_ADMIN"}:
+        raise HTTPException(status_code=403, detail="Only masterzoe may send WhatsApp test messages.")
+    return user
+
+
 @app.post("/api/admin/whatsapp/test-send")
 def admin_whatsapp_test_send(
     payload: WhatsAppTestSendBody,
-    user: AppUser = Depends(require_admin),
+    user: AppUser = Depends(require_whatsapp_test_masterzoe),
 ) -> dict:
-    """[F005][S003] Send one Meta-approved template to verify WABA credentials."""
+    """[F005][S003] Send one Meta-approved template; restricted to masterzoe."""
     _ = user
     result = get_whatsapp_client().send_template(
         payload.phone,

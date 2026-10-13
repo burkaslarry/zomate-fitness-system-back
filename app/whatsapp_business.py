@@ -151,7 +151,8 @@ class WhatsAppBusinessClient:
             payload["template"]["components"] = [
                 {
                     "type": "body",
-                    "parameters": [{"type": "text", "text": str(p)[:1024]} for p in body_parameters],
+                    # [F005][S003] Keep multiline installment notes safe in positional text parameters.
+                    "parameters": [{"type": "text", "text": " ".join(str(p).split())[:1024] or "—"} for p in body_parameters],
                 }
             ]
 

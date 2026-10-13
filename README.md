@@ -98,6 +98,25 @@ The F01-F04 verifier creates unique test data and checks:
 - Coach/admin trial quota is stored on the student as `coach_trial_quota_remaining` and defaults to `1`.
 - Keepalive liveness uses `/api/health`; readiness with DB remains `/api/health/db`.
 
+## [F005][S003] WhatsApp templates / WhatsApp 範本
+
+Use the root README traceability matrix for this integration. The automated sender is **+852 9756 8105** (Phone Number ID `1292795760587834`, WABA `1623067752857830`). Store the System User token only in server environment variables.
+
+系統通知用 **9756 8105**；人手查詢維持 **6052 9291**。以下四款 `zh_HK` / `UTILITY` 範本於 2026-10-13 獲 Meta 批准：
+
+| Internal key | Meta template | Body variables |
+|---|---|---:|
+| `payment_student_pending` | `zomate_payment_pending` | 7 |
+| `payment_student_installment` | `zomate_payment_installment` | 12 |
+| `payment_student_full` | `zomate_payment_full` | 10 |
+| `payment_coach` | `zomate_payment_coach` | 11 |
+
+Merge these mappings into `WHATSAPP_TEMPLATE_MAP` and preserve `booking_confirmation`. The root artifact `output/whatsapp-templates/template-map.json` contains the exact ordered context fields. `next_lesson_date` currently means the enrollment start date, so the Meta wording is 課程開始日期. `amount_paid` is labeled 付款記錄金額 because the current receipt context may represent one payment rather than a cumulative total. Empty values render as `—`; multiline notes are flattened for Meta.
+
+Quick check / 快速驗證：log in as `masterzoe`, then POST `/api/admin/whatsapp/test-send` with `phone`, `template_name`, `language_code`, and ordered `body_parameters`. Only username `masterzoe` with role `ADMIN` or `MASTER_ADMIN` may call this test endpoint; other authenticated users receive 403 and anonymous callers receive 401. This restriction applies to test sends; existing business notification permissions remain separate.
+
+Run `python -m pytest tests/ -q` in the project virtual environment. Test database fixtures use isolated SQLite, never production PostgreSQL. Template-send tests verify authentication, recipient normalization, variable order, and whitespace handling without contacting Meta.
+
 <!--
 Repository maintenance: GitHub remotes use the burkaslarry-GitHub SSH alias,
 which selects this account's SSH key and connects over port 443.
