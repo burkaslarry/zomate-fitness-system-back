@@ -138,3 +138,11 @@ Release `c4368e206466a59729f4d11ed37f409f0f67ab42` was pushed and deployed Live 
 Repository maintenance: GitHub remotes use the burkaslarry-GitHub SSH alias,
 which selects this account's SSH key and connects over port 443.
 -->
+
+## [F003][S003] Check-in delivery / 簽到通知
+
+`perform_lesson_checkin` commits attendance and the ledger debit before sending two mapped notifications: `checkin_student` → `zomate_checkin_student` (student_name, course_title, checkin_time, lesson_balance); `checkin_coach` → `zomate_checkin_coach` (student_name, student_phone, course_title, checkin_time, lesson_balance). Timestamp is Hong Kong local time; balance is the student account total after debit.
+
+八位電話預設香港 +852；已有 +852/852 不重複添加。學生拒收時跳過學生版，教練沒有電話時跳過教練版。課程同日重複簽到先回 409，不再次扣堂或發送；簽到寫入失敗不發成功通知。原有 Face ID 模擬接口亦經同一 helper，並非這次部署實際識別裝置。付款四款及預約確認保留；測試入口仍只限 masterzoe。
+
+Regression coverage: `tests/test_checkin_whatsapp.py` uses isolated SQLite to exercise attendance and ledger writes, recipients, opt-out, missing coach, duplicate protection and commit failure. Live template tests use only the authorized test handset and do not deduct a production lesson.

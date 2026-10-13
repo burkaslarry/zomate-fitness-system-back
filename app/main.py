@@ -2283,6 +2283,7 @@ def perform_lesson_checkin(
     notified_coach: Coach | None = None,
     pin_resolution: str = "unknown",
 ) -> tuple[dict, dict]:
+    """[F003][S003] Persist successful check-in before notifying the student and course coach."""
     if _lesson_balance_sum(db, student.id) <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
@@ -2325,22 +2326,6 @@ def perform_lesson_checkin(
             )
         )
 
-    log_whatsapp(
-        db,
-        student,
-        student.phone,
-        f"上堂通知：{student.full_name} 已簽到，剩餘堂數 {bal_after}。",
-    )
-    # TODO [F005][S003] WhatsApp reminder hook:
-    # Replace this local log with provider/webhook delivery after check-in redeem.
-    # Payload should include student name, phone, course title, course_enrollment_id,
-    # installment PIN segment, balance after redeem, and low-balance reminder threshold.
-    coach_msg = f"教練通知：學生 {student.full_name} 已簽到。"
-    if notified_coach:
-        log_whatsapp(db, student, notified_coach.phone, coach_msg)
-    else:
-        log_whatsapp(db, student, "coach-remind", coach_msg)
-
     detail_obj: dict = {
         "channel": channel,
         "pin_resolution": pin_resolution,
@@ -2363,6 +2348,29 @@ def perform_lesson_checkin(
     db.commit()
     db.refresh(student)
     db.refresh(checkin_log)
+
+    # [F003][S003] Only committed check-ins dispatch; the duplicate guard returns before this block.
+    notification_context = {
+        "student_name": student.full_name,
+        "student_phone": student.phone,
+        "course_title": resolved_enrollment.title if resolved_enrollment else "未指定課程",
+        "checkin_time": attended_at.replace(tzinfo=timezone.utc).astimezone(HK).strftime("%Y-%m-%d %H:%M"),
+        "lesson_balance": str(bal_after),
+    }
+    log_whatsapp(
+        db, student, student.phone,
+        f"上堂通知：{student.full_name} 已簽到，帳戶剩餘堂數 {bal_after}。",
+        template_key="checkin_student", template_context=notification_context,
+    )
+    if notified_coach and notified_coach.phone:
+        log_whatsapp(
+            db, student, notified_coach.phone,
+            f"教練通知：學生 {student.full_name} 已簽到，課程：{notification_context['course_title']}。",
+            template_key="checkin_coach", template_context=notification_context,
+        )
+    else:
+        log_event("[F003][S003] checkin_coach_notification_skipped", checkin_id=checkin_log.id)
+    db.commit()
 
     event_payload = {
         "event": "checkin_acknowledged",
