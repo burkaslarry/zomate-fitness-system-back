@@ -58,6 +58,7 @@ class StudentRegisterV1(BaseModel):
     digital_signature: str = Field(min_length=20, max_length=400_000)
     package_sessions: Literal[10, 30]
     renewal_notes: str | None = None
+    whatsapp_reminder_opt_in: bool = False
 
     @field_validator("email", mode="before")
     @classmethod
@@ -68,8 +69,11 @@ class StudentRegisterV1(BaseModel):
 
     @model_validator(mode="after")
     def validate_ack_and_clearance(self) -> "StudentRegisterV1":
+        """[F001][S001] Reject registration without explicit WhatsApp consent."""
         if not self.cooling_off_acknowledged or not self.disclaimer_accepted:
             raise ValueError("請確認冷靜期條款及免責聲明。")
+        if not self.whatsapp_reminder_opt_in:
+            raise ValueError("請同意接收 WhatsApp 提醒。")
         return self
 
 
@@ -94,7 +98,7 @@ class RenewalCreate(BaseModel):
     applicant_name: str = Field(min_length=1, max_length=120)
     signature: str = Field(min_length=1, max_length=120)
     renewal_date: date
-    whatsapp_reminder_opt_in: bool = True
+    whatsapp_reminder_opt_in: bool = False
 
 
 class MemberCreate(BaseModel):
@@ -417,9 +421,19 @@ class CourseCreate(BaseModel):
     # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
     student_first_session_at: datetime | None = None
     coach_schedule_note: str | None = Field(default=None, max_length=500)
+    # [F002][S001] Link checkout only after the new course and PIN exist.
+    whatsapp_reminder_opt_in: bool = False
+    payment_renewal_id: int | None = Field(default=None, ge=1)
+    payment_total_amount: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    payment_received: bool = False
 
     @model_validator(mode="after")
     def validate_weekdays(self) -> "CourseCreate":
+        """[F002][S001] Course forms require consent and a single linked checkout owner."""
+        if not self.whatsapp_reminder_opt_in:
+            raise ValueError("請同意接收 WhatsApp 提醒。")
+        if self.payment_renewal_id is not None and (len(self.student_ids) != 1 or self.payment_total_amount is None):
+            raise ValueError("Linked payment requires one student and the course total amount.")
         u = sorted(set(self.lesson_weekdays))
         if not u:
             raise ValueError("lesson_weekdays must include at least one day (Mon–Sun).")
@@ -650,6 +664,8 @@ class CourseEnrollmentOut(BaseModel):
 
 
 class CourseOut(BaseModel):
+    # [F005][S003] Return the same client-approved preview that was dispatched after checkout.
+    payment_whatsapp: dict | None = None
     id: int
     title: str
     branch_id: int

@@ -28,14 +28,17 @@ def _checkin_data(db, opted_in=True):
 
 
 @pytest.mark.parametrize("opted_in,has_coach,expected_keys", [
-    (True, True, ["checkin_student", "checkin_coach"]),
-    (False, True, ["checkin_coach"]),
-    (True, False, ["checkin_student"]),
+    (True, True, ["payment_student_pending", "payment_coach"]),
+    (False, True, ["payment_coach"]),
+    (True, False, ["payment_student_pending"]),
 ])
 def test_successful_checkin_notifies_only_expected_recipients(db_session, monkeypatch, opted_in, has_coach, expected_keys):
     """[F003][S003] Verify dynamic data, persisted attendance, consent and no duplicate send."""
     student, coach, enrollment = _checkin_data(db_session, opted_in)
     captured = []
+    if not has_coach:
+        coach.phone = ""
+        db_session.commit()
 
     def capture(phone, message, *, template_key, template_context):
         """[F003][S003] Assert attendance is already committed before any provider call."""
@@ -44,20 +47,18 @@ def test_successful_checkin_notifies_only_expected_recipients(db_session, monkey
         captured.append((phone, template_key, dict(template_context)))
 
     monkeypatch.setattr(main, "dispatch_reminder", capture)
-    before = datetime.now(timezone.utc).astimezone(main.HK).strftime("%Y-%m-%d %H:%M")
     result, _ = main.perform_lesson_checkin(
         db_session, student, "qr_pin", resolved_enrollment=enrollment,
         notified_coach=coach if has_coach else None,
     )
-    after = datetime.now(timezone.utc).astimezone(main.HK).strftime("%Y-%m-%d %H:%M")
     assert result["student"]["lesson_balance"] == 9
     assert [x[1] for x in captured] == expected_keys
     for phone, key, context in captured:
-        assert phone == (student.phone if key == "checkin_student" else coach.phone)
+        assert phone == (student.phone if key.startswith("payment_student") else coach.phone)
         assert context["course_title"] == "Dynamic Pilates"
         assert context["student_name"] == "Student Example"
-        assert context["lesson_balance"] == "9"
-        assert context["checkin_time"] in {before, after}
+        assert context["lessons_remaining"] == "9"
+        assert context["lessons_attended"] == "1"
     assert all(x.recipient != "coach-remind" for x in db_session.query(WhatsAppLog).all())
     with pytest.raises(HTTPException) as duplicate:
         main.perform_lesson_checkin(db_session, student, "qr_pin", resolved_enrollment=enrollment, notified_coach=coach)

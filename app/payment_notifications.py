@@ -15,6 +15,8 @@ from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session, joinedload
 
 from .enrollment_schedule import parse_segment_pins_json
+from .course_payment_state import course_payment_state
+from .whatsapp_business import normalize_whatsapp_phone
 from .models import (
     CategoryEnrollment,
     Coach,
@@ -42,7 +44,8 @@ if TYPE_CHECKING:
 
 
 def wa_me_link(phone: str, message: str) -> str:
-    digits = "".join(ch for ch in phone if ch.isdigit())
+    """[F005][S003] Manual fallback links use the same default +852 as API delivery."""
+    digits = normalize_whatsapp_phone(phone)
     return f"https://wa.me/{digits}?text={quote(message)}"
 
 
@@ -213,6 +216,8 @@ def _format_next_lesson_date(enr: CourseEnrollment | None) -> str:
     """[F005][S003] Match reminder_student.txt — date-only next lesson."""
     if enr is None or enr.scheduled_start is None:
         return "—"
+    if not enr.coach_time_confirmed:
+        return "待教練安排"
     return enr.scheduled_start.strftime("%Y-%m-%d")
 
 
@@ -235,7 +240,7 @@ def send_payment_whatsapp_notifications(
     log_whatsapp_fn,
     *,
     student: Student,
-    receipt_confirmed: bool = True,
+    receipt_confirmed: bool | None = None,
     notify_coach: bool = True,
     course_enrollment_id: int | None = None,
     installment_no: int | None = None,
@@ -246,6 +251,11 @@ def send_payment_whatsapp_notifications(
 ) -> dict[str, Any]:
     """[F005][S003] Render templates and log WhatsApp messages for student (+ optional coach)."""
     enr = _resolve_course_enrollment(db, student.id, course_enrollment_id)
+    # [F005][S003] Automatic notifications read the selected course's recorded payment status.
+    payment_state = course_payment_state(enr)
+    if receipt_confirmed is None:
+        receipt_confirmed = bool(payment_state.get("confirmed") and payment_state.get("receipt_uploaded"))
+    full_payment = full_payment or bool(payment_state.get("fully_paid"))
     coach: Coach | None = None
     if enr is not None and enr.coach_id:
         coach = db.get(Coach, enr.coach_id)
@@ -261,7 +271,7 @@ def send_payment_whatsapp_notifications(
             segment_dicts = []
 
     is_installment = (len(segments) > 1 or installment_plan_id is not None or installment_no is not None) and not full_payment
-    if installment_plan_id is not None:
+    if installment_plan_id is not None and not full_payment:
         plan = db.get(InstallmentPlan, installment_plan_id)
         if plan and plan.total_installments > 1:
             is_installment = True
@@ -283,6 +293,11 @@ def send_payment_whatsapp_notifications(
     attended = count_course_checkins(db, student.id, enr.id if enr else None)
     total_lessons = int(enr.total_lessons) if enr and enr.total_lessons else 0
     remaining = max(0, total_lessons - attended) if total_lessons else 0
+    # [F005][S003] After check-in, show the PIN for the next redeemable lesson tranche.
+    if installment_no is None and segment_dicts:
+        next_segment = next((s for s in segment_dicts if int(s.get("lesson_from", 0)) <= attended + 1 <= int(s.get("lesson_to", 0))), None)
+        if next_segment and next_segment.get("paid"):
+            pin = str(next_segment.get("pin") or pin)
 
     receipts = db.query(Receipt).filter(Receipt.student_id == student.id).all()
     renewal = (
@@ -306,7 +321,16 @@ def send_payment_whatsapp_notifications(
         renewal_amount=float(renewal.amount) if renewal and renewal.amount is not None else None,
         is_installment=is_installment,
     )
+    if enr is not None:
+        # [F005][S003] Never put another enrollment's money into this course's notification.
+        paid_amt = amount if amount is not None else payment_state.get("last_amount")
+        total_amt = payment_state.get("total_amount")
+        if total_amt is None and segment_dicts and all(s.get("amount_hkd") is not None for s in segment_dicts):
+            total_amt = sum(float(s["amount_hkd"]) for s in segment_dicts)
+        owing = max(0.0, float(total_amt) - float(payment_state.get("paid_total", 0))) if total_amt is not None else None
     payment_status = _payment_status_label(is_installment, receipt_confirmed, segments)
+    if receipt_confirmed and is_installment and payment_state.get("last_installment_no"):
+        payment_status = f"已分期（第{payment_state['last_installment_no']}期已付）"
     installment_notes = build_installment_notes_from_segments(segment_dicts) if segment_dicts else ""
 
     ctx = build_payment_context(

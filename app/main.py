@@ -35,6 +35,7 @@ from reportlab.pdfgen.canvas import Canvas
 import qrcode
 
 from .config import settings
+from .course_payment_state import course_payment_state, record_course_payment
 from .database import Base, db_session, engine, get_db
 from .excel_csv_compat import (
     FUNG_PAYMENT_HEADERS,
@@ -199,7 +200,7 @@ from .coach_sessions import (
     build_coach_session_rows,
     sort_coach_attendance_ledger_rows,
 )
-from .whatsapp_templates import seed_whatsapp_templates
+from .whatsapp_templates import seed_whatsapp_templates, get_template_body
 from .whatsapp_business import dispatch_reminder, get_whatsapp_client, verify_whatsapp_webhook_signature
 from .storage import FileStorageService
 
@@ -309,9 +310,11 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """[F007][S001] Serialize validator failures without exception objects or submitted personal data."""
+    details = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
-        content={"error": "validation_error", "message": "Request validation failed.", "details": exc.errors()},
+        content={"error": "validation_error", "message": "Request validation failed.", "details": details},
     )
 
 
@@ -909,6 +912,16 @@ def _save_member_receipt_row(
     renewal_id: int | None = None,
 ) -> dict:
     """[F004][S002] Persist receipt, optionally match installment/renewal, and log WhatsApp payment reminders."""
+    # [F004][S002] Unscoped uploads can infer only a unique course, never the latest of several.
+    if course_enrollment_id is None:
+        courses = db.query(CourseEnrollment).filter(
+            CourseEnrollment.student_id == student.id,
+            ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+        ).limit(2).all()
+        if len(courses) == 1:
+            course_enrollment_id = courses[0].id
+        elif len(courses) > 1 and send_whatsapp:
+            raise HTTPException(status_code=400, detail="請選擇對應 Course，避免通知錯誤課程。")
     path = _save_upload_file(file, "receipts", member_key, 5 * 1024 * 1024)
     note_text = (note or "").strip()
     context_text = (context or "").strip()
@@ -966,11 +979,22 @@ def _save_member_receipt_row(
         )
     )
     record_activity(db, student, "receipt_upload", receipt.id)
+    # [F004][S002] Persist course-scoped money before selecting the client-approved wording.
+    if course_enrollment_id is not None:
+        paid_course = db.query(CourseEnrollment).filter(
+            CourseEnrollment.id == course_enrollment_id, CourseEnrollment.student_id == student.id,
+        ).first()
+        if paid_course is None:
+            raise HTTPException(status_code=404, detail="Course enrollment not found for this student.")
+        record_course_payment(
+            paid_course, amount=amount, installment_no=installment_no,
+            full_payment=full_payment, receipt_id=receipt.id,
+        )
     whatsapp_result = send_payment_whatsapp_notifications(
         db,
         log_whatsapp,
         student=student,
-        receipt_confirmed=True,
+        receipt_confirmed=None if course_enrollment_id is not None else True,
         notify_coach=notify_coach,
         course_enrollment_id=course_enrollment_id,
         installment_no=installment_no,
@@ -1894,6 +1918,8 @@ def _migrate_management_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS branch_id INTEGER NULL REFERENCES zomate_fs_branches(id)",
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS amount NUMERIC(12,2) NULL",
         "ALTER TABLE zomate_fs_renewal_records ADD COLUMN IF NOT EXISTS receipt_id INTEGER NULL REFERENCES zomate_fs_receipts(id)",
+        # [F005][S003] Additive migration for course-specific paid amounts and checkout association.
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS payment_state_json TEXT NULL",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_receipts_member_hkid ON zomate_fs_receipts (member_hkid)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_expenses_date ON zomate_fs_expenses (date)",
         "CREATE INDEX IF NOT EXISTS ix_zomate_fs_activity_log_member_hkid ON zomate_fs_activity_log (member_hkid)",
@@ -2349,27 +2375,12 @@ def perform_lesson_checkin(
     db.refresh(student)
     db.refresh(checkin_log)
 
-    # [F003][S003] Only committed check-ins dispatch; the duplicate guard returns before this block.
-    notification_context = {
-        "student_name": student.full_name,
-        "student_phone": student.phone,
-        "course_title": resolved_enrollment.title if resolved_enrollment else "未指定課程",
-        "checkin_time": attended_at.replace(tzinfo=timezone.utc).astimezone(HK).strftime("%Y-%m-%d %H:%M"),
-        "lesson_balance": str(bal_after),
-    }
-    log_whatsapp(
-        db, student, student.phone,
-        f"上堂通知：{student.full_name} 已簽到，帳戶剩餘堂數 {bal_after}。",
-        template_key="checkin_student", template_context=notification_context,
-    )
-    if notified_coach and notified_coach.phone:
-        log_whatsapp(
-            db, student, notified_coach.phone,
-            f"教練通知：學生 {student.full_name} 已簽到，課程：{notification_context['course_title']}。",
-            template_key="checkin_coach", template_context=notification_context,
+    # [F003][S003] Successful check-ins reuse the four agreed wordings and this course's payment facts.
+    if resolved_enrollment is not None:
+        send_payment_whatsapp_notifications(
+            db, log_whatsapp, student=student, receipt_confirmed=None,
+            course_enrollment_id=resolved_enrollment.id, notify_coach=True,
         )
-    else:
-        log_event("[F003][S003] checkin_coach_notification_skipped", checkin_id=checkin_log.id)
     db.commit()
 
     event_payload = {
@@ -2706,6 +2717,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         if payload.email is not None:
             existing.email = (payload.email.strip() or None)
         existing.disclaimer_accepted = True
+        _set_whatsapp_reminder_opt_in(existing, True)
         _apply_signature_image(existing, payload.digital_signature)
         apply_lesson_ledger_delta(
             db,
@@ -2747,6 +2759,8 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
         emergency_contact_phone=emergency_contact_phone,
         health_notes=_register_v1_health_notes(payload),
         disclaimer_accepted=True,
+        whatsapp_reminder_opt_in=True,
+        whatsapp_reminder_opt_in_at=datetime.utcnow(),
     )
     db.add(student)
     db.flush()
@@ -3482,6 +3496,8 @@ def create_renewal_multipart(
     course_package_type_label: str | None = Form(default=None),
     note: str | None = Form(default=None),
     skip_lesson_ledger: bool = Form(default=False),
+    # [F002][S001] Checkout may defer notifications until the new course/PIN is available.
+    send_whatsapp: bool = Form(default=True),
     whatsapp_reminder_opt_in: str = Form(default="false"),
     receipt: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
@@ -3577,14 +3593,11 @@ def create_renewal_multipart(
     }
     db.add(AuditLog(action="renewal_create", student_id=student.id, detail=json.dumps(detail_obj, ensure_ascii=False)))
     record_activity(db, student, "renewal_create", renewal_row.id)
-    send_payment_whatsapp_notifications(
-        db,
-        log_whatsapp,
-        student=student,
-        receipt_confirmed=receipt_row is not None,
-        notify_coach=True,
-        amount=float(amount),
-    )
+    if send_whatsapp and not skip_lesson_ledger:
+        send_payment_whatsapp_notifications(
+            db, log_whatsapp, student=student, receipt_confirmed=receipt_row is not None,
+            notify_coach=True, amount=float(amount),
+        )
     log_event(
         "[F002][S003] checkout_summary_created",
         student_id=student.id,
@@ -5318,6 +5331,9 @@ def update_whatsapp_template(
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> WhatsAppMessageTemplate:
     """[F005][S003] Update template body; placeholders like {{student_name}} are preserved."""
+    # [F005][S003] The four client-agreed bodies cannot drift from the approved Meta text.
+    if template_key.startswith("payment_") and payload.body.strip() != get_template_body(db, template_key):
+        raise HTTPException(status_code=409, detail="此範本文字已由客戶確認，固定字眼不可修改。")
     row = db.query(WhatsAppMessageTemplate).filter(WhatsAppMessageTemplate.key == template_key).first()
     if row is None:
         seed_whatsapp_templates(db)
@@ -6674,15 +6690,20 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
 
     branch = db.query(Branch).filter(Branch.id == payload.branch_id).first()
     assert branch is not None
-    first_for_coach_notice: Student | None = None
-    enrolled_names: list[str] = []
-    note_trim = (payload.coach_schedule_note or "").strip()
     n_inst = max(1, min(3, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
     inst_amounts = getattr(payload, "installment_amounts", None)
     if inst_amounts is not None and len(inst_amounts) != n_inst:
         raise HTTPException(status_code=400, detail="installment_amounts length must match total_installments.")
     first_created: CourseEnrollment | None = None
+    created_enrollments: list[CourseEnrollment] = []
+    # [F002][S001] Validate checkout association before creating or sending anything.
+    linked_renewal = db.get(RenewalRecord, payload.payment_renewal_id) if payload.payment_renewal_id else None
+    if payload.payment_renewal_id and (
+        linked_renewal is None or linked_renewal.student_id not in payload.student_ids
+        or linked_renewal.coach_id != payload.coach_id
+    ):
+        raise HTTPException(status_code=400, detail="Payment record does not match the student and coach.")
 
     for sid in payload.student_ids:
         student = db.query(Student).filter(Student.id == sid).first()
@@ -6743,9 +6764,20 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
         db.flush()
         if first_created is None:
             first_created = enr
-        enrolled_names.append(student.full_name)
-        if first_for_coach_notice is None:
-            first_for_coach_notice = student
+        created_enrollments.append(enr)
+        _set_whatsapp_reminder_opt_in(student, True)
+        if linked_renewal is not None:
+            record_course_payment(
+                enr, amount=float(linked_renewal.amount or 0), total_amount=payload.payment_total_amount,
+                installment_no=1 if n_inst > 1 else None, received=payload.payment_received,
+                renewal_id=linked_renewal.id, receipt_id=linked_renewal.receipt_id,
+            )
+        db.add(AuditLog(
+            action="course_create", student_id=student.id, course_id=enr.id, coach_id=coach.id,
+            detail=json.dumps({"coach_schedule_note": payload.coach_schedule_note,
+                               "student_first_session_at": str(payload.student_first_session_at or ""),
+                               "renewal_id": payload.payment_renewal_id}, ensure_ascii=False),
+        ))
         pkg_sessions = payload.total_lessons
         credit_delta = 0
         if pkg_sessions > 0:
@@ -6759,50 +6791,18 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                     "course_open_package",
                     created_by_role=user.role.lower(),
                 )
-        bal_msg = _lesson_balance_sum(db, student.id)
-        if n_inst <= 1:
-            pin_txt = (
-                f" 你嘅課堂簽到 PIN：{primary_pin}"
-                "（一次付款此等套餐為一個 PIN；續約／新一筆過數會派新 PIN）。"
-            )
-        else:
-            pin_txt = (
-                " 分期簽到 PIN："
-                + "；".join(
-                    f"第{r['installment_no']}個分期（第{r['lesson_from']}–{r['lesson_to']}堂）PIN {r['pin']}"
-                    for r in seg_payload
-                )
-                + "。（首期預設可簽到；第2期起需先確認收款，並由櫃台 PATCH 或使用後台標記為已付先有得簽該 PIN。）"
-            )
-        msg = (
-            f"課堂確認：{payload.title} @ {branch.name} "
-            f"首課 {first_start.strftime('%Y-%m-%d %H:%M')}，套餐共 {payload.total_lessons} 堂，預計最後一堂 {series_end.isoformat()}。"
-            f"{pin_txt}"
-            f" 餘額已加 {credit_delta} 堂（套餐堂數），現有 {bal_msg} 堂。\n\n"
-            "預約須最少提前 72 小時；改期或取消須最少於課堂開始前 24 小時通知，"
-            "否則照計一堂及不設補堂。"
-        )
-        log_whatsapp(db, student, student.phone, msg)
-
-    if first_for_coach_notice is not None:
-        # [F002][S003] Coach WhatsApp log — baseline + optional agreed first session + confirm with students.
-        lines = [
-            f"【後台開課】{payload.title} · {branch.name}",
-            f"教練 {coach.full_name}：學員「{'、'.join(enrolled_names)}」已編入此課程。",
-            f"系統首課基準時段：{first_start.strftime('%Y-%m-%d %H:%M')}（請務必同學員核實實際到店／首堂時間）。",
-        ]
-        if payload.student_first_session_at is not None:
-            lines.append(
-                "櫃台記錄與學員約定首課："
-                f"{payload.student_first_session_at.strftime('%Y-%m-%d %H:%M')}。"
-            )
-        if note_trim:
-            lines.append(f"備註：{note_trim}")
-        lines.append("請主動約學員確認第一堂時間、地點及準備事項。")
-        log_whatsapp(db, first_for_coach_notice, coach.phone, "\n".join(lines))
-
     if first_created is None:
         raise HTTPException(status_code=400, detail="No valid student_ids to enroll.")
+    db.commit()
+    # [F005][S003] One complete message for each side after the new course/PIN/payment commit.
+    first_notification = None
+    for enrollment in created_enrollments:
+        notification = send_payment_whatsapp_notifications(
+            db, log_whatsapp, student=db.get(Student, enrollment.student_id),
+            course_enrollment_id=enrollment.id, receipt_confirmed=None, notify_coach=True,
+        )
+        if first_notification is None:
+            first_notification = notification
     db.commit()
     full = (
         db.query(CourseEnrollment)
@@ -6811,7 +6811,9 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
         .first()
     )
     assert full is not None
-    return enrollment_to_out(full)
+    output = enrollment_to_out(full)
+    output.payment_whatsapp = first_notification
+    return output
 
 
 @app.post("/api/admin/courses", response_model=CourseOut)
@@ -7663,7 +7665,7 @@ def coach_upload_student_receipt(
         course_enrollment_id=course_enrollment_id,
         full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
-        notify_coach=False,
+        notify_coach=True,
     )
     record_activity(db, student, "coach_receipt_upload", course_enrollment_id)
     db.commit()
@@ -7907,28 +7909,13 @@ def coach_confirm_enrollment_schedule(
     enr.scheduled_start = datetime.combine(first_day, start.time())
     enr.scheduled_end = datetime.combine(first_day, end.time())
     enr.coach_time_confirmed = True
-    booking_message = (
-        f"【Zomate Fitness】預約確認：{enr.title}\n"
-        f"日期時間：{start.strftime('%Y-%m-%d %H:%M')}–{end.strftime('%H:%M')}\n"
-        f"課堂 PIN：{enr.checkin_pin}\n\n"
-        "預約須最少提前 72 小時；如需改期或取消，請最少於課堂開始前 24 小時通知，"
-        "否則將照計一堂及不設補堂。"
-    )
-    log_whatsapp(
-        db,
-        enr.student,
-        enr.student.phone,
-        booking_message,
-        template_key="booking_confirmation",
-        template_context={
-            "student_name": enr.student.full_name,
-            "course_title": enr.title,
-            "lesson_date": start.strftime("%Y-%m-%d"),
-            "lesson_time": f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}",
-            "pin": enr.checkin_pin,
-        },
-    )
     record_activity(db, enr.student, "coach_confirm_schedule", enr.id)
+    db.commit()
+    # [F005][S003] Schedule updates also use one agreed complete message per recipient.
+    send_payment_whatsapp_notifications(
+        db, log_whatsapp, student=enr.student, course_enrollment_id=enr.id,
+        receipt_confirmed=None, notify_coach=True,
+    )
     db.commit()
     full = (
         db.query(CourseEnrollment)

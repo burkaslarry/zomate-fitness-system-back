@@ -22,67 +22,75 @@ PaymentTemplateKey = Literal[
     "payment_coach",
 ]
 
+# [F005][S003] Fixed wording agreed by the client; only context variables change.
 DEFAULT_WHATSAPP_TEMPLATES: list[dict[str, str]] = [
     {
         "key": "payment_student_pending",
         "audience": "student",
         "title": "收據未確認（學生）",
-        "body": """收據未確認
+        "body": """收據／付款待確認
 【Zomate 開課】{{course_title}}
-{{student_name}}（{{student_phone}}）
+學生：{{student_name}}（{{student_phone}}）
 課堂 PIN：{{pin}}
-上堂時間 : {{next_lesson_date}}
-已上堂數: {{lessons_attended}}
-餘下堂數: {{lessons_remaining}}
-公司有待確認付款""",
+課程開始日期：{{next_lesson_date}}
+已上堂數：{{lessons_attended}}
+餘下堂數：{{lessons_remaining}}
+公司正在核對付款記錄。
+
+如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。""",
     },
     {
         "key": "payment_student_installment",
         "audience": "student",
         "title": "收據已上傳 · 分期（學生）",
-        "body": """收據已上傳 (分期)
+        "body": """收據已上傳（分期）
 【Zomate 開課】{{course_title}}
-{{student_name}}（{{student_phone}}）
+學生：{{student_name}}（{{student_phone}}）
 課堂 PIN：{{pin}}
-上堂時間 : {{next_lesson_date}}
-已上堂數: {{lessons_attended}}
-餘下堂數: {{lessons_remaining}}
-付款狀態: {{payment_status}}
-已付金額: {{amount_paid}}
-總數 : {{total_amount}}
-尚欠: {{amount_owing}}
-{{installment_notes}}""",
+課程開始日期：{{next_lesson_date}}
+已上堂數：{{lessons_attended}}
+餘下堂數：{{lessons_remaining}}
+付款狀態：{{payment_status}}
+付款記錄金額：{{amount_paid}}
+課程總額：{{total_amount}}
+尚欠：{{amount_owing}}
+分期安排：{{installment_notes}}
+
+如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。""",
     },
     {
         "key": "payment_student_full",
         "audience": "student",
         "title": "收據已上傳 · 全數（學生）",
-        "body": """收據已上傳 (full pay)
+        "body": """收據已上傳（全數付款）
 【Zomate 開課】{{course_title}}
-{{student_name}}（{{student_phone}}）
+學生：{{student_name}}（{{student_phone}}）
 課堂 PIN：{{pin}}
-上堂時間 : {{next_lesson_date}}
-已上堂數: {{lessons_attended}}
-餘下堂數: {{lessons_remaining}}
-付款狀態: {{payment_status}}
-已付金額: {{amount_paid}}
-總數 : {{total_amount}}""",
+課程開始日期：{{next_lesson_date}}
+已上堂數：{{lessons_attended}}
+餘下堂數：{{lessons_remaining}}
+付款狀態：{{payment_status}}
+付款記錄金額：{{amount_paid}}
+課程總額：{{total_amount}}
+
+如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。""",
     },
     {
         "key": "payment_coach",
         "audience": "coach",
         "title": "開課／付款通知（教練）",
-        "body": """【Zomate 開課】{{course_title}}
-{{student_name}}（{{student_phone}}）
+        "body": """【Zomate 開課／付款通知】{{course_title}}
+學生：{{student_name}}（{{student_phone}}）
+課程開始日期：{{next_lesson_date}}
+已上堂數：{{lessons_attended}}
+餘下堂數：{{lessons_remaining}}
+付款狀態：{{payment_status}}
+付款記錄金額：{{amount_paid}}
+課程總額：{{total_amount}}
+尚欠：{{amount_owing}}
+分期安排：{{installment_notes}}
 
-上堂時間 : {{next_lesson_date}}
-已上堂數: {{lessons_attended}}
-餘下堂數: {{lessons_remaining}}
-付款狀態: {{payment_status}}
-已付金額: {{amount_paid}}
-總數 : {{total_amount}}
-尚欠: {{amount_owing}}
-{{installment_notes}}""",
+如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。""",
     },
     {
         "key": "receipt_upload_request",
@@ -129,9 +137,11 @@ def seed_whatsapp_templates(db: Session) -> None:
 
 
 def get_template_body(db: Session, key: str) -> str:
-    """[F005][S003] Load template body from DB or fall back to bundled defaults."""
+    """[F005][S003] Client-approved payment wording is fixed; other legacy previews may be editable."""
     from .models import WhatsAppMessageTemplate
 
+    if key.startswith("payment_"):
+        return next((row["body"] for row in DEFAULT_WHATSAPP_TEMPLATES if row["key"] == key), "")
     row = db.query(WhatsAppMessageTemplate).filter(WhatsAppMessageTemplate.key == key).first()
     if row:
         return row.body
@@ -167,7 +177,7 @@ def _ordinal_en(n: int) -> str:
 
 
 def build_installment_notes_from_segments(segments: list[dict]) -> str:
-    """[F005][S003] e.g. 第9堂提醒 / 付 2nd instalment for unpaid future tranches."""
+    """[F005][S003] Request the next installment before its lesson tranche starts."""
     lines: list[str] = []
     for seg in segments:
         if not isinstance(seg, dict):
@@ -178,9 +188,10 @@ def build_installment_notes_from_segments(segments: list[dict]) -> str:
         lo = int(seg.get("lesson_from") or 0)
         if ino <= 1 or lo <= 0:
             continue
-        reminder_lesson = int(seg.get("reminder_lesson") or max(lo, int(seg.get("lesson_to") or lo) - 1))
-        lines.append(f"第{reminder_lesson}堂付 {_ordinal_en(ino)} instalment")
-    return "\n".join(lines)
+        previous = next((p for p in segments if isinstance(p, dict) and int(p.get("installment_no") or 0) == ino - 1), {})
+        reminder_lesson = int(previous.get("reminder_lesson") or max(1, lo - 2))
+        lines.append(f"第{reminder_lesson}堂付第{ino}期")
+    return "；".join(lines)
 
 
 def resolve_payment_template_key(

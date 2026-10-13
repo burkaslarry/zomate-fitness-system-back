@@ -141,6 +141,6 @@ which selects this account's SSH key and connects over port 443.
 
 ### [F003][S003] 簽到通知範本選擇（2026-10-13 更新）
 
-依使用者指定，沿用 `zomate_payment_pending`、`zomate_payment_installment`、`zomate_payment_full`、`zomate_payment_coach` 四款已批准原文；只注入動態資料，不更改固定字眼。額外 `zomate_checkin_student`／`zomate_checkin_coach` 已從正式 Render 映射移除，簽到暫不透過這兩款發送。簽到是否沿用付款四款，待使用者確認；確認前不得聲稱兩款額外簽到通知正在發送。香港電話預設 +852 的處理保留。原有預約確認是獨立既有功能。
+使用者已確認使用四款原文：開課、教練確認排課、成功簽到及補收據，按同一課程付款狀態選學生版，再同步教練版。`[F005][S003] app/course_payment_state.py` 保存課程總額／累計付款／收據；`app/payment_notifications.py` 按本課程算尚欠、注入動態資料。`[F003][S003] perform_lesson_checkin` 先提交扣堂及出勤，再通知；重複簽到不重發。`[F002][S001] _create_course_impl` 先保存新課程／PIN 及 linked checkout，再通知。八位香港電話及手動連結均預設 +852。
 
-The four approved payment wordings remain unchanged. Additional check-in mappings are disabled. Reusing the payment wording on check-in requires the user's choice because those bodies describe receipt/payment status rather than a check-in acknowledgement.
+English: earlier rollout limitations above describe the previous release. This revision requires explicit WhatsApp consent; defers checkout notifications until the new course/PIN exists; scopes money to that course; and notifies both recipients on coach receipt uploads. The fixed four bodies cannot be overridden in the preview editor. 61 tests and an isolated API drill passed (FPS 3 × HKD 3000; two check-ins; duplicate 409; unpaid PIN 403). This revision is prepared for release; production deployment is not yet verified.
