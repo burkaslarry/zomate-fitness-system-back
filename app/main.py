@@ -997,7 +997,7 @@ def _save_member_receipt_row(
             # [F004][S002] An uploaded proof is pending evidence, never permission to unlock a PIN.
             state = course_payment_state(paid_course)
             pending = state.setdefault("pending_payments", {})
-            pending["full" if full_payment else str(installment_no or 1)] = {"amount": amount, "receipt_id": receipt.id, "full_payment": full_payment}
+            pending["full" if full_payment else str(installment_no) if installment_no else "unassigned"] = {"amount": amount, "receipt_id": receipt.id, "full_payment": full_payment}
             paid_course.payment_state_json = json.dumps(state, ensure_ascii=False)
     whatsapp_result = send_payment_whatsapp_notifications(
         db,
@@ -3397,7 +3397,7 @@ def upload_member_receipt_by_id(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    """[F004][S002] Admin receipt upload: match full/installment payment + optional WhatsApp to student/coach."""
+    """[F004][S002] Admin uploads pending proof; explicit course confirmation records the payment."""
     student = db.get(Student, student_id)
     if student is None or _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
@@ -3419,7 +3419,8 @@ def upload_member_receipt_by_id(
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
         renewal_id=renewal_id,
-        payment_confirmed=user.role in {"ADMIN", "MASTER_ADMIN"},
+        # [F004][S002] Even Admin uploads proof first; the explicit confirm action records payment.
+        payment_confirmed=False,
     )
     db.commit()
     return result
@@ -6922,8 +6923,9 @@ def admin_course_mark_installment_paid(
     existing = (state.get("payments") or {}).get(f"installment:{payload.installment_no}")
     if len(rows) == 1:
         existing = existing or (state.get("payments") or {}).get("full")
-    pending = state.setdefault("pending_payments", {}).get(str(payload.installment_no)) or state["pending_payments"].get("full", {})
-    if existing and not pending:
+    pending = (state.setdefault("pending_payments", {}).get(str(payload.installment_no))
+               or state["pending_payments"].get("full") or state["pending_payments"].get("unassigned", {}))
+    if (existing or (state.get("fully_paid") and row.get("paid"))) and not pending:
         return enrollment_to_out(enr)
     amount = pending.get("amount")
     if amount is None:
@@ -6931,6 +6933,8 @@ def admin_course_mark_installment_paid(
     if amount is None or float(amount) <= 0:
         raise HTTPException(status_code=400, detail="請先上傳有金額的付款收據或設定本期金額。")
     state["pending_payments"].pop(str(payload.installment_no), None)
+    if pending is state["pending_payments"].get("unassigned"):
+        state["pending_payments"].pop("unassigned", None)
     if pending.get("full_payment"):
         state["pending_payments"].pop("full", None)
     for segment in rows:

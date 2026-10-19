@@ -257,6 +257,10 @@ def test_admin_handles_partial_installment_and_final_balance(db_session, monkeyp
     assert bool(third.pin) is issued
     if issued:
         assert third.pin not in {"10192","10193","10194"}
+        main.admin_course_mark_installment_paid(enrollment.id,
+            CourseInstallmentMarkPaid(student_id=student.id, installment_no=3), db_session, SimpleNamespace(role="ADMIN"))
+        assert course_payment_state(enrollment)["paid_total"] == 9000
+        assert len(emitted) == 2
     else:
         assert "部分付款待補足" in emitted[0]["template_context"]["payment_status"]
 
@@ -273,3 +277,17 @@ def test_single_payment_course_pending_receipt_can_be_confirmed(db_session, monk
     assert result.enrollments[0].installment_segments[0].pin == enrollment.checkin_pin
     assert emitted[0]["template_key"] == "payment_student_full"
     assert emitted[1]["template_context"]["amount_owing"] == "HKD 0"
+
+
+def test_unassigned_receipt_is_linked_to_admin_selected_term_without_double_count(db_session, monkeypatch):
+    """[F004][S002] An Admin selects the term for an unscoped uploaded proof, counting it once."""
+    student, _, enrollment = _course(db_session)
+    enrollment.payment_state_json = json.dumps({"total_amount":9000,"pending_payments":{"unassigned":{"amount":3000,"receipt_id":1}}})
+    monkeypatch.setattr(main,"dispatch_reminder",lambda *args,**kwargs:None)
+    body=CourseInstallmentMarkPaid(student_id=student.id,installment_no=2)
+    main.admin_course_mark_installment_paid(enrollment.id,body,db_session,SimpleNamespace(role="ADMIN"))
+    main.admin_course_mark_installment_paid(enrollment.id,body,db_session,SimpleNamespace(role="ADMIN"))
+    state=course_payment_state(enrollment)
+    assert state["paid_total"] == 3000
+    assert state["payments"]["installment:2"]["receipt_id"] == 1
+    assert state["pending_payments"] == {}
