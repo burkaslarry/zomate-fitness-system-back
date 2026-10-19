@@ -130,10 +130,13 @@ def test_linked_checkout_notifies_after_course_pin_and_payment_are_saved(db_sess
     result = main._create_course_impl(body, db_session, SimpleNamespace(role="ADMIN"))
     assert result.id != old_course.id
     assert len(captured) == 2
-    assert captured[0]["template_key"] == "payment_student_installment"
+    assert captured[0]["template_key"] == "payment_student_pending"
     assert captured[1]["template_key"] == "payment_coach"
     assert captured[0]["template_context"]["next_lesson_date"] == "待教練安排"
-    assert result.payment_whatsapp["student"]["template_key"] == "payment_student_installment"
+    assert result.payment_whatsapp["student"]["template_key"] == "payment_student_pending"
+    new_course = db_session.get(CourseEnrollment, result.id)
+    assert course_payment_state(new_course)["paid_total"] == 0
+    assert course_payment_state(new_course)["pending_payments"]["1"]["receipt_id"] == receipt.id
 
 
 def test_course_registration_requires_explicit_consent():

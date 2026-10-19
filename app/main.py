@@ -6810,9 +6810,15 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
         if linked_renewal is not None:
             record_course_payment(
                 enr, amount=float(linked_renewal.amount or 0), total_amount=payload.payment_total_amount,
-                installment_no=1 if n_inst > 1 else None, received=payload.payment_received,
+                installment_no=1 if n_inst > 1 else None, received=False,
                 renewal_id=linked_renewal.id, receipt_id=linked_renewal.receipt_id,
             )
+            # [F004][S002] Checkout reports payment evidence; only the separate Admin action confirms it.
+            state = course_payment_state(enr)
+            state.setdefault("pending_payments", {})["1"] = {
+                "amount": float(linked_renewal.amount or 0), "receipt_id": linked_renewal.receipt_id,
+            }
+            enr.payment_state_json = json.dumps(state, ensure_ascii=False)
         db.add(AuditLog(
             action="course_create", student_id=student.id, course_id=enr.id, coach_id=coach.id,
             detail=json.dumps({"coach_schedule_note": payload.coach_schedule_note,
