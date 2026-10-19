@@ -114,7 +114,7 @@ def parse_segment_pins_json(raw: str | None) -> list[InstallmentSegmentPinOut]:
                     installment_no=ino,
                     lesson_from=lesson_from,
                     lesson_to=lesson_to,
-                    pin=str(row["pin"]).strip(),
+                    pin=str(row.get("pin") or "").strip() if ino == 1 or paid_bool else "",
                     paid=paid_bool,
                     reminder_lesson=reminder_lesson,
                     amount_hkd=amount_hkd,

@@ -1,7 +1,7 @@
 """[F005][S003] The agreed four wordings use course-specific money and paired recipients."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -11,9 +11,10 @@ from pydantic import ValidationError
 
 from app import main
 from app.course_payment_state import course_payment_state, record_course_payment
-from app.models import Branch, Coach, CourseEnrollment, Receipt, RenewalRecord, Student
+from app.models import Attendance, Branch, Coach, CourseEnrollment, Receipt, RenewalRecord, Student
 from app.payment_notifications import send_payment_whatsapp_notifications
-from app.schemas import CourseCreate, RenewalCreate
+from app.schemas import CourseCreate, CourseInstallmentMarkPaid, RenewalCreate
+from app.enrollment_schedule import parse_segment_pins_json
 from app.whatsapp_templates import DEFAULT_WHATSAPP_TEMPLATES, get_template_body
 
 
@@ -162,3 +163,113 @@ def test_fixed_bodies_match_meta_approved_wording(db_session):
             assert get_template_body(db_session, row["key"]) == row["body"]
             assert "課程開始日期：{{next_lesson_date}}" in row["body"]
             assert "測試課程" not in row["body"]
+
+
+def test_first_unpaid_pin_has_grace_but_cannot_cross_installment_boundary(db_session, monkeypatch):
+    """[F003][S002] Unpaid first term is allowed; lesson 11 requires confirmed term 2 and its own PIN."""
+    student, coach, enrollment = _course(db_session)
+    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 19, 11))
+    assert main.resolve_checkin_pin_context(db_session, student, "10192")[0].id == enrollment.id
+    for i in range(10):
+        day = datetime(2026, 10, 1) + timedelta(days=i)
+        db_session.add(Attendance(student_id=student.id, course_id=enrollment.id, coach_id=coach.id,
+            branch_id=coach.branch_id, attended_at=day, session_calendar_date=day.date()))
+    db_session.commit()
+    assert main.resolve_checkin_pin_context(db_session, student, "10192") == "blocked_installment_unpaid"
+    record_course_payment(enrollment, amount=3000, installment_no=2, receipt_id=2)
+    db_session.commit()
+    assert main.resolve_checkin_pin_context(db_session, student, "10192") is None
+    assert main.resolve_checkin_pin_context(db_session, student, "10193")[0].id == enrollment.id
+
+
+def test_new_course_issues_only_first_pin_before_payment(db_session, monkeypatch):
+    """[F002][S001] Later PINs are not generated or exposed at checkout."""
+    student, coach, _ = _course(db_session)
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: None)
+    result = main._create_course_impl(CourseCreate(title="Grace Pilates", branch_id=coach.branch_id,
+        coach_id=coach.id, student_ids=[student.id], total_lessons=30, total_installments=3,
+        installment_amounts=[3000]*3, whatsapp_reminder_opt_in=True,
+        scheduled_start=datetime(2026,10,19,11), scheduled_end=datetime(2026,10,19,12)),
+        db_session, SimpleNamespace(role="ADMIN"))
+    segments = result.enrollments[0].installment_segments
+    assert len(segments[0].pin) == 5 and segments[0].paid is False
+    assert [s.pin for s in segments[1:]] == ["", ""]
+    assert not any(s.paid for s in segments)
+
+
+def test_public_receipt_waits_for_admin_then_issues_new_pin_and_notifies_once(db_session, monkeypatch):
+    """[F004][S002] Proof upload cannot confirm payment; Admin confirmation is idempotent."""
+    student, _, enrollment = _course(db_session)
+    rows = json.loads(enrollment.segment_pins_json)
+    for row in rows[1:]:
+        row["pin"] = ""
+    enrollment.segment_pins_json = json.dumps(rows)
+    emitted = []
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    monkeypatch.setattr(main, "_save_upload_file", lambda *args: "receipts/sample.png")
+    result = main._save_member_receipt_row(db_session, student=student, file=None, member_key="DRILL",
+        amount=3000, payment_method="FPS", note="Test", context="Test", source="RENEWAL",
+        installment_no=2, course_enrollment_id=enrollment.id, payment_confirmed=False)
+    db_session.commit()
+    assert result["installment_match"]["pending_admin_confirmation"]
+    assert parse_segment_pins_json(enrollment.segment_pins_json)[1].pin == ""
+    emitted.clear()
+    body = CourseInstallmentMarkPaid(student_id=student.id, installment_no=2)
+    confirmed = main.admin_course_mark_installment_paid(enrollment.id, body, db_session, SimpleNamespace(role="ADMIN"))
+    pin = confirmed.enrollments[0].installment_segments[1].pin
+    assert len(pin) == 5 and pin != enrollment.checkin_pin
+    assert [m["template_key"] for m in emitted] == ["payment_student_installment", "payment_coach"]
+    assert emitted[0]["template_context"]["pin"] == pin
+    main.admin_course_mark_installment_paid(enrollment.id, body, db_session, SimpleNamespace(role="ADMIN"))
+    assert len(emitted) == 2
+    assert parse_segment_pins_json(enrollment.segment_pins_json)[1].pin == pin
+
+
+def test_coach_cannot_use_admin_payment_confirmation():
+    """[F004][S002] Role authorization is enforced at the HTTP confirmation boundary."""
+    main.app.dependency_overrides[main.get_current_user] = lambda: SimpleNamespace(role="COACH", username="drillcoach")
+    try:
+        response = TestClient(main.app).patch("/api/admin/courses/1/installment-paid", json={"student_id":1,"installment_no":2})
+        assert response.status_code == 403
+    finally:
+        main.app.dependency_overrides.pop(main.get_current_user, None)
+
+
+@pytest.mark.parametrize("amount,full_payment,expected_key,issued", [
+    (1000, False, "payment_student_installment", False),
+    (3000, True, "payment_student_full", True),
+])
+def test_admin_handles_partial_installment_and_final_balance(db_session, monkeypatch, amount, full_payment, expected_key, issued):
+    """[F004][S002] Partial funds cannot unlock term 3; full remaining balance issues its fresh PIN."""
+    student, _, enrollment = _course(db_session)
+    record_course_payment(enrollment, amount=3000, installment_no=1, receipt_id=1)
+    record_course_payment(enrollment, amount=3000, installment_no=2, receipt_id=2)
+    state = course_payment_state(enrollment)
+    state["pending_payments"] = {"full" if full_payment else "3": {"amount": amount, "receipt_id":3,"full_payment":full_payment}}
+    enrollment.payment_state_json = json.dumps(state)
+    emitted = []
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    result = main.admin_course_mark_installment_paid(enrollment.id,
+        CourseInstallmentMarkPaid(student_id=student.id, installment_no=3), db_session, SimpleNamespace(role="ADMIN"))
+    assert emitted[0]["template_key"] == expected_key
+    third = result.enrollments[0].installment_segments[2]
+    assert third.paid is issued
+    assert bool(third.pin) is issued
+    if issued:
+        assert third.pin not in {"10192","10193","10194"}
+    else:
+        assert "部分付款待補足" in emitted[0]["template_context"]["payment_status"]
+
+
+def test_single_payment_course_pending_receipt_can_be_confirmed(db_session, monkeypatch):
+    """[F004][S002] SOP3 also works for a course without installment segments."""
+    student, _, enrollment = _course(db_session)
+    enrollment.segment_pins_json = None
+    enrollment.payment_state_json = json.dumps({"total_amount":9000,"pending_payments":{"1":{"amount":9000,"receipt_id":1}}})
+    emitted=[]
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    result=main.admin_course_mark_installment_paid(enrollment.id,
+        CourseInstallmentMarkPaid(student_id=student.id,installment_no=1),db_session,SimpleNamespace(role="ADMIN"))
+    assert result.enrollments[0].installment_segments[0].pin == enrollment.checkin_pin
+    assert emitted[0]["template_key"] == "payment_student_full"
+    assert emitted[1]["template_context"]["amount_owing"] == "HKD 0"

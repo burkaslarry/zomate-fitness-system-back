@@ -631,7 +631,8 @@ class InstallmentSegmentPinOut(BaseModel):
     installment_no: int = Field(ge=1)
     lesson_from: int = Field(ge=1)
     lesson_to: int = Field(ge=1)
-    pin: str = Field(min_length=1, max_length=8)
+    # [F003][S002] Later installment PINs remain unissued until Admin confirms payment.
+    pin: str = Field(default="", max_length=8)
     paid: bool = True
     reminder_lesson: int | None = Field(default=None, ge=1)
     amount_hkd: float | None = Field(default=None, ge=0)

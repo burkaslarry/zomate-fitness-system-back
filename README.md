@@ -144,3 +144,10 @@ which selects this account's SSH key and connects over port 443.
 使用者已確認使用四款原文：開課、教練確認排課、成功簽到及補收據，按同一課程付款狀態選學生版，再同步教練版。`[F005][S003] app/course_payment_state.py` 保存課程總額／累計付款／收據；`app/payment_notifications.py` 按本課程算尚欠、注入動態資料。`[F003][S003] perform_lesson_checkin` 先提交扣堂及出勤，再通知；重複簽到不重發。`[F002][S001] _create_course_impl` 先保存新課程／PIN 及 linked checkout，再通知。八位香港電話及手動連結均預設 +852。
 
 English: earlier rollout limitations above describe the previous release. This revision requires explicit WhatsApp consent; defers checkout notifications until the new course/PIN exists; scopes money to that course; and notifies both recipients on coach receipt uploads. The fixed four bodies cannot be overridden in the preview editor. 61 tests and an isolated API drill passed (FPS 3 × HKD 3000; two check-ins; duplicate 409; unpaid PIN 403). This revision is prepared for release; production deployment is not yet verified.
+
+
+### [F003][S002] Latest SOP / 最新流程 - 2026-10-19
+
+首期未付款仍發五位 PIN，僅限首期堂數；第二／三期由 Admin 確認足額後發新 PIN，舊 PIN 不可跨期。學生／教練上傳收據不自行解鎖；Admin 確認會同步原有學生／教練通知，重複確認不換碼、不重發。學生詳情頁提供持續確認入口。
+
+English: first-term credit is distinct from paid status; later PIN issuance is gated by Admin confirmation and the current lesson tranche. Provider-stub regression tests cover these rules. No new live WhatsApp test is implied.

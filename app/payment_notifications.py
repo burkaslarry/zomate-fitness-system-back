@@ -62,6 +62,8 @@ def _mark_course_installment_paid(enr: CourseEnrollment, installment_no: int) ->
     touched = False
     for row in rows:
         if isinstance(row, dict) and int(row.get("installment_no") or 0) == installment_no:
+            if installment_no > 1 and not row.get("paid"):
+                row["pin"] = ""  # [F003][S002] Replace legacy pre-issued codes at actual approval.
             row["paid"] = True
             touched = True
             break
@@ -83,6 +85,8 @@ def _mark_course_full_paid(enr: CourseEnrollment) -> bool:
     touched = False
     for row in rows:
         if isinstance(row, dict):
+            if int(row.get("installment_no") or 0) > 1 and not row.get("paid"):
+                row["pin"] = ""
             row["paid"] = True
             touched = True
     if touched:
@@ -199,6 +203,8 @@ def _resolve_notification_pin(
         if installment_no is not None:
             for seg in segment_dicts:
                 if int(seg.get("installment_no") or 0) == installment_no:
+                    if installment_no > 1 and not seg.get("paid"):
+                        return "待 Admin 確認付款後發出"
                     return str(seg.get("pin") or enr.checkin_pin or "—")
         if full_payment:
             for seg in segment_dicts:
@@ -296,8 +302,8 @@ def send_payment_whatsapp_notifications(
     # [F005][S003] After check-in, show the PIN for the next redeemable lesson tranche.
     if installment_no is None and segment_dicts:
         next_segment = next((s for s in segment_dicts if int(s.get("lesson_from", 0)) <= attended + 1 <= int(s.get("lesson_to", 0))), None)
-        if next_segment and next_segment.get("paid"):
-            pin = str(next_segment.get("pin") or pin)
+        if next_segment:
+            pin = str(next_segment.get("pin") or pin) if int(next_segment.get("installment_no", 1)) == 1 or next_segment.get("paid") else "待 Admin 確認付款後發出"
 
     receipts = db.query(Receipt).filter(Receipt.student_id == student.id).all()
     renewal = (
@@ -330,7 +336,9 @@ def send_payment_whatsapp_notifications(
         owing = max(0.0, float(total_amt) - float(payment_state.get("paid_total", 0))) if total_amt is not None else None
     payment_status = _payment_status_label(is_installment, receipt_confirmed, segments)
     if receipt_confirmed and is_installment and payment_state.get("last_installment_no"):
-        payment_status = f"已分期（第{payment_state['last_installment_no']}期已付）"
+        last_no = payment_state["last_installment_no"]
+        last_segment = next((s for s in segment_dicts if int(s.get("installment_no", 0)) == last_no), {})
+        payment_status = f"已分期（第{last_no}期已付）" if last_segment.get("paid") else "已分期（部分付款待補足）"
     installment_notes = build_installment_notes_from_segments(segment_dicts) if segment_dicts else ""
 
     ctx = build_payment_context(

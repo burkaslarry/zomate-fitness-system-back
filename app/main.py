@@ -910,6 +910,7 @@ def _save_member_receipt_row(
     send_whatsapp: bool = True,
     notify_coach: bool = True,
     renewal_id: int | None = None,
+    payment_confirmed: bool = False,
 ) -> dict:
     """[F004][S002] Persist receipt, optionally match installment/renewal, and log WhatsApp payment reminders."""
     # [F004][S002] Unscoped uploads can infer only a unique course, never the latest of several.
@@ -962,7 +963,7 @@ def _save_member_receipt_row(
         installment_plan_id=installment_plan_id,
         amount=amount,
         full_payment=full_payment,
-    )
+    ) if payment_confirmed else {"installment_marked_paid": False, "pending_admin_confirmation": True}
     db.add(
         AuditLog(
             action="receipt_upload",
@@ -986,15 +987,23 @@ def _save_member_receipt_row(
         ).first()
         if paid_course is None:
             raise HTTPException(status_code=404, detail="Course enrollment not found for this student.")
-        record_course_payment(
-            paid_course, amount=amount, installment_no=installment_no,
-            full_payment=full_payment, receipt_id=receipt.id,
-        )
+        if payment_confirmed:
+            record_course_payment(
+                paid_course, amount=amount, installment_no=installment_no,
+                full_payment=full_payment, receipt_id=receipt.id,
+            )
+            _issue_confirmed_course_pins(db, paid_course)
+        else:
+            # [F004][S002] An uploaded proof is pending evidence, never permission to unlock a PIN.
+            state = course_payment_state(paid_course)
+            pending = state.setdefault("pending_payments", {})
+            pending["full" if full_payment else str(installment_no or 1)] = {"amount": amount, "receipt_id": receipt.id, "full_payment": full_payment}
+            paid_course.payment_state_json = json.dumps(state, ensure_ascii=False)
     whatsapp_result = send_payment_whatsapp_notifications(
         db,
         log_whatsapp,
         student=student,
-        receipt_confirmed=None if course_enrollment_id is not None else True,
+        receipt_confirmed=(None if course_enrollment_id is not None else True) if payment_confirmed else False,
         notify_coach=notify_coach,
         course_enrollment_id=course_enrollment_id,
         installment_no=installment_no,
@@ -1079,6 +1088,23 @@ def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[in
     return out
 
 
+def _issue_confirmed_course_pins(db: Session, enrollment: CourseEnrollment) -> None:
+    """[F003][S002] Issue a distinct later PIN only after confirmed payment; retain existing paid PINs."""
+    rows = json.loads(enrollment.segment_pins_json or "[]")
+    reserved = {str(r.get("pin")) for r in rows if r.get("pin")}
+    for row in rows:
+        if row.get("pin") or not row.get("paid"):
+            continue
+        row["pin"] = allocate_enrollment_pin(
+            db, enrollment.id, enrollment.student_id, peer_branch_id=enrollment.branch_id,
+            peer_coach_id=enrollment.coach_id, peer_title=enrollment.title,
+            peer_series_start=enrollment.series_start_date, avoid_pins=frozenset(reserved),
+        )
+        reserved.add(row["pin"])
+    if rows:
+        enrollment.segment_pins_json = json.dumps(rows, ensure_ascii=False)
+
+
 def _default_installment_reminder_lesson(lesson_from: int, lesson_to: int) -> int:
     """[F003][S003] Reminder fires one lesson before each tranche boundary by default."""
     if lesson_to <= lesson_from:
@@ -1133,6 +1159,8 @@ def _segment_paid_for_matched_pin(enr: CourseEnrollment, pin: str) -> bool:
         return False
 
     ino = int(seg.get("installment_no") or 0)
+    if ino == 1:
+        return True  # [F003][S002] First-tranche grace is separate from actual payment status.
     pr = seg.get("paid")
     if pr is None:
         return ino <= 1
@@ -2234,7 +2262,7 @@ def resolve_today_primary_enrollment_for_student(
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
 ) -> tuple[CourseEnrollment, Coach, str] | Literal["blocked_installment_unpaid"] | None:
-    """Class PIN → enrollment when paid segment allows check-in & today is a lesson day."""
+    """[F003][S002] Today-only PIN with first-term credit and a paid/current later-term gate."""
     pin = pin.strip()
     now = now_hk()
     enrs = (
@@ -2248,6 +2276,17 @@ def resolve_checkin_pin_context(
     for enr in enrs:
         if not _enrollment_matches_class_pin(enr, pin):
             continue
+        # [F003][S002] A previous tranche PIN cannot redeem lessons from a later tranche.
+        segments = json.loads(enr.segment_pins_json or "[]")
+        if segments:
+            used = db.query(Attendance).filter(Attendance.student_id == student.id, Attendance.course_id == enr.id).count()
+            current = next((s for s in segments if int(s["lesson_from"]) <= used + 1 <= int(s["lesson_to"])), None)
+            if current is None:
+                return None
+            if int(current["installment_no"]) > 1 and not current.get("paid"):
+                return "blocked_installment_unpaid"
+            if str(current.get("pin") or "") != pin:
+                return None
         if not _segment_paid_for_matched_pin(enr, pin):
             return "blocked_installment_unpaid"
         if _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
@@ -3380,6 +3419,7 @@ def upload_member_receipt_by_id(
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=_form_bool(notify_coach),
         renewal_id=renewal_id,
+        payment_confirmed=user.role in {"ADMIN", "MASTER_ADMIN"},
     )
     db.commit()
     return result
@@ -6726,7 +6766,7 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
             for idx, (lo, hi) in enumerate(segment_ranges):
                 p = allocate_enrollment_pin(
                     db, None, student.id, avoid_pins=frozenset(batch_reserved), **peer_kwargs
-                )
+                ) if idx == 0 else ""
                 batch_reserved.add(p)
                 seg_payload.append(
                     {
@@ -6735,7 +6775,7 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                         "lesson_to": hi,
                         "reminder_lesson": _default_installment_reminder_lesson(lo, hi),
                         "pin": p,
-                        "paid": idx == 0,
+                        "paid": False,
                         **(
                             {"amount_hkd": float(inst_amounts[idx])}
                             if inst_amounts is not None and idx < len(inst_amounts)
@@ -6843,12 +6883,12 @@ def admin_course_mark_installment_paid(
     course_id: int,
     payload: CourseInstallmentMarkPaid,
     db: Session = Depends(get_db),
-    user: AppUser = Depends(require_admin_or_clerk),
+    user: AppUser = Depends(require_admin),
 ) -> CourseOut:
     """[F002][S002]
     Feature: Course Entry & Automation
     Step: Unlock scheduled-package installment PIN after staff confirms payment
-    Logic: Sets ``paid: true`` on matching segment in ``segment_pins_json`` — check-in rejects unpaid segments.
+    Logic: Confirm scoped funds under a row lock, issue the eligible PIN, then notify both parties once.
     """
     if _is_deleted(db, "course_enrollments", course_id):
         raise HTTPException(status_code=404, detail="Course not found.")
@@ -6858,28 +6898,57 @@ def admin_course_mark_installment_paid(
             CourseEnrollment.id == course_id,
             CourseEnrollment.student_id == payload.student_id,
         )
+        .with_for_update()
         .first()
     )
     if not enr:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     raw = getattr(enr, "segment_pins_json", None)
     if not raw:
-        raise HTTPException(status_code=400, detail="This enrollment has no installment PIN segments.")
+        # [F004][S002] The same confirmation action also supports a one-payment course.
+        raw = json.dumps([{"installment_no": 1, "lesson_from": 1, "lesson_to": enr.total_lessons,
+                           "pin": enr.checkin_pin, "paid": False}])
     try:
         rows = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=500, detail="Corrupt installment segment payload.") from exc
     if not isinstance(rows, list):
         raise HTTPException(status_code=500, detail="Invalid installment segment payload.")
-    touched = False
-    for row in rows:
-        if isinstance(row, dict) and int(row.get("installment_no") or 0) == payload.installment_no:
-            row["paid"] = True
-            touched = True
-            break
-    if not touched:
+    row = next((r for r in rows if isinstance(r, dict) and int(r.get("installment_no") or 0) == payload.installment_no), None)
+    if row is None:
         raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")
+    # [F004][S002] Confirm the scoped payment once; repeated clicks neither rotate PIN nor resend.
+    state = course_payment_state(enr)
+    existing = (state.get("payments") or {}).get(f"installment:{payload.installment_no}")
+    if len(rows) == 1:
+        existing = existing or (state.get("payments") or {}).get("full")
+    pending = state.setdefault("pending_payments", {}).get(str(payload.installment_no)) or state["pending_payments"].get("full", {})
+    if existing and not pending:
+        return enrollment_to_out(enr)
+    amount = pending.get("amount")
+    if amount is None:
+        amount = row.get("amount_hkd")
+    if amount is None or float(amount) <= 0:
+        raise HTTPException(status_code=400, detail="請先上傳有金額的付款收據或設定本期金額。")
+    state["pending_payments"].pop(str(payload.installment_no), None)
+    if pending.get("full_payment"):
+        state["pending_payments"].pop("full", None)
+    for segment in rows:
+        if int(segment.get("installment_no", 0)) > 1 and not segment.get("paid") and (segment is row or pending.get("full_payment")):
+            segment["pin"] = ""  # [F003][S002] Do not expose a legacy pre-issued code as a newly approved PIN.
+    if len(rows) == 1:
+        row["amount_hkd"] = state.get("total_amount") or amount
+    enr.payment_state_json = json.dumps(state, ensure_ascii=False)
     enr.segment_pins_json = json.dumps(rows, ensure_ascii=False)
+    record_course_payment(enr, amount=amount, installment_no=payload.installment_no,
+                          full_payment=bool(pending.get("full_payment")) or len(rows) == 1, receipt_id=pending.get("receipt_id"))
+    _issue_confirmed_course_pins(db, enr)
+    record_activity(db, enr.student, "admin_confirm_installment_payment", enr.id)
+    db.commit()
+    send_payment_whatsapp_notifications(
+        db, log_whatsapp, student=enr.student, course_enrollment_id=enr.id,
+        installment_no=payload.installment_no, receipt_confirmed=None, notify_coach=True,
+    )
     db.commit()
     full = (
         db.query(CourseEnrollment)
