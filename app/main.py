@@ -6283,14 +6283,20 @@ def import_students_csv(
                 existing.emergency_contact_relationship = emerg_rel
             if emerg_phone is not None:
                 existing.emergency_contact_phone = emerg_phone
-            existing.email = email
-            existing.health_notes = health_notes
-            existing.disclaimer_accepted = disc_bool
+            # [F001][S003] A roster without these columns must not erase existing profile data.
+            supplied_columns = {str(key).strip().lower() for key in row if key is not None}
+            if "email" in supplied_columns:
+                existing.email = email
+            if "health_notes" in supplied_columns:
+                existing.health_notes = health_notes
+            if "disclaimer_accepted" in supplied_columns:
+                existing.disclaimer_accepted = disc_bool
             if wa_raw:
                 _set_whatsapp_reminder_opt_in(existing, wa_bool)
             ledger_sum = _lesson_balance_sum(db, existing.id)
             adj = int(balance) - ledger_sum
-            if adj != 0:
+            # [F001][S003] Numbers member rosters omit balances: retain existing lessons on re-import.
+            if csv_cell(row, "lesson_balance") and adj != 0:
                 db.add(
                     LessonLedgerEntry(
                         student_id=existing.id,
@@ -6301,7 +6307,8 @@ def import_students_csv(
                     )
                 )
                 db.flush()
-            existing.face_id_external = face
+            if "face_id_external" in supplied_columns:
+                existing.face_id_external = face
             if local_eight:
                 existing.phone = f"+852{local_eight}"
             updated += 1

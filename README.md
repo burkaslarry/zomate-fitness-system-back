@@ -151,3 +151,9 @@ English: earlier rollout limitations above describe the previous release. This r
 首期未付款仍發五位 PIN，僅限首期堂數；第二／三期由 Admin 確認足額後發新 PIN，舊 PIN 不可跨期。學生／教練上傳收據不自行解鎖；Admin 確認會同步原有學生／教練通知，重複確認不換碼、不重發。學生詳情頁提供持續確認入口。
 
 English: first-term credit is distinct from paid status; later PIN issuance is gated by Admin confirmation and the current lesson tranche. Provider-stub regression tests cover these rules. No new live WhatsApp test is implied.
+
+## [F001][S003] Numbers CSV member import / Numbers 會員 CSV 匯入
+
+Upload the original Numbers-exported CSV at Student Management → Import CSV / Excel. Leading blank lines and `Table 1` / `表格 1` title rows are removed before existing Fung/system header mapping. Quoted names containing commas are preserved. Re-import matches normalized HK phone plus name; it does not create duplicate students. Omitted balance/profile columns preserve existing values; an explicitly supplied `lesson_balance=0` remains an intentional balance adjustment.
+
+可直接上傳 Numbers 輸出嘅原始 CSV，唔使人手刪除 `Table 1` 標題。系統按姓名及電話核對新增／更新；同電話不同姓名會略過並顯示原因。名單冇堂數／email 等欄位時，重匯入會保留現有資料。操作及驗證見 [CSV 匯入說明](docs/CSV-IMPORT.zh-Hant.md)。

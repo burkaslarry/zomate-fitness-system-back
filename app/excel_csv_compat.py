@@ -356,6 +356,19 @@ def fix_fung_student_csv_headers(raw: str) -> str:
     rows = list(csv.reader(buf))
     if not rows:
         return raw
+    # [F001][S003] Numbers exports prepend table titles before the actual CSV header.
+    # Remove only blank rows / explicit table titles, never search past arbitrary data.
+    while rows:
+        populated = [str(cell).strip().lstrip("\ufeff").strip() for cell in rows[0]
+                     if str(cell).strip().lstrip("\ufeff").strip()]
+        is_table_title = len(populated) == 1 and re.fullmatch(
+            r"(?:Table|表格)\s*\d+", populated[0], flags=re.IGNORECASE
+        )
+        if populated and not is_table_title:
+            break
+        rows.pop(0)
+    if not rows:
+        return ""
     header = rows[0]
     ec_count = 0
     for i, cell in enumerate(header):
