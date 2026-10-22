@@ -157,3 +157,8 @@ English: first-term credit is distinct from paid status; later PIN issuance is g
 Upload the original Numbers-exported CSV at Student Management → Import CSV / Excel. Leading blank lines and `Table 1` / `表格 1` title rows are removed before existing Fung/system header mapping. Quoted names containing commas are preserved. Re-import matches normalized HK phone plus name; it does not create duplicate students. Omitted balance/profile columns preserve existing values; an explicitly supplied `lesson_balance=0` remains an intentional balance adjustment.
 
 可直接上傳 Numbers 輸出嘅原始 CSV，唔使人手刪除 `Table 1` 標題。系統按姓名及電話核對新增／更新；同電話不同姓名會略過並顯示原因。名單冇堂數／email 等欄位時，重匯入會保留現有資料。操作及驗證見 [CSV 匯入說明](docs/CSV-IMPORT.zh-Hant.md)。
+
+### [F003][S004] Same-day staff booking / 職員即日排堂 (2026-10-23)
+Assigned coaches and authorized staff can make a first booking for today, including a slot already in progress but not ended (Hong Kong time). Open the coach portal, select today and an unexpired slot, then use the student's current PIN for same-day check-in. Past/ended slots, conflicting bookings and edits through first-confirmation are rejected. The 72-hour replacement-slot and 24-hour cancellation/change rules, Today-only PIN, installment payment gates and duplicate attendance protection remain enforced.
+
+獲授權教練／職員首次排堂可選今日，包括已開始但未完結時段（香港時間）。教練首頁選今日、未完堂時段並確認，學生可用當期 PIN 即日簽到。已完堂、撞堂及重複確認整個課程會被拒絕；改期新時段仍須提前 72 小時，改期／取消仍須提前 24 小時。Today-only、後續分期付款及防重複扣堂規則繼續生效。

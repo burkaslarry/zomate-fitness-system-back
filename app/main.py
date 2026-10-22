@@ -700,6 +700,13 @@ def _assert_booking_notice(start: datetime) -> None:
         raise HTTPException(status_code=400, detail="預約必須最少提前 72 小時。")
 
 
+def _assert_initial_staff_booking(start: datetime, end: datetime) -> None:
+    """[F003][S004] Assigned staff may book today, including an ongoing, unexpired slot."""
+    now = _session_policy_now()
+    if start.date() < now.date() or end <= now:
+        raise HTTPException(status_code=400, detail="不能安排已完結的課堂，請選今日未完結或未來時段。")
+
+
 def _assert_change_notice(start: datetime) -> None:
     """[F003][S004] Changes/cancellations require at least 24 hours' notice."""
     if start < _session_policy_now() + timedelta(hours=24):
@@ -7946,7 +7953,7 @@ def coach_book_session(
         raise HTTPException(status_code=400, detail="請喺日曆揀指定一堂改期；系統不會一次改動整個課程。")
     start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
-    _assert_booking_notice(start)
+    _assert_initial_staff_booking(start, end)
     _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
     return coach_confirm_enrollment_schedule(
         enrollment_id=payload.enrollment_id,
@@ -7979,10 +7986,13 @@ def coach_confirm_enrollment_schedule(
         raise HTTPException(status_code=404, detail="Course not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
+    # [F003][S004] Confirmed series must use the scoped, notice-checked reschedule API.
+    if enr.coach_time_confirmed:
+        raise HTTPException(status_code=400, detail="請喺日曆揀指定一堂改期；系統不會一次改動整個課程。")
     first_day = payload.day
     start = datetime.combine(first_day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
-    _assert_booking_notice(start)
+    _assert_initial_staff_booking(start, end)
     _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id)
     # [F003][S002] First booking uses coach-picked calendar day (not legacy placeholder weekday).
     ws_raw = [first_day.weekday()]
