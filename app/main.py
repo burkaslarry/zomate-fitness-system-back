@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import distinct, func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -402,6 +403,16 @@ def _record_soft_delete(db: Session, entity_type: str, entity_id: int, actor: Ap
             deleted_hard=False,
         )
     )
+
+
+def _clear_soft_delete(db: Session, entity_type: str, entity_id: int) -> bool:
+    """[F001][S003] Undelete soft-deleted entity; return True if a DeletedRecord was removed."""
+    deleted = (
+        db.query(DeletedRecord)
+        .filter(DeletedRecord.entity_type == entity_type, DeletedRecord.entity_id == entity_id)
+        .delete(synchronize_session=False)
+    )
+    return bool(deleted)
 
 
 def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
@@ -1279,6 +1290,7 @@ def _student_import_skip_message(
         "missing_name": "缺少姓名",
         "missing_phone": "缺少有效電話",
         "phone_exists_name_mismatch": "電話已存在但姓名唔同",
+        "db_conflict": "資料庫衝突",
     }
     parts = [f"第{row_no}行", labels.get(code, code)]
     if field:
@@ -6188,9 +6200,10 @@ def export_students_fung_csv(
 def import_students_csv(
     file: UploadFile = File(...), db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> dict:
-    """[F001][S003] Batch upsert. Accepts CSV or Excel (.xlsx/.xls; prefers 學生資料 sheet).
+    """[F001][S003] Additive batch upsert — never deletes existing students.
 
-    Headers: system English or Fung Excel. Returns skip_reasons for diagnostics.
+    Accepts CSV or Excel (.xlsx/.xls; prefers 學生資料 sheet). Existing lesson balances
+    are preserved on match; soft-deleted phone matches are restored instead of skipped.
     """
     raw_bytes = file.file.read()
     try:
@@ -6217,10 +6230,16 @@ def import_students_csv(
         )
     added = 0
     updated = 0
+    restored = 0
     skipped = 0
     skip_reasons: list[dict] = []
-    active_students_sq = ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
+    deleted_student_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    active_students_sq = ~Student.id.in_(deleted_student_ids)
+    before_count = db.query(func.count(Student.id)).filter(active_students_sq).scalar() or 0
     fung_mode = is_fung_student_headers(fieldnames)
+    header_keys = {(h or "").strip().lstrip("\ufeff").lower() for h in fieldnames if h}
+    # Prefer real phone columns; only fall back to MemberCode when no phone header exists.
+    has_phone_header = bool(header_keys & {"phone number", "phone", "電話號碼"})
 
     def _skip(
         row_no: int,
@@ -6250,7 +6269,10 @@ def import_students_csv(
 
     for row_idx, row in enumerate(reader, start=2):
         full_name = csv_cell(row, "Name", "full_name", "會員", "姓名")
-        phone_raw = csv_cell(row, "phone number", "phone", "電話號碼", "MemberCode", "Member Code")
+        if has_phone_header:
+            phone_raw = csv_cell(row, "phone number", "phone", "電話號碼")
+        else:
+            phone_raw = csv_cell(row, "phone number", "phone", "電話號碼", "MemberCode", "Member Code")
         hkid_raw = csv_cell(row, "ID Number", "hkid")
         if not full_name and not phone_raw and not hkid_raw:
             continue
@@ -6271,152 +6293,188 @@ def import_students_csv(
         disc = csv_cell(row, "disclaimer_accepted") or "1"
         wa_raw = csv_cell(row, "whatsapp_reminder_opt_in")
         face = csv_cell(row, "face_id_external") or None
-        balance_raw = csv_cell(row, "lesson_balance") or "0"
+        balance_raw = csv_cell(row, "lesson_balance")
 
         hkid_norm = normalize_hkid(hkid_raw) if hkid_raw else None
-        # Incomplete DOB should not block import — leave null
         dob = parse_flexible_date(dob_raw) if dob_raw else None
         gender = normalize_gender(gender_raw)
         disc_bool = disc.strip().lower() in ("1", "true", "yes", "y")
         wa_bool = True if not wa_raw else wa_raw.strip().lower() in ("1", "true", "yes", "y")
         try:
-            balance = int(balance_raw.strip() or 0)
+            balance = int((balance_raw or "0").strip() or 0)
         except ValueError:
             balance = 0
 
         local_eight = normalize_hk_phone_local_eight(phone_raw) if phone_raw else None
         variants = _hk_phone_lookup_variants(local_eight) if local_eight else []
 
-        existing: Student | None = None
-        if variants:
-            existing = db.query(Student).filter(active_students_sq, Student.phone.in_(variants)).first()
+        try:
+            with db.begin_nested():
+                existing: Student | None = None
+                was_soft_deleted = False
+                if variants:
+                    # Include soft-deleted so we restore instead of failing unique phone / "losing" roster.
+                    existing = db.query(Student).filter(Student.phone.in_(variants)).first()
+                    if existing is not None and _is_deleted(db, "students", existing.id):
+                        was_soft_deleted = True
 
-        if existing is not None:
-            csv_name_key = _normalize_student_csv_name(full_name)
-            if not csv_name_key:
-                _skip(
-                    row_idx,
-                    "missing_name",
-                    field="Name / full_name / 姓名",
-                    phone=phone_raw,
-                    detail="電話已在系統，但 CSV 姓名欄空白",
-                )
-                continue
-            if _normalize_student_csv_name(existing.full_name) != csv_name_key:
-                _skip(
-                    row_idx,
-                    "phone_exists_name_mismatch",
-                    field="Name / phone number",
-                    name=full_name,
-                    phone=phone_raw,
-                    detail=f"系統已有 {existing.full_name}",
-                )
-                continue
-            if full_name:
-                existing.full_name = full_name.strip()
-            if hkid_norm:
-                existing.hkid = hkid_norm
-            if dob is not None:
-                existing.date_of_birth = dob
-            if gender:
-                existing.gender = gender
-            if emerg_name is not None:
-                existing.emergency_contact_name = emerg_name
-            if emerg_rel is not None:
-                existing.emergency_contact_relationship = emerg_rel
-            if emerg_phone is not None:
-                existing.emergency_contact_phone = emerg_phone
-            # [F001][S003] A roster without these columns must not erase existing profile data.
-            supplied_columns = {str(key).strip().lower() for key in row if key is not None}
-            if "email" in supplied_columns:
-                existing.email = email
-            if "health_notes" in supplied_columns:
-                existing.health_notes = health_notes
-            if "disclaimer_accepted" in supplied_columns:
-                existing.disclaimer_accepted = disc_bool
-            if wa_raw:
-                _set_whatsapp_reminder_opt_in(existing, wa_bool)
-            ledger_sum = _lesson_balance_sum(db, existing.id)
-            adj = int(balance) - ledger_sum
-            # [F001][S003] Numbers member rosters omit balances: retain existing lessons on re-import.
-            if csv_cell(row, "lesson_balance") and adj != 0:
-                db.add(
-                    LessonLedgerEntry(
-                        student_id=existing.id,
-                        enrollment_id=None,
-                        delta_lessons=adj,
-                        reason="admin_csv_import",
-                        created_by_role=user.role.lower(),
+                if existing is not None:
+                    csv_name_key = _normalize_student_csv_name(full_name)
+                    if not csv_name_key:
+                        _skip(
+                            row_idx,
+                            "missing_name",
+                            field="Name / full_name / 姓名",
+                            phone=phone_raw,
+                            detail="電話已在系統，但 CSV 姓名欄空白",
+                        )
+                        continue
+                    if _normalize_student_csv_name(existing.full_name) != csv_name_key:
+                        _skip(
+                            row_idx,
+                            "phone_exists_name_mismatch",
+                            field="Name / phone number",
+                            name=full_name,
+                            phone=phone_raw,
+                            detail=f"系統已有 {existing.full_name}",
+                        )
+                        continue
+                    if was_soft_deleted:
+                        if _clear_soft_delete(db, "students", existing.id):
+                            restored += 1
+                    if full_name:
+                        existing.full_name = full_name.strip()
+                    if hkid_norm:
+                        existing.hkid = hkid_norm
+                    if dob is not None:
+                        existing.date_of_birth = dob
+                    if gender:
+                        existing.gender = gender
+                    if emerg_name is not None:
+                        existing.emergency_contact_name = emerg_name
+                    if emerg_rel is not None:
+                        existing.emergency_contact_relationship = emerg_rel
+                    if emerg_phone is not None:
+                        existing.emergency_contact_phone = emerg_phone
+                    supplied_columns = {str(key).strip().lower() for key in row if key is not None}
+                    if "email" in supplied_columns:
+                        existing.email = email
+                    if "health_notes" in supplied_columns:
+                        existing.health_notes = health_notes
+                    if "disclaimer_accepted" in supplied_columns:
+                        existing.disclaimer_accepted = disc_bool
+                    if wa_raw:
+                        _set_whatsapp_reminder_opt_in(existing, wa_bool)
+                    # [F001][S003] Never adjust lesson ledger on update — mass import must not wipe packages.
+                    if "face_id_external" in supplied_columns:
+                        existing.face_id_external = face
+                    if local_eight:
+                        existing.phone = f"+852{local_eight}"
+                    updated += 1
+                    continue
+
+                if not full_name:
+                    _skip(
+                        row_idx,
+                        "missing_name",
+                        field="Name / full_name / 姓名",
+                        phone=phone_raw,
+                        detail="請填學員姓名",
                     )
+                    continue
+                if not local_eight:
+                    _skip(
+                        row_idx,
+                        "missing_phone",
+                        field="phone number / MemberCode",
+                        name=full_name,
+                        detail="須為香港 8 位數字",
+                    )
+                    continue
+
+                canonical = f"+852{local_eight}"
+                st = Student(
+                    full_name=full_name,
+                    phone=canonical,
+                    hkid=hkid_norm,
+                    gender=gender,
+                    date_of_birth=dob,
+                    email=email,
+                    health_notes=health_notes,
+                    disclaimer_accepted=disc_bool if csv_cell(row, "disclaimer_accepted") else True,
+                    whatsapp_reminder_opt_in=wa_bool,
+                    whatsapp_reminder_opt_in_at=datetime.utcnow() if wa_bool else None,
+                    face_id_external=face,
+                    emergency_contact_name=emerg_name,
+                    emergency_contact_relationship=emerg_rel,
+                    emergency_contact_phone=emerg_phone,
                 )
+                db.add(st)
                 db.flush()
-            if "face_id_external" in supplied_columns:
-                existing.face_id_external = face
-            if local_eight:
-                existing.phone = f"+852{local_eight}"
-            updated += 1
-            continue
-
-        if not full_name:
+                if balance > 0:
+                    db.add(
+                        LessonLedgerEntry(
+                            student_id=st.id,
+                            enrollment_id=None,
+                            delta_lessons=balance,
+                            reason="admin_csv_import_new",
+                            created_by_role=user.role.lower(),
+                        )
+                    )
+                    db.flush()
+                added += 1
+        except IntegrityError:
             _skip(
                 row_idx,
-                "missing_name",
-                field="Name / full_name / 姓名",
-                phone=phone_raw,
-                detail="請填學員姓名",
-            )
-            continue
-        if not local_eight:
-            _skip(
-                row_idx,
-                "missing_phone",
-                field="phone number / MemberCode",
+                "db_conflict",
+                field="phone / face_id",
                 name=full_name,
-                detail="須為香港 8 位數字",
+                phone=phone_raw,
+                detail="資料庫唯一鍵衝突（電話或 face id 已存在）",
             )
-            continue
-
-        canonical = f"+852{local_eight}"
-
-        st = Student(
-            full_name=full_name,
-            phone=canonical,
-            hkid=hkid_norm,
-            gender=gender,
-            date_of_birth=dob,
-            email=email,
-            health_notes=health_notes,
-            disclaimer_accepted=disc_bool if csv_cell(row, "disclaimer_accepted") else True,
-            whatsapp_reminder_opt_in=wa_bool,
-            whatsapp_reminder_opt_in_at=datetime.utcnow() if wa_bool else None,
-            face_id_external=face,
-            emergency_contact_name=emerg_name,
-            emergency_contact_relationship=emerg_rel,
-            emergency_contact_phone=emerg_phone,
-        )
-        db.add(st)
-        db.flush()
-        if balance != 0:
-            db.add(
-                LessonLedgerEntry(
-                    student_id=st.id,
-                    enrollment_id=None,
-                    delta_lessons=balance,
-                    reason="admin_csv_import_new",
-                    created_by_role=user.role.lower(),
-                )
-            )
-            db.flush()
-        added += 1
 
     db.commit()
+    after_count = (
+        db.query(func.count(Student.id))
+        .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
+        .scalar()
+        or 0
+    )
     return {
         "imported": added,
         "updated": updated,
+        "restored": restored,
         "skipped": skipped,
+        "before_count": int(before_count),
+        "after_count": int(after_count),
         "format": "fung" if fung_mode else "system",
         "skip_reasons": skip_reasons,
+        "note": "Import never deletes students; existing lesson balances are preserved on update.",
     }
+
+
+@app.post("/api/admin/students/restore-soft-deleted")
+def restore_soft_deleted_students(
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F001][S003] Undelete all soft-deleted students (recovery after accidental roster wipe)."""
+    rows = (
+        db.query(DeletedRecord)
+        .filter(DeletedRecord.entity_type == "students", DeletedRecord.deleted_hard.is_(False))
+        .all()
+    )
+    restored_ids: list[int] = []
+    for row in rows:
+        student = db.get(Student, row.entity_id)
+        if student is None:
+            db.delete(row)
+            continue
+        db.delete(row)
+        restored_ids.append(int(row.entity_id))
+    db.commit()
+    log_event("students_restore_soft_deleted", actor=user.username, count=len(restored_ids))
+    return {"ok": True, "restored": len(restored_ids), "student_ids": restored_ids}
 
 
 @app.delete("/api/admin/students/{student_id}")
