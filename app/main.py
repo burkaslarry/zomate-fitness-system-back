@@ -936,7 +936,11 @@ def _save_member_receipt_row(
     payment_confirmed: bool = False,
 ) -> dict:
     """[F004][S002] Persist receipt, optionally match installment/renewal, and log WhatsApp payment reminders."""
-    # [F004][S002] Unscoped uploads can infer only a unique course, never the latest of several.
+    # [F004][S002] Require an explicit Course only when WhatsApp would unlock / scope a PIN tranche.
+    # Renewal「跟進收條」uploads notify「已收到收據」without course selection.
+    needs_course_scope = (
+        installment_no is not None or full_payment or installment_plan_id is not None
+    )
     if course_enrollment_id is None:
         courses = db.query(CourseEnrollment).filter(
             CourseEnrollment.student_id == student.id,
@@ -944,7 +948,7 @@ def _save_member_receipt_row(
         ).limit(2).all()
         if len(courses) == 1:
             course_enrollment_id = courses[0].id
-        elif len(courses) > 1 and send_whatsapp:
+        elif len(courses) > 1 and send_whatsapp and needs_course_scope:
             raise HTTPException(status_code=400, detail="請選擇對應 Course，避免通知錯誤課程。")
     path = _save_upload_file(file, "receipts", member_key, 5 * 1024 * 1024)
     note_text = (note or "").strip()
@@ -1022,11 +1026,19 @@ def _save_member_receipt_row(
             pending = state.setdefault("pending_payments", {})
             pending["full" if full_payment else str(installment_no) if installment_no else "unassigned"] = {"amount": amount, "receipt_id": receipt.id, "full_payment": full_payment}
             paid_course.payment_state_json = json.dumps(state, ensure_ascii=False)
+    # [F005][S003] File saved = Zomate 已收到收據 for WhatsApp API wording (student + coach).
+    # payment_confirmed still gates PIN unlock separately from this acknowledgement.
+    if send_whatsapp:
+        wa_receipt_confirmed = True
+    elif payment_confirmed:
+        wa_receipt_confirmed = None if course_enrollment_id is not None else True
+    else:
+        wa_receipt_confirmed = False
     whatsapp_result = send_payment_whatsapp_notifications(
         db,
         log_whatsapp,
         student=student,
-        receipt_confirmed=(None if course_enrollment_id is not None else True) if payment_confirmed else False,
+        receipt_confirmed=wa_receipt_confirmed,
         notify_coach=notify_coach,
         course_enrollment_id=course_enrollment_id,
         installment_no=installment_no,
