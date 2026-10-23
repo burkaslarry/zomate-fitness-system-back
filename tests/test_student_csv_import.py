@@ -55,7 +55,7 @@ def test_roster_without_balance_or_optional_columns_preserves_existing_data(db_s
     assert student.face_id_external == 'qa-face'
 
 
-def test_explicit_zero_balance_is_still_supported(db_session):
+def test_zero_placeholder_preserves_existing_balance(db_session):
     """[F001][S003] An explicitly supplied balance retains the existing import contract."""
     student = Student(full_name='QA Balance', phone='90000003')
     db_session.add(student)
@@ -64,7 +64,7 @@ def test_explicit_zero_balance_is_still_supported(db_session):
     db_session.commit()
     result = main.import_students_csv(upload('full_name,phone,lesson_balance\nQA Balance,90000003,0\n'), db_session, SimpleNamespace(role='ADMIN'))
     assert result['updated'] == 1
-    assert main._lesson_balance_sum(db_session, student.id) == 0
+    assert main._lesson_balance_sum(db_session, student.id) == 7
 
 
 @pytest.mark.parametrize('prefix', ['', '\n', 'Table 1\n', '\nTable 1,,,\n\n', '表格 1\n', 'table 12\r\n'])

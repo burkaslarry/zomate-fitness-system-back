@@ -9,7 +9,8 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta
 
-from .models import CourseEnrollment
+from .models import CourseEnrollment, CourseSessionOverride
+from sqlalchemy.orm import Session
 from .schemas import CourseEnrollmentOut, CourseOut, InstallmentSegmentPinOut
 from .timezone import HK
 
@@ -160,3 +161,22 @@ def enrollment_to_out(enr: CourseEnrollment) -> CourseOut:
         coach_time_confirmed=bool(getattr(enr, "coach_time_confirmed", True)),
         enrollments=enrollments,
     )
+
+
+def confirmed_lesson_slots(db: Session, enr: CourseEnrollment) -> list[tuple[datetime, datetime, date]]:
+    """[F003][S009] Only explicitly coach-booked lessons are actionable; never inferred weekly dates."""
+    if not enr.coach_time_confirmed:
+        return []
+    overrides = {r.original_date: r for r in db.query(CourseSessionOverride).filter(
+        CourseSessionOverride.enrollment_id == enr.id).all()}
+    slots = []
+    # [F003][S009] Preserve the first legacy booking; later lessons require their own confirmation.
+    for original in sorted({enr.scheduled_start.date(), *overrides.keys()}):
+        row = overrides.get(original)
+        if row and row.action == "cancelled":
+            continue
+        if row and row.action in {"scheduled", "rescheduled"} and row.rescheduled_start and row.rescheduled_end:
+            slots.append((row.rescheduled_start, row.rescheduled_end, original))
+        elif original == enr.scheduled_start.date():
+            slots.append((enr.scheduled_start, enr.scheduled_end, original))
+    return slots

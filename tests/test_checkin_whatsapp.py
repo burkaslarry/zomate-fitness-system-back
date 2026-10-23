@@ -28,13 +28,14 @@ def _checkin_data(db, opted_in=True):
 
 
 @pytest.mark.parametrize("opted_in,has_coach,expected_keys", [
-    (True, True, ["payment_student_pending", "payment_coach"]),
-    (False, True, ["payment_coach"]),
-    (True, False, ["payment_student_pending"]),
+    (True, True, ["checkin_coach"]),
+    (False, True, ["checkin_coach"]),
+    (True, False, []),
 ])
 def test_successful_checkin_notifies_only_expected_recipients(db_session, monkeypatch, opted_in, has_coach, expected_keys):
     """[F003][S003] Verify dynamic data, persisted attendance, consent and no duplicate send."""
     student, coach, enrollment = _checkin_data(db_session, opted_in)
+    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 13, 10))
     captured = []
     if not has_coach:
         coach.phone = ""
@@ -70,6 +71,7 @@ def test_successful_checkin_notifies_only_expected_recipients(db_session, monkey
 def test_checkin_does_not_notify_when_commit_fails(db_session, monkeypatch):
     """[F003][S003] A failed attendance write must not send a false success message."""
     student, coach, enrollment = _checkin_data(db_session)
+    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 13, 10))
     captured = []
 
     def capture(*args, **kwargs):

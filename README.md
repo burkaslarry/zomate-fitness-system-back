@@ -162,3 +162,15 @@ Upload the original Numbers-exported CSV at Student Management → Import CSV / 
 Assigned coaches and authorized staff can make a first booking for today, including a slot already in progress but not ended (Hong Kong time). Open the coach portal, select today and an unexpired slot, then use the student's current PIN for same-day check-in. Past/ended slots, conflicting bookings and edits through first-confirmation are rejected. The 72-hour replacement-slot and 24-hour cancellation/change rules, Today-only PIN, installment payment gates and duplicate attendance protection remain enforced.
 
 獲授權教練／職員首次排堂可選今日，包括已開始但未完結時段（香港時間）。教練首頁選今日、未完堂時段並確認，學生可用當期 PIN 即日簽到。已完堂、撞堂及重複確認整個課程會被拒絕；改期新時段仍須提前 72 小時，改期／取消仍須提前 24 小時。Today-only、後續分期付款及防重複扣堂規則繼續生效。
+
+### [F003][S002][S009] Explicit lessons / 逐堂排程 (2026-10-23)
+Coach-approved initial slots may be today or tomorrow. Each next lesson must be explicitly booked using “排下一堂”; inferred weekly dates do not allow check-in. A successful attendance locks that course/day, disappears from the student picker and cannot be rescheduled/cancelled. Concurrent redemption is serialized by a student row lock. The existing one check-in per course per Hong Kong calendar day remains. Legacy first appointments and explicit reschedules are retained; no records are deleted.
+教練可安排即日／翌日上堂；往後每一堂須按「排下一堂」獨立確認，系統不再以推算每週日期開放簽到。未排堂拒絕簽到；完成後隱藏及鎖定該堂，不可改期／取消或重複扣堂。保留同一課程每日一次簽到限制，舊首堂及明確改期保留，沒有刪除記錄。
+
+### [F008][S005] Calendar / 教練日曆
+Day/week use hourly appointment blocks with overlap lanes; month shows every booked appointment. “今天” and period navigation share the same API and display full details on click.
+日／週提供時間軸與並排撞時課堂，月曆列出每一堂；可切換今天、上一段／下一段及完整課堂詳情，已簽到會顯示鎖定。
+
+### [F004][S002] Payment edit / 付款詳情編輯
+Admin: payment record → details → edit → save. Pending amounts, payment method, Hong Kong date and notes can be corrected (installments: amount/date/due date). Confirmed amounts are locked to preserve payment/PIN gates; metadata remains editable. Changes are audited and do not auto-confirm funds or send notifications.
+Admin：付款紀錄 → 詳情 → 編輯付款詳情 → 儲存修改。可改待確認金額、付款方式、香港日期及備註；分期記錄可改未付金額、日期及到期日。已確認金額鎖定以保護付款／PIN 狀態，其他資料仍可編輯。每次修改保留稽核紀錄，不會自動確認付款或發訊息。

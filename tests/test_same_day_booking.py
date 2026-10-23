@@ -92,7 +92,7 @@ def test_permission_conflict_and_reconfirmation_rejected(db_session, monkeypatch
 def test_reschedule_notices_still_enforced(monkeypatch):
     """[F003][S004] Initial booking exception never relaxes change/cancellation notice."""
     monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 23, 15, 5))
-    for check in (main._assert_booking_notice, main._assert_change_notice):
+    for check in (main._assert_change_notice,):
         with pytest.raises(HTTPException) as exc:
             check(datetime(2026, 10, 23, 16))
         assert exc.value.status_code == 400

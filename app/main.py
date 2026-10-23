@@ -152,6 +152,7 @@ from .schemas import (
     StudentRegisterV1,
     TrialClassCreate,
     PaymentNotificationSendBody,
+    PaymentRecordUpdate,
     WhatsAppTemplateOut,
     WhatsAppTemplateUpdate,
     WhatsAppAnalyticsOut,
@@ -738,41 +739,17 @@ def _session_override_map(db: Session, enrollment_id: int) -> dict[date, CourseS
 def _effective_intervals_for_enrollment_on_day(
     db: Session, enr: CourseEnrollment, day: date
 ) -> list[tuple[datetime, datetime, date]]:
-    """[F003][S009] Effective slots on a day after one-lesson cancel/reschedule overrides."""
-    overrides = _session_override_map(db, enr.id)
-    slots: list[tuple[datetime, datetime, date]] = []
-    for original_date in get_lesson_dates_for_enrollment(enr):
-        override = overrides.get(original_date)
-        if override and override.action == "cancelled":
-            continue
-        if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
-            if override.rescheduled_start.date() == day:
-                slots.append((override.rescheduled_start, override.rescheduled_end, original_date))
-            continue
-        if original_date == day:
-            start = datetime.combine(day, enr.scheduled_start.time())
-            end = datetime.combine(day, enr.scheduled_end.time())
-            if end <= start:
-                end = start + timedelta(hours=1)
-            slots.append((start, end, original_date))
-    return slots
+    """[F003][S009] Only explicitly confirmed appointments can appear or permit check-in."""
+    from .enrollment_schedule import confirmed_lesson_slots
+    return [(start, end, original) for start, end, original in confirmed_lesson_slots(db, enr)
+            if start.date() == day]
 
 
 def _next_effective_session_start(db: Session, enr: CourseEnrollment) -> datetime | None:
-    """[F003][S009] Find the next uncancelled lesson, including rescheduled overrides."""
-    now = _session_policy_now()
-    overrides = _session_override_map(db, enr.id)
-    starts: list[datetime] = []
-    for original_date in get_lesson_dates_for_enrollment(enr):
-        override = overrides.get(original_date)
-        if override and override.action == "cancelled":
-            continue
-        if override and override.action == "rescheduled" and override.rescheduled_start:
-            start = override.rescheduled_start
-        else:
-            start = datetime.combine(original_date, enr.scheduled_start.time())
-        if start >= now:
-            starts.append(start)
+    """[F003][S009] Find the next explicitly booked appointment, excluding cancelled lessons."""
+    from .enrollment_schedule import confirmed_lesson_slots
+    starts = [start for start, _end, _original in confirmed_lesson_slots(db, enr)
+              if start >= _session_policy_now()]
     return min(starts) if starts else None
 
 
@@ -2327,6 +2304,8 @@ def resolve_checkin_pin_context(
         .all()
     )
     for enr in enrs:
+        if not enr.coach_time_confirmed:
+            continue
         if not _enrollment_matches_class_pin(enr, pin):
             continue
         # [F003][S002] A previous tranche PIN cannot redeem lessons from a later tranche.
@@ -2343,7 +2322,10 @@ def resolve_checkin_pin_context(
         if not _segment_paid_for_matched_pin(enr, pin):
             return "blocked_installment_unpaid"
         if _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
-            return enr, enr.coach, "class_pin"
+            consumed = db.query(Attendance.id).filter(Attendance.course_id == enr.id,
+                Attendance.student_id == student.id, Attendance.session_calendar_date == now.date()).first()
+            if not consumed:
+                return enr, enr.coach, "class_pin"
         return None
     return None
 
@@ -2402,11 +2384,15 @@ def perform_lesson_checkin(
     pin_resolution: str = "unknown",
 ) -> tuple[dict, dict]:
     """[F003][S003] Persist successful check-in before notifying the student and course coach."""
+    # [F003][S002] Serialize check-ins and revalidate schedule; direct/FaceID paths cannot bypass it.
+    db.query(Student).filter(Student.id == student.id).with_for_update().one()
+    if resolved_enrollment is None or not resolved_enrollment.coach_time_confirmed or not _effective_intervals_for_enrollment_on_day(db, resolved_enrollment, now_hk().date()):
+        raise HTTPException(status_code=400, detail="請先由教練確認今日排程，再簽到。")
     if _lesson_balance_sum(db, student.id) <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
     attended_at = datetime.utcnow()
-    session_day = hk_calendar_date(attended_at)
+    session_day = now_hk().date()
 
     if resolved_enrollment:
         dup = (
@@ -2709,6 +2695,10 @@ def public_student_today_lessons(
     )
     out: list[dict] = []
     for enr in rows:
+        # [F003][S001] A completed appointment disappears immediately from public check-in choices.
+        if db.query(Attendance.id).filter(Attendance.course_id == enr.id,
+                Attendance.student_id == student.id, Attendance.session_calendar_date == today).first():
+            continue
         slots = _effective_intervals_for_enrollment_on_day(db, enr, today)
         if not slots:
             continue
@@ -5032,6 +5022,73 @@ def export_course_categories_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="course-categories.csv"'},
     )
+
+
+@app.patch("/api/admin/payment-records/{record_type}/{ref_id}")
+def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentRecordUpdate,
+    db: Session = Depends(get_db), user: AppUser = Depends(require_admin)) -> dict:
+    """[F004][S002] Audited Admin edit; never silently rewrite confirmed funds or issue notifications."""
+    models = {"renewal": (RenewalRecord, "renewal_records"), "receipt": (Receipt, "receipts"),
+              "installment": (InstallmentPayment, "installment_payments")}
+    if record_type not in models:
+        raise HTTPException(status_code=400, detail="Invalid payment record type.")
+    model, entity = models[record_type]
+    row = db.query(model).filter(model.id == ref_id).with_for_update().first()
+    if row is None or _is_deleted(db, entity, ref_id):
+        raise HTTPException(status_code=404, detail="Payment record not found.")
+    records = build_payment_records(db, file_url_fn=_file_url)
+    projection = next((r for r in records if r["record_type"] == record_type and r["ref_id"] == ref_id), None)
+    if projection is None:
+        raise HTTPException(status_code=404, detail="Active payment record not found.")
+    changes = payload.model_dump(exclude_unset=True)
+    if any(value is None for value in changes.values()):
+        raise HTTPException(status_code=400, detail="修改欄位不可為 null。")
+    amount_changed = "amount" in changes and float(changes["amount"]) != float(row.amount or 0)
+    if amount_changed and projection["status"] == "paid":
+        raise HTTPException(status_code=409, detail="已確認付款的金額已鎖定；可編輯方式、日期及備註，金額需另作更正處理。")
+    if "payment_method" in changes and (record_type == "installment" or not changes["payment_method"].strip()):
+        raise HTTPException(status_code=400, detail="此記錄不支援該付款方式修改。")
+    if "note" in changes and record_type == "installment":
+        raise HTTPException(status_code=400, detail="分期記錄不支援備註修改。")
+    if "due_date" in changes and record_type != "installment":
+        raise HTTPException(status_code=400, detail="此記錄沒有到期日欄位。")
+    # [F004][S002] A renewal with both confirmed and pending installments still owns historical money.
+    if amount_changed and record_type == "renewal":
+        for enr in db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).all():
+            state = course_payment_state(enr)
+            if state.get("renewal_id") == ref_id and state.get("payments"):
+                raise HTTPException(status_code=409, detail="此記錄已有已確認款項，金額需另作更正處理。")
+    before = {}
+    for key, value in changes.items():
+        field = "remarks" if key == "note" and record_type == "renewal" else key
+        before[key] = str(getattr(row, field, None))
+        if key == "created_at" and value.tzinfo is not None:
+            from datetime import timezone
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        setattr(row, field, value)
+    # [F004][S002] Keep receipt and its renewal amount/method in agreement; pending course funds follow.
+    receipt = db.get(Receipt, row.receipt_id) if record_type == "renewal" and row.receipt_id else None
+    if receipt:
+        for key in ("amount", "payment_method"):
+            if key in changes:
+                setattr(receipt, key, changes[key])
+    linked = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).with_for_update().all()
+    for enr in linked:
+        state = course_payment_state(enr)
+        matches = record_type == "renewal" and state.get("renewal_id") == ref_id
+        if amount_changed:
+            for pending in (state.get("pending_payments") or {}).values():
+                if matches or (record_type == "receipt" and pending.get("receipt_id") == ref_id):
+                    pending["amount"] = changes["amount"]
+            enr.payment_state_json = json.dumps(state, ensure_ascii=False)
+    db.add(AuditLog(action="payment_record_edit", student_id=projection["student_id"],
+        detail=json.dumps({"record_type": record_type, "ref_id": ref_id, "edited_by": user.username,
+                           "before": before, "after": {k: str(v) for k,v in changes.items()}}, ensure_ascii=False)))
+    db.commit()
+    updated = next(r for r in build_payment_records(db, student_id=projection["student_id"], file_url_fn=_file_url)
+        if r["record_type"] == record_type and r["ref_id"] == ref_id)
+    return {"ok": True, "record": updated}
+
 
 @app.delete("/api/admin/payment-records/{record_type}/{ref_id}")
 def admin_delete_payment_record(
@@ -8179,6 +8236,35 @@ def coach_remind_payment(
     )
 
 
+
+def _book_next_lesson(db: Session, user: AppUser, enr: CourseEnrollment, payload: CoachBookSession, cid: int) -> CourseOut:
+    """[F003][S009] Add one assigned-coach appointment without inventing a recurring series."""
+    from .enrollment_schedule import confirmed_lesson_slots
+    db.query(CourseEnrollment).filter(CourseEnrollment.id == enr.id).with_for_update().one()
+    start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
+    end = start + timedelta(hours=payload.duration_hours)
+    _assert_initial_staff_booking(start, end)
+    slots = confirmed_lesson_slots(db, enr)
+    if any(a.date() == payload.day for a, _b, _o in slots):
+        raise HTTPException(status_code=409, detail="此課程當日已有排程；已簽到課堂已鎖定，請選下一個上堂日期。")
+    if len(slots) >= enr.total_lessons:
+        raise HTTPException(status_code=400, detail="已排滿課程堂數。")
+    _assert_coach_slot_available(db, cid, payload.day, start, end)
+    row = db.query(CourseSessionOverride).filter(CourseSessionOverride.enrollment_id == enr.id,
+        CourseSessionOverride.original_date == payload.day).first()
+    row = row or CourseSessionOverride(enrollment_id=enr.id, original_date=payload.day)
+    row.action = "scheduled"
+    row.rescheduled_start, row.rescheduled_end = start, end
+    row.created_by_username = user.username
+    db.add(row)
+    record_activity(db, enr.student, "coach_book_next_lesson", enr.id)
+    db.commit()
+    send_payment_whatsapp_notifications(db, log_whatsapp, student=enr.student,
+        course_enrollment_id=enr.id, notify_coach=True)
+    db.commit()
+    return enrollment_to_out(enr)
+
+
 @app.post("/api/coach/bookings", response_model=CourseOut)
 def coach_book_session(
     payload: CoachBookSession,
@@ -8199,6 +8285,7 @@ def coach_book_session(
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == payload.enrollment_id)
+        .with_for_update().populate_existing()
         .first()
     )
     if not enr or _is_deleted(db, "course_enrollments", enr.id):
@@ -8206,7 +8293,7 @@ def coach_book_session(
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
     if enr.coach_time_confirmed:
-        raise HTTPException(status_code=400, detail="請喺日曆揀指定一堂改期；系統不會一次改動整個課程。")
+        return _book_next_lesson(db, user, enr, payload, cid)
     start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_initial_staff_booking(start, end)
@@ -8232,6 +8319,7 @@ def coach_confirm_enrollment_schedule(
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == enrollment_id)
+        .with_for_update().populate_existing()
         .first()
     )
     if not enr:
@@ -8326,7 +8414,9 @@ def _require_enrollment_session(
         raise HTTPException(status_code=404, detail="Enrollment not found.")
     if enr.coach_id != cid:
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
-    if original_date not in get_lesson_dates_for_enrollment(enr):
+    from .enrollment_schedule import confirmed_lesson_slots
+    actual = next(((a, b) for a, b, original in confirmed_lesson_slots(db, enr) if original == original_date), None)
+    if actual is None:
         raise HTTPException(status_code=404, detail="Lesson date not found in this course.")
     override = (
         db.query(CourseSessionOverride)
@@ -8338,8 +8428,10 @@ def _require_enrollment_session(
     )
     if override and override.action == "cancelled":
         raise HTTPException(status_code=409, detail="This lesson is already cancelled.")
-    start = datetime.combine(original_date, enr.scheduled_start.time())
-    end = datetime.combine(original_date, enr.scheduled_end.time())
+    start, end = actual
+    if db.query(Attendance.id).filter(Attendance.course_id == enr.id,
+            Attendance.student_id == enr.student_id, Attendance.session_calendar_date == start.date()).first():
+        raise HTTPException(status_code=409, detail="已簽到課堂已鎖定，不能改期或取消。")
     if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
         start = override.rescheduled_start
         end = override.rescheduled_end

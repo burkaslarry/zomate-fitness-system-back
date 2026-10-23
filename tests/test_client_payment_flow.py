@@ -171,7 +171,7 @@ def test_fixed_bodies_match_meta_approved_wording(db_session):
 def test_first_unpaid_pin_has_grace_but_cannot_cross_installment_boundary(db_session, monkeypatch):
     """[F003][S002] Unpaid first term is allowed; lesson 11 requires confirmed term 2 and its own PIN."""
     student, coach, enrollment = _course(db_session)
-    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 19, 11))
+    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 16, 10))
     assert main.resolve_checkin_pin_context(db_session, student, "10192")[0].id == enrollment.id
     for i in range(10):
         day = datetime(2026, 10, 1) + timedelta(days=i)

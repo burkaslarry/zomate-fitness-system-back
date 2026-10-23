@@ -10,7 +10,7 @@ from datetime import date, datetime, timedelta, time
 
 from sqlalchemy.orm import Session, joinedload
 
-from .enrollment_schedule import get_lesson_dates_for_enrollment
+from .enrollment_schedule import get_lesson_dates_for_enrollment, confirmed_lesson_slots
 from .models import Attendance, CategoryEnrollment, CourseCategory, CourseEnrollment, CourseSessionOverride
 from .timezone import hk_calendar_date, now_hk, utc_to_hk
 
@@ -139,21 +139,11 @@ def build_coach_session_rows(
         except (TypeError, ValueError):
             total_lessons = max(1, len(lesson_dates))
 
-        for original_date in lesson_dates:
+        booked_slots = confirmed_lesson_slots(db, enr)
+        for start_dt, end_dt, original_date in booked_slots:
             override = overrides.get((enr.id, original_date))
-            if override and override.action == "cancelled":
-                continue
-
-            session_date = original_date
-            start_dt = datetime.combine(original_date, enr.scheduled_start.time())
-            end_dt = datetime.combine(original_date, enr.scheduled_end.time())
-            override_label: str | None = None
-            if override and override.action == "rescheduled" and override.rescheduled_start and override.rescheduled_end:
-                session_date = override.rescheduled_start.date()
-                start_dt = override.rescheduled_start
-                end_dt = override.rescheduled_end
-                override_label = "rescheduled"
-
+            session_date = start_dt.date()
+            override_label = "rescheduled" if override and override.action == "rescheduled" else None
             if day is not None and session_date != day:
                 continue
             if from_date is not None and to_date is not None:
@@ -162,7 +152,7 @@ def build_coach_session_rows(
 
             if end_dt <= start_dt:
                 end_dt = start_dt + timedelta(hours=1)
-            lesson_no = lesson_dates.index(original_date) + 1
+            lesson_no = sorted(o for _a, _b, o in booked_slots).index(original_date) + 1
 
             rows.append(
                 {

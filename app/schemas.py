@@ -871,3 +871,13 @@ class WhatsAppTestSendBody(BaseModel):
     template_name: str = Field(min_length=1, max_length=128)
     language_code: str = Field(default="zh_HK", min_length=2, max_length=16)
     body_parameters: list[str] = Field(default_factory=list)
+
+
+class PaymentRecordUpdate(BaseModel):
+    """[F004][S002] Scoped Admin corrections; payment confirmation is a separate action."""
+    model_config = {"extra": "forbid"}
+    amount: float | None = Field(default=None, ge=0, le=9999999999, allow_inf_nan=False)
+    payment_method: str | None = Field(default=None, max_length=80)
+    note: str | None = Field(default=None, max_length=2000)
+    created_at: datetime | None = None
+    due_date: date | None = None

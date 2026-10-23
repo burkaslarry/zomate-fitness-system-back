@@ -35,6 +35,10 @@ def _series_fixture() -> tuple[Session, Coach, CourseEnrollment]:
         coach_time_confirmed=True,
     )
     db.add(enrollment)
+    db.flush()
+    # [F003][S009] Later lessons are explicit coach appointments, never automatic recurrences.
+    db.add(CourseSessionOverride(enrollment_id=enrollment.id, original_date=date(2026,10,19),
+        action="scheduled", rescheduled_start=datetime(2026,10,19,10), rescheduled_end=datetime(2026,10,19,11)))
     db.commit()
     return db, coach, enrollment
 
