@@ -3815,16 +3815,81 @@ def renewal(payload: RenewalCreate, db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/students")
-def list_students(db: Session = Depends(get_db)) -> list[dict]:
-    rows = (
-        db.query(Student)
-        .filter(
-            ~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students"))
+def list_students(
+    db: Session = Depends(get_db),
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    q: str | None = Query(default=None),
+    medical_pending: bool = Query(default=False),
+) -> dict:
+    """[F001][S003]
+    Feature: Student Onboarding
+    Step: Admin roster paginated list (default 100)
+    Logic: Filter/search in SQL; enrich only the current page to avoid N+1 hang on 1k+ rows.
+    """
+    deleted_students = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    base = db.query(Student).filter(~Student.id.in_(deleted_students))
+    if medical_pending:
+        base = base.filter(Student.medical_clearance_status == "pending")
+    q_norm = (q or "").strip()
+    if q_norm:
+        pattern = f"%{q_norm}%"
+        base = base.filter(
+            or_(
+                Student.full_name.ilike(pattern),
+                Student.phone.ilike(pattern),
+                Student.hkid.ilike(pattern),
+            )
         )
-        .order_by(Student.id.desc())
-        .all()
+    total = int(base.count() or 0)
+    rows = base.order_by(Student.id.desc()).offset(offset).limit(limit).all()
+    items = [student_to_member_dict(db, row) for row in rows]
+
+    # Global summary cards (ignore current search so totals stay stable while paging).
+    total_all = int(
+        db.query(Student).filter(~Student.id.in_(deleted_students)).count() or 0
     )
-    return [student_to_member_dict(db, row) for row in rows]
+    medical_pending_count = int(
+        db.query(Student)
+        .filter(~Student.id.in_(deleted_students))
+        .filter(Student.medical_clearance_status == "pending")
+        .count()
+        or 0
+    )
+    ledger_positive = (
+        select(LessonLedgerEntry.student_id.label("sid"))
+        .group_by(LessonLedgerEntry.student_id)
+        .having(func.coalesce(func.sum(LessonLedgerEntry.delta_lessons), 0) > 0)
+        .subquery()
+    )
+    cutoff = datetime.utcnow() - timedelta(days=ACTIVE_MEMBER_DAYS)
+    recent_checkin = (
+        select(CheckinLog.student_id.label("sid"))
+        .where(CheckinLog.created_at >= cutoff)
+        .distinct()
+        .subquery()
+    )
+    active_count = (
+        db.query(func.count(Student.id))
+        .filter(~Student.id.in_(deleted_students))
+        .filter(
+            or_(
+                Student.id.in_(select(ledger_positive.c.sid)),
+                Student.id.in_(select(recent_checkin.c.sid)),
+            )
+        )
+        .scalar()
+        or 0
+    )
+    return {
+        "items": items,
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "total_all": int(total_all),
+        "active_count": int(active_count),
+        "medical_pending_count": int(medical_pending_count),
+    }
 
 
 # [F007][S001]
