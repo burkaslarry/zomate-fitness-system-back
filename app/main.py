@@ -702,18 +702,16 @@ def _enrollment_interval_on_date(enr: CourseEnrollment, day: date) -> tuple[date
 
 
 def _session_policy_now() -> datetime:
-    """[F003][S004] Current HKT wall clock for 72h booking / 24h change rules."""
+    """[F003][S004] Current HKT wall clock for staff booking / 24h change rules."""
     return now_hk().replace(tzinfo=None)
 
 
-def _assert_booking_notice(start: datetime) -> None:
-    """[F003][S004] New bookings and replacement slots require at least 72 hours' notice."""
-    if start < _session_policy_now() + timedelta(hours=72):
-        raise HTTPException(status_code=400, detail="預約必須最少提前 72 小時。")
-
-
 def _assert_initial_staff_booking(start: datetime, end: datetime) -> None:
-    """[F003][S004] Assigned staff may book today, including an ongoing, unexpired slot."""
+    """[F003][S004]
+    Feature: Attendance & Today-Only QR Check-in
+    Step: Coach/staff arrange lesson time for a student
+    Logic: No minimum 72h advance — today and upcoming unexpired slots are allowed; past/ended slots are not.
+    """
     now = _session_policy_now()
     if start.date() < now.date() or end <= now:
         raise HTTPException(status_code=400, detail="不能安排已完結的課堂，請選今日未完結或未來時段。")
@@ -6554,6 +6552,47 @@ def restore_soft_deleted_students(
     return {"ok": True, "restored": len(restored_ids), "student_ids": restored_ids}
 
 
+def _hard_purge_student_dependencies(db: Session, student_id: int) -> None:
+    """[F001][S003] Remove all FK-linked rows before deleting ``zomate_fs_students``."""
+    course_ids = [
+        row[0]
+        for row in db.query(CourseEnrollment.id).filter(CourseEnrollment.student_id == student_id).all()
+    ]
+    cat_enrollment_ids = [
+        row[0]
+        for row in db.query(CategoryEnrollment.id).filter(CategoryEnrollment.student_id == student_id).all()
+    ]
+    student = db.query(Student).filter(Student.id == student_id).first()
+    hkid_norm = normalize_hkid(student.hkid) if student and student.hkid else None
+
+    audit_filters = [AuditLog.student_id == student_id]
+    if course_ids:
+        audit_filters.append(AuditLog.course_id.in_(course_ids))
+    db.query(AuditLog).filter(or_(*audit_filters)).delete(synchronize_session=False)
+
+    db.query(Attendance).filter(Attendance.student_id == student_id).delete(synchronize_session=False)
+    db.query(LessonLedgerEntry).filter(LessonLedgerEntry.student_id == student_id).delete(synchronize_session=False)
+    if cat_enrollment_ids:
+        db.query(CategoryEnrollment).filter(CategoryEnrollment.id.in_(cat_enrollment_ids)).delete(
+            synchronize_session=False
+        )
+    db.query(RenewalRecord).filter(RenewalRecord.student_id == student_id).delete(synchronize_session=False)
+    db.query(StudentPhoto).filter(StudentPhoto.student_id == student_id).delete(synchronize_session=False)
+    db.query(Receipt).filter(Receipt.student_id == student_id).delete(synchronize_session=False)
+    if course_ids:
+        db.query(CourseSessionOverride).filter(CourseSessionOverride.enrollment_id.in_(course_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(CourseEnrollment).filter(CourseEnrollment.id.in_(course_ids)).delete(synchronize_session=False)
+    db.query(CheckinLog).filter(CheckinLog.student_id == student_id).delete(synchronize_session=False)
+    db.query(WhatsAppLog).filter(WhatsAppLog.student_id == student_id).delete(synchronize_session=False)
+    db.query(DeletedRecord).filter(
+        DeletedRecord.entity_type == "students", DeletedRecord.entity_id == student_id
+    ).delete(synchronize_session=False)
+    if hkid_norm:
+        db.query(ActivityLog).filter(ActivityLog.member_hkid == hkid_norm).delete(synchronize_session=False)
+
+
 @app.delete("/api/admin/students/{student_id}")
 def delete_student(
     student_id: int,
@@ -6569,10 +6608,7 @@ def delete_student(
         raise HTTPException(status_code=403, detail="Only ADMIN can hard delete.")
 
     if hard:
-        db.query(CourseEnrollment).filter(CourseEnrollment.student_id == student.id).delete(synchronize_session=False)
-        db.query(CheckinLog).filter(CheckinLog.student_id == student.id).delete(synchronize_session=False)
-        db.query(WhatsAppLog).filter(WhatsAppLog.student_id == student.id).delete(synchronize_session=False)
-        db.query(AuditLog).filter(AuditLog.student_id == student.id).delete(synchronize_session=False)
+        _hard_purge_student_dependencies(db, student.id)
         db.delete(student)
     else:
         _record_soft_delete(db, "students", student.id, user)
@@ -8310,7 +8346,8 @@ def coach_reschedule_one_session(
         db, user, enrollment_id, original_date, payload.coach_id
     )
     _assert_change_notice(current_start)
-    _assert_booking_notice(payload.scheduled_start)
+    # [F003][S004] Coach-arranged replacement slots: no 72h minimum (same rule as first booking).
+    _assert_initial_staff_booking(payload.scheduled_start, payload.scheduled_end)
     _assert_coach_slot_available(
         db,
         cid,

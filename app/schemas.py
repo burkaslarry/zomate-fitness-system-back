@@ -700,7 +700,7 @@ class CoachSessionCancelBody(BaseModel):
 
 
 class CoachSessionRescheduleBody(BaseModel):
-    """[F003][S009] Move exactly one lesson; 72h booking and 24h change rules are enforced server-side."""
+    """[F003][S009] Move exactly one lesson; staff may pick same-day/soon slots; 24h change notice still applies to the current lesson."""
 
     coach_id: int | None = None
     scheduled_start: datetime
