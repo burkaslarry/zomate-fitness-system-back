@@ -186,6 +186,7 @@ from .payment_records import (
     count_missing_receipt_renewals,
     extract_renewal_category_label,
     student_onboarding_coach,
+    students_onboarded_to_coach,
 )
 from .enrollment_schedule import (
     enrollment_to_out,
@@ -817,6 +818,7 @@ def _assert_coach_slot_available(
 
 
 def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
+    """[F003][S005] True if student has a course under this coach, or chose them at /register."""
     deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     hit = (
@@ -829,7 +831,10 @@ def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
         )
         .first()
     )
-    return hit is not None
+    if hit is not None:
+        return True
+    ob_id, _ = student_onboarding_coach(db, student_id)
+    return ob_id == coach_id
 
 
 def require_admin(user: AppUser = Depends(get_current_user)) -> AppUser:
@@ -1408,8 +1413,8 @@ def _trial_records_from_audit(db: Session, student_id: int) -> list[dict]:
 def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[int, list[CoachEnrolledStudentOut]]:
     """[F002][S001]
     Feature: Course Entry & Automation
-    Step: Admin coach grid — list students enrolled in any course taught by each coach.
-    Logic: Distinct (coach_id, student_id) via ``Course`` × ``CourseEnrollment`` × ``Student``.
+    Step: Admin coach grid — course enrollments plus /register onboarding coach picks.
+    Logic: Distinct (coach_id, student_id) via CourseEnrollment ∪ CategoryEnrollment notes.
     """
     if not coach_ids:
         return {}
@@ -1430,6 +1435,17 @@ def _enrolled_students_for_coaches(db: Session, coach_ids: list[int]) -> dict[in
         out.setdefault(cid, []).append(
             CoachEnrolledStudentOut(id=int(sid), full_name=name, phone=phone or "")
         )
+    for cid in coach_ids:
+        bucket = seen.setdefault(cid, set())
+        for st, _cat in students_onboarded_to_coach(db, cid):
+            if st.id in bucket:
+                continue
+            bucket.add(st.id)
+            out.setdefault(cid, []).append(
+                CoachEnrolledStudentOut(id=int(st.id), full_name=st.full_name, phone=st.phone or "")
+            )
+        if cid in out:
+            out[cid].sort(key=lambda r: (r.full_name.lower(), r.id))
     return out
 
 
@@ -2974,6 +2990,7 @@ def _create_member_impl(
         _assert_coach_teaches_category(db, resolved_coach_id, payload.course_category_id)
         cat = _resolve_active_course_category(db, payload.course_category_id)
         coach_label = (payload.coach_username or "").strip() or str(resolved_coach_id)
+        # Store numeric coach id first so coach roster / follow-up resolve reliably.
         db.add(
             CategoryEnrollment(
                 student_id=student.id,
@@ -2981,7 +2998,7 @@ def _create_member_impl(
                 status="active",
                 started_at=date.today(),
                 total_lessons=0,
-                notes=f"Onboarding coach={coach_label}",
+                notes=f"Onboarding coach={resolved_coach_id} username={coach_label}",
             )
         )
     db.add(
@@ -5970,6 +5987,22 @@ def admin_coach_student_follow_up(
                 row["payment_reminder"] = f"{row['payment_reminder']}；{reminder}"
             else:
                 row["payment_reminder"] = reminder
+    # [F001][S002] Include /register members who selected this coach but have no CourseEnrollment yet.
+    for st, cat_name in students_onboarded_to_coach(db, coach_id):
+        if st.id in by_student:
+            continue
+        course_label = cat_name.strip() if cat_name else "新入會"
+        by_student[st.id] = {
+            "student_id": st.id,
+            "full_name": st.full_name,
+            "phone": st.phone,
+            "courses": [f"{course_label}（待報課）"],
+            "_course_titles": {course_label},
+            "attendance_status": "新入會",
+            "next_lesson": "待報課",
+            "payment_reminder": None,
+            "_next_dt": None,
+        }
     out: list[CoachStudentFollowUpOut] = []
     for data in by_student.values():
         out.append(
@@ -7774,7 +7807,7 @@ def coach_list_students(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> list[CoachStudentBriefOut]:
-    """[F003][S005] Distinct students on this coach's course enrollments."""
+    """[F003][S005] Students on this coach's courses, plus /register onboarding picks."""
     cid = _resolve_coach_id_param(db, user, coach_id)
     deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
@@ -7812,7 +7845,19 @@ def coach_list_students(
                 enrollment_count=cur.enrollment_count + 1,
                 pending_schedule=cur.pending_schedule or pending,
             )
-    return list(by_student.values())
+    # [F001][S002] New members who selected this coach before any CourseEnrollment exists.
+    for st, _cat in students_onboarded_to_coach(db, cid):
+        if st.id in by_student:
+            continue
+        by_student[st.id] = CoachStudentBriefOut(
+            student_id=st.id,
+            full_name=st.full_name,
+            phone=st.phone,
+            lesson_balance=_lesson_balance_sum(db, st.id),
+            enrollment_count=0,
+            pending_schedule=False,
+        )
+    return sorted(by_student.values(), key=lambda r: (r.full_name.lower(), r.student_id))
 
 
 @app.get("/api/coach/students/{student_id}", response_model=CoachStudentRecordOut)

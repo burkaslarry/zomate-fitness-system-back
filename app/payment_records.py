@@ -83,25 +83,36 @@ def _coach_slug(full_name: str) -> str:
     return "".join(c for c in slug if c.isalnum()) or "coach"
 
 
+def _resolve_onboarding_coach_label(db: Session, label: str) -> tuple[int | None, str | None]:
+    """[F002][S001] Map `Onboarding coach=` note token to coach id + display name."""
+    from .models import AppUser, Coach
+
+    raw = (label or "").strip()
+    if not raw:
+        return None, None
+    if raw.isdigit():
+        coach = db.get(Coach, int(raw))
+        if coach:
+            return coach.id, coach.full_name
+    slug = raw.lower()
+    user = db.query(AppUser).filter(AppUser.username == slug).first()
+    if user and user.coach_id:
+        coach = db.get(Coach, int(user.coach_id))
+        if coach:
+            return coach.id, coach.full_name
+    for coach in db.query(Coach).filter(Coach.active.is_(True)).all():
+        if _coach_slug(coach.full_name) == slug:
+            return coach.id, coach.full_name
+        # Match default login username style (spaces → empty, lower).
+        uname = "".join(c for c in coach.full_name.lower() if c.isalnum())
+        if uname and uname == slug:
+            return coach.id, coach.full_name
+    return None, None
+
+
 def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, str | None]:
     """[F002][S001] Coach chosen at /register — from category enrollment notes or latest renewal."""
-    from .models import AppUser, CategoryEnrollment, Coach, RenewalRecord
-
-    def _resolve_coach_label(label: str) -> tuple[int | None, str | None]:
-        if label.isdigit():
-            coach = db.get(Coach, int(label))
-            if coach:
-                return coach.id, coach.full_name
-        slug = label.lower()
-        user = db.query(AppUser).filter(AppUser.username == slug).first()
-        if user and user.coach_id:
-            coach = db.get(Coach, int(user.coach_id))
-            if coach:
-                return coach.id, coach.full_name
-        for coach in db.query(Coach).filter(Coach.active.is_(True)).all():
-            if _coach_slug(coach.full_name) == slug:
-                return coach.id, coach.full_name
-        return None, None
+    from .models import CategoryEnrollment, Coach, RenewalRecord
 
     enrollments = (
         db.query(CategoryEnrollment)
@@ -115,7 +126,7 @@ def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, 
         match = _ONBOARDING_COACH_RE.search(notes)
         if not match:
             continue
-        resolved = _resolve_coach_label(match.group(1).strip())
+        resolved = _resolve_onboarding_coach_label(db, match.group(1).strip())
         if resolved[0] is not None:
             return resolved
     renewal = (
@@ -128,6 +139,47 @@ def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, 
         coach = db.get(Coach, renewal.coach_id)
         return renewal.coach_id, (coach.full_name if coach else renewal.coach_name)
     return None, None
+
+
+def students_onboarded_to_coach(
+    db: Session, coach_id: int
+) -> list[tuple["Student", str | None]]:
+    """[F002][S001]
+    Feature: Registration → coach roster
+    Step: Students who selected this coach at /register (CategoryEnrollment notes)
+    Logic: Parse ``Onboarding coach=…``; return (student, category_name) for coach portal / admin grids.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
+
+    from .models import CategoryEnrollment, DeletedRecord, Student
+
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    rows = (
+        db.query(CategoryEnrollment)
+        .options(
+            joinedload(CategoryEnrollment.student),
+            joinedload(CategoryEnrollment.course_category),
+        )
+        .filter(CategoryEnrollment.notes.isnot(None))
+        .filter(~CategoryEnrollment.student_id.in_(deleted_s))
+        .order_by(CategoryEnrollment.id.desc())
+        .all()
+    )
+    out: dict[int, tuple[Student, str | None]] = {}
+    for enr in rows:
+        match = _ONBOARDING_COACH_RE.search(enr.notes or "")
+        if not match:
+            continue
+        resolved_id, _ = _resolve_onboarding_coach_label(db, match.group(1).strip())
+        if resolved_id != coach_id:
+            continue
+        st = enr.student
+        if st is None or st.id in out:
+            continue
+        cat_name = enr.course_category.name if enr.course_category is not None else None
+        out[st.id] = (st, cat_name)
+    return list(out.values())
 
 
 def build_payment_records(
