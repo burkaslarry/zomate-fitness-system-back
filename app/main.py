@@ -5052,9 +5052,11 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
         raise HTTPException(status_code=400, detail="分期記錄不支援備註修改。")
     if "due_date" in changes and record_type != "installment":
         raise HTTPException(status_code=400, detail="此記錄沒有到期日欄位。")
+    # [F004][S002] Lock fresh course state before editing; concurrent Admin confirmation must win safely.
+    linked = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).with_for_update().populate_existing().all()
     # [F004][S002] A renewal with both confirmed and pending installments still owns historical money.
     if amount_changed and record_type == "renewal":
-        for enr in db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).all():
+        for enr in linked:
             state = course_payment_state(enr)
             if state.get("renewal_id") == ref_id and state.get("payments"):
                 raise HTTPException(status_code=409, detail="此記錄已有已確認款項，金額需另作更正處理。")
@@ -5072,7 +5074,6 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
         for key in ("amount", "payment_method"):
             if key in changes:
                 setattr(receipt, key, changes[key])
-    linked = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).with_for_update().all()
     for enr in linked:
         state = course_payment_state(enr)
         matches = record_type == "renewal" and state.get("renewal_id") == ref_id

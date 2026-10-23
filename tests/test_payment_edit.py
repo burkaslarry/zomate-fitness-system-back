@@ -63,3 +63,18 @@ def test_edit_route_rejects_coach_before_db():
         with TestClient(main.app) as client:
             assert client.patch('/api/admin/payment-records/renewal/1',json={"amount":1}).status_code == 403
     finally: main.app.dependency_overrides.clear()
+
+
+def test_pending_view_cannot_rewrite_partially_confirmed_renewal(db_session):
+    """[F004][S002] A pending next tranche must not make an earlier confirmed renewal amount editable."""
+    row, enr = _renewal(db_session)
+    state = json.loads(enr.payment_state_json)
+    state["payments"] = {"installment:1": {"amount":3000}}
+    state["pending_payments"] = {"2": {"amount":1000}}
+    enr.payment_state_json = json.dumps(state)
+    db_session.commit()
+    with pytest.raises(HTTPException) as exc:
+        main.admin_update_payment_record("renewal", row.id, PaymentRecordUpdate(amount=500), db_session, SimpleNamespace(username="qa"))
+    assert exc.value.status_code == 409
+    assert float(row.amount) == 3000
+    assert json.loads(enr.payment_state_json) == state
