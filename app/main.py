@@ -6978,6 +6978,22 @@ def admin_create_course(
     return _create_course_impl(payload, db, user)
 
 
+def _redact_course_pins_for_coach(out: CourseOut) -> CourseOut:
+    """[F002][S003] Course PIN is student-only — strip from coach-facing API payloads."""
+    data = out.model_dump()
+    for enr in data.get("enrollments") or []:
+        enr["checkin_pin"] = ""
+        for seg in enr.get("installment_segments") or []:
+            if isinstance(seg, dict):
+                seg["pin"] = ""
+    # WhatsApp student body often embeds PIN — do not return it to coach clients.
+    if isinstance(data.get("payment_whatsapp"), dict):
+        student_wa = data["payment_whatsapp"].get("student")
+        if isinstance(student_wa, dict):
+            student_wa["message"] = ""
+    return CourseOut.model_validate(data)
+
+
 @app.post("/api/coach/register-course", response_model=CourseOut)
 def coach_register_course(
     payload: CourseCreate,
@@ -6990,7 +7006,10 @@ def coach_register_course(
         coach_row = _coach_row_for_user(db, user)
         if coach_row is None or coach_row.id != payload.coach_id:
             raise HTTPException(status_code=403, detail="COACH may only register courses under their own profile.")
-    return _create_course_impl(payload, db, user)
+    out = _create_course_impl(payload, db, user)
+    if user.role == "COACH":
+        return _redact_course_pins_for_coach(out)
+    return out
 
 
 @app.patch("/api/admin/courses/{course_id}/installment-paid", response_model=CourseOut)
@@ -7304,6 +7323,10 @@ def coach_list_sessions(
         to_date=to_date,
         category_ids=cat_filter,
     )
+    # [F002][S003] COACH must not see student check-in PINs (student / admin only).
+    if user.role == "COACH":
+        for r in rows:
+            r["checkin_pin"] = ""
     log_event("coach_sessions_list", coach_id=cid, count=len(rows))
     return [CoachSessionOut.model_validate(r) for r in rows]
 
@@ -7350,6 +7373,7 @@ def coach_export_sessions_xlsx(
             "課程名稱",
         ]
     )
+    hide_pin = user.role == "COACH"
     for r in rows:
         w.writerow(
             [
@@ -7360,7 +7384,7 @@ def coach_export_sessions_xlsx(
                 r["start_time"],
                 r["end_time"],
                 r["branch_name"],
-                r["checkin_pin"],
+                "" if hide_pin else r["checkin_pin"],
                 "已確認" if r["coach_time_confirmed"] else "待確認",
                 r["attendance_status"],
                 r["course_title"],
