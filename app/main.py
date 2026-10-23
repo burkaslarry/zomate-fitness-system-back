@@ -186,6 +186,7 @@ from .payment_records import (
     build_sales_report_rows,
     count_missing_receipt_renewals,
     extract_renewal_category_label,
+    student_onboarding_category,
     student_onboarding_coach,
     students_onboarded_to_coach,
 )
@@ -1681,6 +1682,7 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
     """
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
     ob_coach_id, ob_coach_name = student_onboarding_coach(db, student.id)
+    ob_cat_id, ob_cat_name = student_onboarding_category(db, student.id)
     return {
         "id": student.id,
         "hkid": student.hkid,
@@ -1706,6 +1708,8 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "parq_any_yes": _student_parq_any_yes(student),
         "onboarding_coach_id": ob_coach_id,
         "onboarding_coach_name": ob_coach_name,
+        "onboarding_course_category_id": ob_cat_id,
+        "onboarding_course_category_name": ob_cat_name,
         "whatsapp_reminder_opt_in": bool(getattr(student, "whatsapp_reminder_opt_in", False)),
     }
 
@@ -3616,8 +3620,8 @@ def create_renewal_multipart(
         )
     _set_whatsapp_reminder_opt_in(student, True)
     receipt_tag = student.hkid or student.phone or str(student.id)
-    if total_lessons < 1 or total_lessons > 30:
-        raise HTTPException(status_code=400, detail="total_lessons must be between 1 and 30.")
+    if total_lessons < 1 or total_lessons > 999:
+        raise HTTPException(status_code=400, detail="total_lessons must be between 1 and 999.")
     package = db.get(Package, package_id) if package_id else None
     if package_id is not None and (package is None or not package.active):
         raise HTTPException(status_code=400, detail="Invalid package_id.")

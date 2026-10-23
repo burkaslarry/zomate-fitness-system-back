@@ -141,6 +141,34 @@ def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, 
     return None, None
 
 
+def student_onboarding_category(db: Session, student_id: int) -> tuple[int | None, str | None]:
+    """[F002][S003]
+    Feature: Course Entry & Automation
+    Step: Category chosen at /register (e.g. 新學生一對一) for coach reg-course lock-in
+    Logic: Prefer CategoryEnrollment with Onboarding notes; coach should not re-pick.
+    """
+    from sqlalchemy.orm import joinedload
+
+    from .models import CategoryEnrollment
+
+    enrollments = (
+        db.query(CategoryEnrollment)
+        .options(joinedload(CategoryEnrollment.course_category))
+        .filter(CategoryEnrollment.student_id == student_id)
+        .filter(CategoryEnrollment.notes.isnot(None))
+        .order_by(CategoryEnrollment.id.desc())
+        .all()
+    )
+    for enr in enrollments:
+        if not _ONBOARDING_COACH_RE.search(enr.notes or ""):
+            continue
+        cat = enr.course_category
+        if cat is None:
+            return enr.course_category_id, None
+        return enr.course_category_id, cat.name
+    return None, None
+
+
 def students_onboarded_to_coach(
     db: Session, coach_id: int
 ) -> list[tuple["Student", str | None]]:

@@ -414,7 +414,8 @@ class CourseCreate(BaseModel):
     # Calendar start for the series — defaults to scheduled_start.date() if omitted.
     course_start_date: date | None = None
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
-    total_lessons: int = Field(default=10, ge=10, le=30)
+    # [F002][S003] Coach/staff may set any package size when registering a course for a student.
+    total_lessons: int = Field(default=10, ge=1, le=999)
     # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
     total_installments: int = Field(default=1, ge=1, le=3)
     # Optional HKD split per installment (length must match total_installments when set).
@@ -796,7 +797,7 @@ class CourseCategoryCreate(BaseModel):
 
 class StudentCategoryEnrollmentCreate(BaseModel):
     course_category_id: int
-    total_lessons: int = Field(ge=10, le=999)
+    total_lessons: int = Field(ge=1, le=999)
     total_installments: int = Field(default=3, ge=1, le=3)
 
 
