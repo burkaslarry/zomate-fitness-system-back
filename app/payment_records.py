@@ -17,7 +17,78 @@ if TYPE_CHECKING:
 
     from .models import Student
 
-PaymentRecordStatus = Literal["paid", "outstanding", "missing_receipt"]
+PaymentRecordStatus = Literal["paid", "outstanding", "missing_receipt", "pending_confirmation"]
+
+
+def _index_course_links_by_renewal(db: Session, student_ids: list[int]) -> dict[int, dict]:
+    """[F004][S002] Map renewal_id → course enrollment + pending Admin-confirm state."""
+    import json
+
+    from .course_payment_state import course_payment_state
+    from .models import CourseEnrollment, DeletedRecord
+    from sqlalchemy import select
+
+    deleted_course_ids = select(DeletedRecord.entity_id).where(
+        DeletedRecord.entity_type == "course_enrollments"
+    )
+    enrollments = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.student_id.in_(student_ids),
+            ~CourseEnrollment.id.in_(deleted_course_ids),
+        )
+        .all()
+    )
+    by_renewal: dict[int, dict] = {}
+    for enr in enrollments:
+        state = course_payment_state(enr)
+        rid = state.get("renewal_id")
+        if rid is None:
+            continue
+        try:
+            renewal_id = int(rid)
+        except (TypeError, ValueError):
+            continue
+        pending = state.get("pending_payments") or {}
+        payments = state.get("payments") or {}
+        installment_no = 1
+        if isinstance(pending, dict) and pending:
+            for key in pending:
+                if str(key).isdigit():
+                    installment_no = int(key)
+                    break
+                if key in {"full", "unassigned"}:
+                    installment_no = 1
+                    break
+        elif state.get("last_installment_no"):
+            try:
+                installment_no = int(state["last_installment_no"])
+            except (TypeError, ValueError):
+                installment_no = 1
+        else:
+            # Fall back to first unpaid segment if present.
+            try:
+                segs = json.loads(enr.segment_pins_json or "[]")
+                if isinstance(segs, list):
+                    unpaid = next(
+                        (
+                            s
+                            for s in segs
+                            if isinstance(s, dict) and not s.get("paid")
+                        ),
+                        None,
+                    )
+                    if unpaid and unpaid.get("installment_no") is not None:
+                        installment_no = int(unpaid["installment_no"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        by_renewal[renewal_id] = {
+            "course_enrollment_id": enr.id,
+            "installment_no": installment_no,
+            "has_pending": bool(pending),
+            "confirmed": bool(payments),
+        }
+    return by_renewal
 
 
 def payment_created_at_iso(dt: datetime | None) -> str:
@@ -246,6 +317,7 @@ def build_payment_records(
 
     student_ids = list(students.keys())
     rows: list[dict] = []
+    course_by_renewal = _index_course_links_by_renewal(db, student_ids)
 
     renewals = (
         db.query(RenewalRecord)
@@ -271,40 +343,48 @@ def build_payment_records(
         if not st:
             continue
         rec = receipt_map.get(rr.receipt_id) if rr.receipt_id else None
-        if rec:
-            rec_status: PaymentRecordStatus = "paid"
+        course_link = course_by_renewal.get(rr.id)
+        # [F004][S002] Receipt upload ≠ Admin confirm — pending course funds stay 待確認.
+        if course_link and course_link.get("has_pending"):
+            rec_status: PaymentRecordStatus = "pending_confirmation"
+        elif course_link and course_link.get("confirmed"):
+            rec_status = "paid"
+        elif rec:
+            rec_status = "paid"
         elif rr.amount and float(rr.amount) > 0:
             rec_status = "missing_receipt"
         else:
             rec_status = "outstanding"
         pkg = package_map.get(rr.package_id) if rr.package_id else None
         category_name = extract_renewal_category_label(rr.remarks) or (pkg.name if pkg else None)
-        rows.append(
-            {
-                "id": f"renewal-{rr.id}",
-                "record_type": "renewal",
-                "ref_id": rr.id,
-                "student_id": st.id,
-                "student_name": st.full_name,
-                "student_phone": st.phone,
-                "amount": float(rr.amount) if rr.amount is not None else None,
-                "payment_method": rr.payment_method,
-                "status": rec_status,
-                "coach_id": rr.coach_id,
-                "coach_name": rr.coach_name,
-                "label": build_renewal_payment_label(
-                    lessons=int(rr.lessons),
-                    remarks=rr.remarks,
-                    package_name=pkg.name if pkg else None,
-                ),
-                "category_name": category_name,
-                "receipt_id": rr.receipt_id,
-                "receipt_url": file_url_fn(rec.file_path) if rec and file_url_fn else None,
-                "receipt_file_path": rec.file_path if rec else None,
-                "download_url": f"/api/receipts/{rr.receipt_id}/download" if rr.receipt_id else None,
-                "created_at": payment_created_at_iso(rr.created_at),
-            }
-        )
+        row: dict = {
+            "id": f"renewal-{rr.id}",
+            "record_type": "renewal",
+            "ref_id": rr.id,
+            "student_id": st.id,
+            "student_name": st.full_name,
+            "student_phone": st.phone,
+            "amount": float(rr.amount) if rr.amount is not None else None,
+            "payment_method": rr.payment_method,
+            "status": rec_status,
+            "coach_id": rr.coach_id,
+            "coach_name": rr.coach_name,
+            "label": build_renewal_payment_label(
+                lessons=int(rr.lessons),
+                remarks=rr.remarks,
+                package_name=pkg.name if pkg else None,
+            ),
+            "category_name": category_name,
+            "receipt_id": rr.receipt_id,
+            "receipt_url": file_url_fn(rec.file_path) if rec and file_url_fn else None,
+            "receipt_file_path": rec.file_path if rec else None,
+            "download_url": f"/api/receipts/{rr.receipt_id}/download" if rr.receipt_id else None,
+            "created_at": payment_created_at_iso(rr.created_at),
+        }
+        if course_link:
+            row["course_enrollment_id"] = course_link["course_enrollment_id"]
+            row["installment_no"] = course_link["installment_no"]
+        rows.append(row)
 
     standalone_receipts = (
         db.query(Receipt)
@@ -394,6 +474,8 @@ def build_payment_records(
         norm = status.strip().lower()
         if norm in {"missing_receipt", "missing-receipt"}:
             rows = [r for r in rows if r["status"] == "missing_receipt"]
+        elif norm in {"pending_confirmation", "pending", "awaiting_confirmation"}:
+            rows = [r for r in rows if r["status"] == "pending_confirmation"]
         elif norm == "outstanding":
             rows = [r for r in rows if r["status"] == "outstanding"]
         elif norm == "paid":
@@ -418,7 +500,9 @@ def build_sales_report_rows(db: Session) -> list[dict]:
     for r in build_payment_records(db, file_url_fn=None):
         status = str(r.get("status") or "")
         if status == "paid":
-            pay = "已付"
+            pay = "付款已確認"
+        elif status == "pending_confirmation":
+            pay = "待確認"
         elif status == "missing_receipt":
             pay = "缺收據"
         elif status == "outstanding":

@@ -228,16 +228,17 @@ def _format_next_lesson_date(enr: CourseEnrollment | None) -> str:
 
 
 def _payment_status_label(is_installment: bool, receipt_confirmed: bool, segments: list) -> str:
+    """[F005][S003] WhatsApp ``payment_status`` — Admin confirm → 付款已確認."""
     if not receipt_confirmed:
         return "待確認"
     if not is_installment:
-        return "已付款"
+        return "付款已確認"
     paid_n = sum(1 for s in segments if getattr(s, "paid", False) or (isinstance(s, dict) and s.get("paid")))
     total_n = len(segments) if segments else 0
     if total_n <= 1:
-        return "已付款"
+        return "付款已確認"
     if paid_n >= total_n:
-        return "已付清"
+        return "付款已確認"
     return "已分期"
 
 
@@ -333,12 +334,38 @@ def send_payment_whatsapp_notifications(
         total_amt = payment_state.get("total_amount")
         if total_amt is None and segment_dicts and all(s.get("amount_hkd") is not None for s in segment_dicts):
             total_amt = sum(float(s["amount_hkd"]) for s in segment_dicts)
-        owing = max(0.0, float(total_amt) - float(payment_state.get("paid_total", 0))) if total_amt is not None else None
+        # Confirmed payments + pending checkout amounts (e.g. 第1期 recorded but not Admin-confirmed).
+        paid_total = float(payment_state.get("paid_total") or 0)
+        pending = payment_state.get("pending_payments") or {}
+        pending_sum = 0.0
+        if isinstance(pending, dict):
+            for row in pending.values():
+                if isinstance(row, dict) and row.get("amount") is not None:
+                    try:
+                        pending_sum += float(row["amount"])
+                    except (TypeError, ValueError):
+                        pass
+        seg_paid = sum(
+            float(s.get("amount_hkd") or 0)
+            for s in segment_dicts
+            if s.get("paid") and s.get("amount_hkd") is not None
+        )
+        effective_paid = max(paid_total, pending_sum, seg_paid)
+        if amount is not None:
+            effective_paid = max(effective_paid, float(amount))
+        if paid_amt is None and effective_paid > 0:
+            paid_amt = effective_paid
+        owing = max(0.0, float(total_amt) - effective_paid) if total_amt is not None else None
     payment_status = _payment_status_label(is_installment, receipt_confirmed, segments)
     if receipt_confirmed and is_installment and payment_state.get("last_installment_no"):
         last_no = payment_state["last_installment_no"]
         last_segment = next((s for s in segment_dicts if int(s.get("installment_no", 0)) == last_no), {})
-        payment_status = f"已分期（第{last_no}期已付）" if last_segment.get("paid") else "已分期（部分付款待補足）"
+        # [F005][S003] Confirmed tranche → 付款已確認; underpaid stay partial.
+        payment_status = (
+            f"付款已確認（第{last_no}期）"
+            if last_segment.get("paid")
+            else "已分期（部分付款待補足）"
+        )
     installment_notes = build_installment_notes_from_segments(segment_dicts) if segment_dicts else ""
 
     ctx = build_payment_context(
@@ -407,6 +434,61 @@ def send_payment_whatsapp_notifications(
         }
 
     return result
+
+
+def send_checkin_coach_whatsapp(
+    db: Session,
+    log_whatsapp_fn,
+    *,
+    student: Student,
+    enrollment: CourseEnrollment,
+    coach: Coach | None,
+    lesson_balance_after: int,
+    checked_in_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    """[F003][S003]
+    Feature: Attendance & Today-Only QR Check-in
+    Step: WhatsApp notify assigned coach after successful student check-in
+    Logic: One dedicated coach message (not payment templates).
+    """
+    if coach is None or not (coach.phone or "").strip():
+        return None
+    attended = count_course_checkins(db, student.id, enrollment.id)
+    total_lessons = int(enrollment.total_lessons or 0)
+    remaining = max(0, int(lesson_balance_after))
+    when = (checked_in_at or datetime.utcnow()).strftime("%Y-%m-%d %H:%M")
+    phone_display = "".join(ch for ch in (student.phone or "") if ch.isdigit())
+    if len(phone_display) == 11 and phone_display.startswith("852"):
+        phone_display = phone_display[3:]
+    msg = (
+        f"【Zomate 簽到通知】{enrollment.title}\n"
+        f"學生：{student.full_name}（{phone_display or student.phone}）\n"
+        f"已成功簽到並扣 1 堂\n"
+        f"簽到時間：{when}\n"
+        f"本課程已上：{attended} 堂\n"
+        f"學生餘下堂數：{remaining}\n\n"
+        "如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。"
+    )
+    log_whatsapp_fn(
+        db,
+        student,
+        coach.phone,
+        msg,
+        template_key="checkin_coach",
+        template_context={
+            "student_name": student.full_name,
+            "course_title": enrollment.title,
+            "lessons_attended": str(attended),
+            "lessons_remaining": str(remaining),
+            "checked_in_at": when,
+        },
+    )
+    return {
+        "recipient": coach.phone,
+        "message": msg,
+        "wa_me_url": wa_me_link(coach.phone, msg),
+        "template_key": "checkin_coach",
+    }
 
 
 def send_receipt_upload_request_whatsapp(

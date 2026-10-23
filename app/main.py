@@ -178,6 +178,7 @@ from .medical_clearance import (
 )
 from .payment_notifications import (
     apply_receipt_payment_match,
+    send_checkin_coach_whatsapp,
     send_payment_whatsapp_notifications,
     send_receipt_upload_request_whatsapp,
 )
@@ -2466,11 +2467,19 @@ def perform_lesson_checkin(
     db.refresh(student)
     db.refresh(checkin_log)
 
-    # [F003][S003] Successful check-ins reuse the four agreed wordings and this course's payment facts.
+    # [F003][S003] After successful check-in, notify the assigned coach via WhatsApp API.
     if resolved_enrollment is not None:
-        send_payment_whatsapp_notifications(
-            db, log_whatsapp, student=student, receipt_confirmed=None,
-            course_enrollment_id=resolved_enrollment.id, notify_coach=True,
+        coach = notified_coach or (
+            db.get(Coach, resolved_enrollment.coach_id) if resolved_enrollment.coach_id else None
+        )
+        send_checkin_coach_whatsapp(
+            db,
+            log_whatsapp,
+            student=student,
+            enrollment=resolved_enrollment,
+            coach=coach,
+            lesson_balance_after=bal_after,
+            checked_in_at=attended_at,
         )
     db.commit()
 
