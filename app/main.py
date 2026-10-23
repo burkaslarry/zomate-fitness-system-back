@@ -1552,7 +1552,7 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
         payload = base64.b64decode(raw[len(prefix) :], validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
-    if len(payload) > 1_000_000:
+    if len(payload) > 9_000_000:
         raise HTTPException(status_code=413, detail="Signature image is too large.")
     relative_dir = f"signatures/{student_id}"
     out_dir = UPLOADS_DIR / relative_dir
@@ -1566,20 +1566,23 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
     return relative_path
 
 
-def _apply_signature_image(student: Student, data_url: str) -> None:
-    """[F001][S004] Persist signature PNG to disk when possible; always keep DB blob for ephemeral disks."""
+def _apply_signature_image(student: Student, data_url: str | None) -> None:
+    """[F001][S004] Persist signature PNG when provided; empty = skip (staff 候補 later)."""
+    raw = (data_url or "").strip()
+    if len(raw) < 20:
+        return
     prefix = "data:image/png;base64,"
-    raw = data_url.strip()
     if not raw.startswith(prefix):
         raise HTTPException(status_code=400, detail="Signature must be a PNG canvas data URL.")
     try:
         payload = base64.b64decode(raw[len(prefix) :], validate=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
-    if len(payload) > 1_000_000:
+    # Allow up to ~9MB decoded (~12M base64 data URL); still guard runaway payloads.
+    if len(payload) > 9_000_000:
         raise HTTPException(status_code=413, detail="Signature image is too large.")
     student.signature_image_blob = payload
-    relative_path = _save_signature_image(data_url, student.id)
+    relative_path = _save_signature_image(data_url or raw, student.id)
     student.signature_image_url = relative_path
 
 
@@ -3013,14 +3016,14 @@ def create_member(
     cooling_off_acknowledged: str = Form(default="false"),
     disclaimer_accepted: str = Form(default="false"),
     whatsapp_reminder_opt_in: str = Form(default="false"),
-    digital_signature: str = Form(...),
+    digital_signature: str = Form(default=""),
     coach_id: int | None = Form(default=None),
     coach_username: str | None = Form(default=None),
     course_category_id: int | None = Form(default=None),
     medical_clearance: UploadFile | None = File(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    """[F001][S002] Public registration — multipart with optional medical clearance file upload."""
+    """[F001][S002] Public registration — multipart; signature optional (staff can 候補 later)."""
     try:
         parq_obj = ParqQuestionsIn.model_validate(json.loads(parq))
     except (json.JSONDecodeError, ValueError) as exc:
