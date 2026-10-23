@@ -55,7 +55,7 @@ class StudentRegisterV1(BaseModel):
     medical_clearance_file_name: str | None = ""
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
-    digital_signature: str = Field(min_length=20, max_length=400_000)
+    digital_signature: str = Field(min_length=20, max_length=1_500_000)
     package_sessions: Literal[10, 30]
     renewal_notes: str | None = None
     whatsapp_reminder_opt_in: bool = False
@@ -119,7 +119,7 @@ class MemberCreate(BaseModel):
     cooling_off_acknowledged: bool = True
     disclaimer_accepted: bool = True
     whatsapp_reminder_opt_in: bool = False
-    digital_signature: str = Field(min_length=20, max_length=400_000)
+    digital_signature: str = Field(min_length=20, max_length=1_500_000)
     coach_id: int | None = Field(default=None, ge=1)
     coach_username: str | None = Field(default=None, min_length=1, max_length=120)
     course_category_id: int | None = Field(default=None, ge=1)
@@ -484,7 +484,7 @@ class CoachScheduleConfirm(BaseModel):
 
 
 class CoachSignatureUpdate(BaseModel):
-    digital_signature: str = Field(min_length=20, max_length=400_000)
+    digital_signature: str = Field(min_length=20, max_length=1_500_000)
 
 
 class CoachMeOut(BaseModel):
