@@ -543,12 +543,16 @@ def send_schedule_booking_whatsapp(
         "template_key": "schedule_booking_student",
     }
     if notify_coach and coach and (coach.phone or "").strip():
+        # [F005][S003] Match docs/reminder_coach.txt「教練booking」(no PIN).
         coach_msg = (
-            f"【Zomate 排程確認】{enrollment.title}\n"
-            f"學生：{student_label}（{phone_display or student.phone}）\n"
-            f"上堂時間：{lesson_when}\n"
-            f"已上堂數：{attended}　餘下：{remaining}\n"
-            f"付款狀態：{payment_status}"
+            f"【Zomate 開課】{enrollment.title}\n"
+            f"{student_label}（{phone_display or student.phone}）\n"
+            f"上堂時間 : {lesson_when}\n"
+            f"教練 : {coach_name}\n"
+            f"已上堂數: {attended}\n"
+            f"餘下堂數: {remaining}\n"
+            f"付款狀態: {payment_status}\n"
+            "如需要改期，請於24小時前通知教練"
         )
         log_whatsapp_fn(
             db,
@@ -560,6 +564,7 @@ def send_schedule_booking_whatsapp(
                 "student_name": student_label,
                 "course_title": enrollment.title,
                 "next_lesson_date": lesson_when,
+                "coach_name": coach_name,
                 "lessons_attended": str(attended),
                 "lessons_remaining": str(remaining),
                 "payment_status": payment_status,
