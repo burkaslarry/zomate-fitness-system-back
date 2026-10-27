@@ -471,7 +471,8 @@ class CoachScheduleConfirm(BaseModel):
     coach_id: int | None = None
     enrollment_id: int = Field(ge=1)
     day: date
-    start_hour: int = Field(ge=9, le=18)
+    # [F003][S003] Full-day scheduling (00:00–24:00), not limited to 09–18.
+    start_hour: int = Field(ge=0, le=23)
     start_minute: int = Field(default=0, ge=0, le=45)
     duration_hours: float = Field(ge=0.5, le=2)
 
@@ -482,8 +483,8 @@ class CoachScheduleConfirm(BaseModel):
             raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
         if self.start_minute not in {0, 15, 30, 45}:
             raise ValueError("start_minute must be 0, 15, 30, or 45.")
-        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 19:
-            raise ValueError("Time slot must end by 19:00 (7pm).")
+        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 24:
+            raise ValueError("Time slot must end by midnight (24:00).")
         return self
 
 
@@ -540,6 +541,9 @@ class CoachStudentBriefOut(BaseModel):
 class CoachStudentEnrollmentOut(BaseModel):
     enrollment_id: int
     course_title: str
+    branch_id: int | None = None
+    branch_name: str | None = None
+    branch_code: str | None = None
     scheduled_start: datetime
     scheduled_end: datetime
     total_lessons: int
@@ -609,7 +613,8 @@ class CoachBookSession(BaseModel):
     coach_id: int | None = None
     enrollment_id: int = Field(ge=1)
     day: date
-    start_hour: int = Field(ge=9, le=18)
+    # [F003][S003] Full-day scheduling (00:00–24:00), not limited to 09–18.
+    start_hour: int = Field(ge=0, le=23)
     start_minute: int = Field(default=0, ge=0, le=45)
     duration_hours: float = Field(ge=0.5, le=2)
 
@@ -620,8 +625,8 @@ class CoachBookSession(BaseModel):
             raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
         if self.start_minute not in {0, 15, 30, 45}:
             raise ValueError("start_minute must be 0, 15, 30, or 45.")
-        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 19:
-            raise ValueError("Time slot must end by 19:00 (7pm).")
+        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 24:
+            raise ValueError("Time slot must end by midnight (24:00).")
         return self
 
 
@@ -895,6 +900,9 @@ class CoachPersonalBlockOut(BaseModel):
     start_at: datetime
     end_at: datetime
     created_at: datetime
+
+    class Config:
+        from_attributes = True
 
 
 class PaymentRecordUpdate(BaseModel):

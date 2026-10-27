@@ -8208,6 +8208,7 @@ def coach_student_records(
     deleted_e = _deleted_course_enrollment_ids()
     enrollments = (
         db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.branch))
         .filter(
             CourseEnrollment.coach_id == cid,
             CourseEnrollment.student_id == student_id,
@@ -8240,6 +8241,9 @@ def coach_student_records(
             CoachStudentEnrollmentOut(
                 enrollment_id=e.id,
                 course_title=e.title,
+                branch_id=e.branch_id,
+                branch_name=e.branch.name if e.branch else None,
+                branch_code=e.branch.code if e.branch else None,
                 scheduled_start=e.scheduled_start,
                 scheduled_end=e.scheduled_end,
                 total_lessons=e.total_lessons,
