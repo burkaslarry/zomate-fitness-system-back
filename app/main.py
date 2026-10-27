@@ -1310,6 +1310,17 @@ def canonical_hk_mobile_e164(raw: str | None) -> str | None:
     return f"+852{local}" if local else None
 
 
+def _require_hk_mobile_e164(raw: str | None, *, field_label: str = "電話") -> str:
+    """[F011][S002] Coach/student write path — reject non-HK mobiles; persist ``+852…``."""
+    e164 = canonical_hk_mobile_e164(raw)
+    if not e164:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_label}須為香港 8 位手機號碼（請填 +852xxxxxxxx 或只填八位數字）。",
+        )
+    return e164
+
+
 def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
     """比對資料庫內現有紀錄可能存 8 位、+852 或 852 前置。"""
     return [local_eight, f"+852{local_eight}", f"852{local_eight}"]
@@ -1361,6 +1372,53 @@ def _backfill_student_phones_e164(db: Session) -> int:
         n += 1
     if n or skipped:
         log_event("student_phone_e164_backfill", updated=n, skipped_dup=skipped)
+    return n
+
+
+def _backfill_coach_phones_e164(db: Session) -> int:
+    """[F011][S002] Persist +852 on coach.phone (same canonical form as students)."""
+    deleted_ids = {
+        int(row[0])
+        for row in db.query(DeletedRecord.entity_id)
+        .filter(DeletedRecord.entity_type == "coaches")
+        .all()
+    }
+    coaches = db.query(Coach).order_by(Coach.id.asc()).all()
+    phone_owner: dict[str, Coach] = {c.phone: c for c in coaches if c.phone}
+    n = 0
+    skipped = 0
+    for coach in coaches:
+        if coach.id in deleted_ids:
+            continue
+        canonical = canonical_hk_mobile_e164(coach.phone)
+        if not canonical or coach.phone == canonical:
+            continue
+        digits = "".join(ch for ch in (coach.phone or "") if ch.isdigit())
+        if not (len(digits) == 8 or (len(digits) == 11 and digits.startswith("852"))):
+            continue
+        owner = phone_owner.get(canonical)
+        if owner is not None and owner.id != coach.id:
+            if owner.id in deleted_ids:
+                freed = f"{canonical[:18]}~{owner.id}"[:30]
+                owner.phone = freed
+                phone_owner.pop(canonical, None)
+                phone_owner[freed] = owner
+            else:
+                skipped += 1
+                log_event(
+                    "coach_phone_e164_skip_dup",
+                    coach_id=coach.id,
+                    phone=canonical,
+                    owner_id=owner.id,
+                )
+                continue
+        old = coach.phone
+        coach.phone = canonical
+        phone_owner.pop(old, None)
+        phone_owner[canonical] = coach
+        n += 1
+    if n or skipped:
+        log_event("coach_phone_e164_backfill", updated=n, skipped_dup=skipped)
     return n
 
 
@@ -2663,6 +2721,11 @@ def _sync_startup() -> None:
                 _backfill_student_phones_e164(db)
         except Exception as exc:  # noqa: BLE001 — boot must continue
             log_event("student_phone_e164_backfill_error", error=str(exc)[:240])
+        try:
+            with db.begin_nested():
+                _backfill_coach_phones_e164(db)
+        except Exception as exc:  # noqa: BLE001 — boot must continue
+            log_event("coach_phone_e164_backfill_error", error=str(exc)[:240])
         db.commit()
 
 
@@ -6112,7 +6175,10 @@ def list_coaches(
 def create_coach(
     payload: CoachCreate, db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> CoachOut:
-    if db.query(Coach).filter(Coach.phone == payload.phone).first():
+    # [F011][S002] Persist coach mobiles as +852… (same canonical form as students).
+    phone_e164 = _require_hk_mobile_e164(payload.phone, field_label="教練電話")
+    local_eight = normalize_hk_phone_local_eight(phone_e164) or ""
+    if db.query(Coach).filter(Coach.phone.in_(_hk_phone_lookup_variants(local_eight))).first():
         raise HTTPException(status_code=409, detail="Coach phone already exists.")
     if payload.branch_id is not None:
         if not db.query(Branch).filter(
@@ -6123,6 +6189,7 @@ def create_coach(
     data = payload.model_dump()
     login_username = data.pop("login_username", None)
     password = data.pop("password", None)
+    data["phone"] = phone_e164
     if data.get("hire_date") is None:
         data["hire_date"] = date.today()
     c = Coach(**data)
@@ -6162,13 +6229,17 @@ def update_coach(
     data = raw
 
     if "phone" in data and data["phone"]:
+        # [F011][S002] Canonicalize coach phone to +852… on every update.
+        phone_e164 = _require_hk_mobile_e164(data["phone"], field_label="教練電話")
+        local_eight = normalize_hk_phone_local_eight(phone_e164) or ""
         other = (
             db.query(Coach)
-            .filter(Coach.phone == data["phone"], Coach.id != coach_id)
+            .filter(Coach.phone.in_(_hk_phone_lookup_variants(local_eight)), Coach.id != coach_id)
             .first()
         )
         if other:
             raise HTTPException(status_code=409, detail="Coach phone already exists.")
+        data["phone"] = phone_e164
 
     if "branch_id" in data:
         bid = data["branch_id"]
@@ -6183,7 +6254,7 @@ def update_coach(
     if "full_name" in data and data["full_name"] is not None:
         coach.full_name = data["full_name"].strip()
     if "phone" in data and data["phone"]:
-        coach.phone = data["phone"].strip()
+        coach.phone = data["phone"]
     if "specialty" in data:
         coach.specialty = data["specialty"].strip() if data["specialty"] else None
     if "active" in data and data["active"] is not None:
@@ -6398,7 +6469,11 @@ def import_coaches_csv(
                 hire_d = None
         if not full_name or not phone:
             continue
-        if db.query(Coach).filter(Coach.phone == phone).first():
+        phone_e164 = canonical_hk_mobile_e164(phone)
+        if not phone_e164:
+            continue
+        local_eight = normalize_hk_phone_local_eight(phone_e164) or ""
+        if db.query(Coach).filter(Coach.phone.in_(_hk_phone_lookup_variants(local_eight))).first():
             continue
         branch_id = None
         if branch_code:
@@ -6408,7 +6483,7 @@ def import_coaches_csv(
         db.add(
             Coach(
                 full_name=full_name,
-                phone=phone,
+                phone=phone_e164,
                 branch_id=branch_id,
                 hire_date=hire_d if hire_d is not None else date.today(),
             )
