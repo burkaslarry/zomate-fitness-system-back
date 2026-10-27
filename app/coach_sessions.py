@@ -154,12 +154,15 @@ def build_coach_session_rows(
                 end_dt = start_dt + timedelta(hours=1)
             lesson_no = sorted(o for _a, _b, o in booked_slots).index(original_date) + 1
 
+            coach = enr.coach
             rows.append(
                 {
                     "enrollment_id": enr.id,
                     "student_id": student.id,
                     "student_name": student.full_name,
                     "student_phone": student.phone,
+                    "coach_id": coach.id if coach else coach_id,
+                    "coach_name": coach.full_name if coach else "",
                     "category_id": cat_id,
                     "category_name": cat_name,
                     "session_date": session_date.isoformat(),

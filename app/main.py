@@ -61,7 +61,7 @@ from .health_app import liveness_payload
 from .keepalive import keepalive_loop
 from .logutil import configure_logging, instance_id, log_event
 from .register_public import router as register_public_router
-from .timezone import HK, hk_calendar_date, now_hk
+from .timezone import HK, hk_calendar_date, now_hk, utc_to_hk_iso
 from .models import (
     ActivityLog,
     AppUser,
@@ -904,14 +904,23 @@ def log_whatsapp(
             )
         )
         return
-    log = WhatsAppLog(student_id=student.id, recipient=recipient, message=message)
-    db.add(log)
-    dispatch_reminder(
+    # [F005][S003] Dispatch first; log prefix shows Meta accepted vs dry-run vs failed (not phone delivery).
+    result = dispatch_reminder(
         recipient,
         message,
         template_key=template_key,
         template_context=template_context,
     )
+    if result.dry_run:
+        prefix = f"[dry_run:{result.error or 'not_dispatched'}] "
+    elif not result.ok:
+        prefix = f"[send_failed:{result.error or 'error'}] "
+    elif result.message_id:
+        prefix = f"[api_accepted:{result.message_id}] "
+    else:
+        prefix = "[api_accepted] "
+    log = WhatsAppLog(student_id=student.id, recipient=recipient, message=f"{prefix}{message}")
+    db.add(log)
 
 
 def _set_whatsapp_reminder_opt_in(student: Student, opted_in: bool) -> None:
@@ -2527,6 +2536,9 @@ def perform_lesson_checkin(
         "student_name": student.full_name,
         "student_phone": student.phone,
         "lesson_balance": bal_after,
+        "channel": "qr_pin",
+        # [F007][S004] Always emit HKT (+08:00) so front never treats UTC naive as local wall clock.
+        "created_at": utc_to_hk_iso(checkin_log.created_at),
         # Coach calendar UX：前台用 course_id／session_calendar_date 標記「已簽到扣堂」之課程格。
         "course_id": resolved_enrollment.id if resolved_enrollment else None,
         "session_calendar_date": session_day.isoformat() if resolved_enrollment else None,
@@ -5161,9 +5173,7 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
                 if enr.id == int(course_enr_id):
                     enr.branch_id = int(branch_id)
                     break
-        student = db.get(Student, projection["student_id"])
-        if student is not None:
-            student.branch_id = int(branch_id)
+        # [F004][S002] Fung: 課程跟分店 — do not rewrite student home branch here.
     db.add(AuditLog(action="payment_record_edit", student_id=projection["student_id"],
         detail=json.dumps({"record_type": record_type, "ref_id": ref_id, "edited_by": user.username,
                            "before": before, "after": {k: str(v) for k,v in changes.items()}}, ensure_ascii=False)))
@@ -5563,7 +5573,7 @@ def whatsapp_logs(
             "id": item.id,
             "recipient": item.recipient,
             "message": item.message,
-            "created_at": item.created_at.isoformat(),
+            "created_at": utc_to_hk_iso(item.created_at),
         }
         for item in logs
     ]
@@ -5837,7 +5847,7 @@ def list_checkins(
             "student_phone": student.phone,
             "channel": checkin.channel,
             "remarks": checkin.remarks,
-            "created_at": checkin.created_at.isoformat(),
+            "created_at": utc_to_hk_iso(checkin.created_at),
         }
         for checkin, student in rows
     ]
@@ -7571,12 +7581,44 @@ def coach_list_sessions(
     from_date: date | None = None,
     to_date: date | None = None,
     category_ids: str | None = Query(default=None, description="Comma-separated CourseCategory ids"),
+    all_coaches: bool = Query(default=False, description="Staff: merge every coach schedule"),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> list[CoachSessionOut]:
     """[F008][S002] Coach-scoped session rows with optional course-type filter."""
-    cid = _resolve_coach_id_param(db, user, coach_id)
     cat_filter = _parse_category_ids_param(category_ids)
+    # [F008][S002] Masteracc 學生上堂：同一畫面睇晒所有教練 schedule.
+    if all_coaches:
+        if user.role == "COACH":
+            raise HTTPException(status_code=403, detail="Coach may only access their own schedule.")
+        deleted_c = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "coaches")
+        coach_rows = (
+            db.query(Coach)
+            .filter(~Coach.id.in_(deleted_c))
+            .order_by(Coach.full_name.asc())
+            .all()
+        )
+        rows: list[dict] = []
+        for coach in coach_rows:
+            enrollments = _coach_enrollments_for_sessions(
+                db, coach.id, day=day, from_date=from_date, to_date=to_date
+            )
+            rows.extend(
+                build_coach_session_rows(
+                    db,
+                    enrollments,
+                    coach_id=coach.id,
+                    day=day,
+                    from_date=from_date,
+                    to_date=to_date,
+                    category_ids=cat_filter,
+                )
+            )
+        rows.sort(key=lambda r: (r["session_date"], r["start_time"], r.get("coach_name") or "", r["student_name"]))
+        log_event("coach_sessions_list_all", coach_count=len(coach_rows), count=len(rows))
+        return [CoachSessionOut.model_validate(r) for r in rows]
+
+    cid = _resolve_coach_id_param(db, user, coach_id)
     enrollments = _coach_enrollments_for_sessions(
         db, cid, day=day, from_date=from_date, to_date=to_date
     )

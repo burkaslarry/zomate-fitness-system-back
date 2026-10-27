@@ -738,6 +738,8 @@ class CoachSessionOut(BaseModel):
     student_id: int
     student_name: str
     student_phone: str
+    coach_id: int | None = None
+    coach_name: str | None = None
     category_id: int | None = None
     category_name: str
     session_date: str

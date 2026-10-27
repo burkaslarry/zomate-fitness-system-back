@@ -33,3 +33,10 @@ def utc_to_hk(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=dt_timezone.utc).astimezone(HK)
     return dt.astimezone(HK)
+
+
+def utc_to_hk_iso(dt: datetime | None) -> str:
+    """[F007][S004] Serialize naive-UTC timestamps as Asia/Hong_Kong ISO (+08:00)."""
+    if dt is None:
+        return ""
+    return utc_to_hk(dt).isoformat()
