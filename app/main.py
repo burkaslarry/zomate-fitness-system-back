@@ -725,10 +725,24 @@ def _assert_initial_staff_booking(start: datetime, end: datetime) -> None:
         raise HTTPException(status_code=400, detail="不能安排已完結的課堂，請選今日未完結或未來時段。")
 
 
-def _assert_change_notice(start: datetime) -> None:
-    """[F003][S004] Changes/cancellations require at least 24 hours' notice."""
-    if start < _session_policy_now() + timedelta(hours=24):
-        raise HTTPException(status_code=400, detail="改期或取消必須最少提前 24 小時；逾時請聯絡管理員處理。")
+def _assert_change_notice(start: datetime, *, actor_role: str | None = None) -> None:
+    """[F003][S004]
+    Coach may reschedule/cancel until lesson start; once started, locked.
+    Admin/Clerk (and other staff) still need 24h notice.
+    """
+    now = _session_policy_now()
+    if (actor_role or "").upper() == "COACH":
+        if start <= now:
+            raise HTTPException(
+                status_code=400,
+                detail="課堂已開始或已完結，教練不可再改期或取消。",
+            )
+        return
+    if start < now + timedelta(hours=24):
+        raise HTTPException(
+            status_code=400,
+            detail="改期或取消必須最少提前 24 小時；逾時請聯絡管理員處理。",
+        )
 
 
 def _session_override_map(db: Session, enrollment_id: int) -> dict[date, CourseSessionOverride]:
@@ -8529,7 +8543,7 @@ def coach_reschedule_one_session(
     cid, enr, override, current_start, _current_end = _require_enrollment_session(
         db, user, enrollment_id, original_date, payload.coach_id
     )
-    _assert_change_notice(current_start)
+    _assert_change_notice(current_start, actor_role=user.role)
     # [F003][S004] Coach-arranged replacement slots: no 72h minimum (same rule as first booking).
     _assert_initial_staff_booking(payload.scheduled_start, payload.scheduled_end)
     _assert_coach_slot_available(
@@ -8549,12 +8563,17 @@ def coach_reschedule_one_session(
     row.created_by_username = user.username
     if override is None:
         db.add(row)
+    notice = (
+        "課堂開始前教練仍可再改期；一到上課時間即不可改。"
+        if (user.role or "").upper() == "COACH"
+        else "如需再次改期或取消，請最少於課堂開始前 24 小時通知。"
+    )
     message = (
         f"【Zomate Fitness】改期確認：{enr.title}\n"
         f"原定：{current_start.strftime('%Y-%m-%d %H:%M')}\n"
         f"新時間：{payload.scheduled_start.strftime('%Y-%m-%d %H:%M')}–{payload.scheduled_end.strftime('%H:%M')}\n"
         f"課堂 PIN：{enr.checkin_pin}\n\n"
-        "如需再次改期或取消，請最少於課堂開始前 24 小時通知。"
+        f"{notice}"
     )
     log_whatsapp(
         db,
@@ -8603,7 +8622,7 @@ def coach_cancel_one_session(
     cid, enr, override, current_start, _current_end = _require_enrollment_session(
         db, user, enrollment_id, original_date, payload.coach_id
     )
-    _assert_change_notice(current_start)
+    _assert_change_notice(current_start, actor_role=user.role)
     row = override or CourseSessionOverride(enrollment_id=enrollment_id, original_date=original_date)
     row.action = "cancelled"
     row.rescheduled_start = None
