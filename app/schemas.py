@@ -121,6 +121,8 @@ class MemberCreate(BaseModel):
     whatsapp_reminder_opt_in: bool = False
     # Empty allowed — staff can 候補簽署 later from admin student detail.
     digital_signature: str = Field(default="", max_length=12_000_000)
+    # [F001][S001] Required home branch (SW / TST) at registration.
+    branch_id: int = Field(ge=1)
     coach_id: int | None = Field(default=None, ge=1)
     coach_username: str | None = Field(default=None, min_length=1, max_length=120)
     course_category_id: int | None = Field(default=None, ge=1)

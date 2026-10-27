@@ -1672,6 +1672,15 @@ def _student_last_checkin_iso(db: Session, student_id: int) -> str | None:
     return last_at.isoformat() if last_at else None
 
 
+def _student_home_branch_code(db: Session, student: Student) -> str | None:
+    """[F001][S001] SW/TST code from registration home branch."""
+    bid = getattr(student, "branch_id", None)
+    if not bid:
+        return None
+    branch = db.get(Branch, bid)
+    return branch.code if branch else None
+
+
 def student_to_member_dict(db: Session, student: Student) -> dict:
     """[F001][S003]
     Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
@@ -1679,6 +1688,9 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
     ob_coach_id, ob_coach_name = student_onboarding_coach(db, student.id)
     ob_cat_id, ob_cat_name = student_onboarding_category(db, student.id)
+    branch = None
+    if getattr(student, "branch_id", None):
+        branch = db.get(Branch, student.branch_id)
     return {
         "id": student.id,
         "hkid": student.hkid,
@@ -1707,6 +1719,10 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "onboarding_course_category_id": ob_cat_id,
         "onboarding_course_category_name": ob_cat_name,
         "whatsapp_reminder_opt_in": bool(getattr(student, "whatsapp_reminder_opt_in", False)),
+        "branch_id": student.branch_id,
+        "branch_code": branch.code if branch else None,
+        "branch_name": branch.name if branch else None,
+        "display_name": format_student_display_name(student, branch.code if branch else None),
     }
 
 
@@ -2018,6 +2034,9 @@ def _migrate_member_profile_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS emergency_contact_relationship VARCHAR(80) NULL",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in BOOLEAN NOT NULL DEFAULT TRUE",
         "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS whatsapp_reminder_opt_in_at TIMESTAMP NULL",
+        # [F001][S001] Preferred branch (SW / TST) from new-member registration.
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS branch_id INTEGER NULL REFERENCES zomate_fs_branches(id)",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_students_branch_id ON zomate_fs_students (branch_id)",
         # [F001][S003] HKID not unique — phone is the unique key.
         "DROP INDEX IF EXISTS ix_zomate_fs_students_hkid",
         "ALTER TABLE zomate_fs_students DROP CONSTRAINT IF EXISTS zomate_fs_students_hkid_key",
@@ -2996,8 +3015,15 @@ def _create_member_impl(
             f"PAR-Q JSON: {json.dumps(parq_data, ensure_ascii=False)}",
             f"Medical clearance file: {medical_label or (medical_path or '')}",
             f"PDPO acknowledged: {payload.pdpo_acknowledged}",
+            f"Branch id: {payload.branch_id}",
         ]
     )
+    branch = db.get(Branch, payload.branch_id)
+    if branch is None or _is_deleted(db, "branches", branch.id) or not branch.active:
+        raise HTTPException(status_code=400, detail="請選擇有效分店（尖沙咀 TST 或上環 SW）。")
+    code_u = (branch.code or "").strip().upper()
+    if code_u not in {"TST", "SW", "SHEUNGWAN"}:
+        raise HTTPException(status_code=400, detail="新會友分店只可選尖沙咀 (TST) 或上環 (SW)。")
     student = Student(
         full_name=payload.full_name.strip(),
         chinese_name=payload.chinese_name.strip(),
@@ -3017,6 +3043,7 @@ def _create_member_impl(
         disclaimer_accepted=True,
         whatsapp_reminder_opt_in=bool(payload.whatsapp_reminder_opt_in),
         whatsapp_reminder_opt_in_at=datetime.utcnow() if payload.whatsapp_reminder_opt_in else None,
+        branch_id=branch.id,
     )
     db.add(student)
     db.flush()
@@ -3077,6 +3104,7 @@ def create_member(
     disclaimer_accepted: str = Form(default="false"),
     whatsapp_reminder_opt_in: str = Form(default="false"),
     digital_signature: str = Form(default=""),
+    branch_id: int = Form(...),
     coach_id: int | None = Form(default=None),
     coach_username: str | None = Form(default=None),
     course_category_id: int | None = Form(default=None),
@@ -3110,6 +3138,7 @@ def create_member(
             disclaimer_accepted=_form_bool(disclaimer_accepted, default=False),
             whatsapp_reminder_opt_in=_form_bool(whatsapp_reminder_opt_in, default=False),
             digital_signature=digital_signature,
+            branch_id=branch_id,
             coach_id=coach_id,
             coach_username=coach_username,
             course_category_id=course_category_id,
@@ -7901,7 +7930,9 @@ def coach_pending_students(
             course_id=enr.id,
             student_id=enr.student.id,
             student_name=format_student_display_name(
-                enr.student, enr.branch.code if enr.branch else None
+                enr.student,
+                _student_home_branch_code(db, enr.student)
+                or (enr.branch.code if enr.branch else None),
             ),
             student_phone=enr.student.phone,
             course_title=enr.title,
@@ -8112,7 +8143,10 @@ def coach_list_students(
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
-        display = format_student_display_name(st, enr.branch.code if enr.branch else None)
+        display = format_student_display_name(
+            st,
+            _student_home_branch_code(db, st) or (enr.branch.code if enr.branch else None),
+        )
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
                 student_id=st.id,
@@ -8138,7 +8172,7 @@ def coach_list_students(
             continue
         by_student[st.id] = CoachStudentBriefOut(
             student_id=st.id,
-            full_name=st.full_name,
+            full_name=format_student_display_name(st, _student_home_branch_code(db, st)),
             phone=st.phone,
             lesson_balance=_lesson_balance_sum(db, st.id),
             enrollment_count=0,

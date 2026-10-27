@@ -152,8 +152,11 @@ class Student(Base):
     signature_image_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    #: [F001][S001] Home branch from registration — SW / TST for display prefixes.
+    branch_id: Mapped[int | None] = mapped_column(ForeignKey("zomate_fs_branches.id"), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    branch: Mapped["Branch | None"] = relationship()
     checkins: Mapped[list["CheckinLog"]] = relationship(back_populates="student")
     whatsapp_logs: Mapped[list["WhatsAppLog"]] = relationship(back_populates="student")
     course_enrollments: Mapped[list["CourseEnrollment"]] = relationship(

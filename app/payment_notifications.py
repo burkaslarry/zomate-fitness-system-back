@@ -456,9 +456,17 @@ def branch_code_prefix(branch_code: str | None) -> str:
 
 
 def format_student_display_name(student: Student, branch_code: str | None = None) -> str:
-    """[F005][S003] Prefixed name for UI / WhatsApp: ``(sw)Alex``."""
+    """[F005][S003] Prefixed name for UI / WhatsApp: ``(sw)Alex``.
+
+    Prefers explicit ``branch_code``, else student's home branch from registration.
+    """
     name = (student.full_name or "").strip() or "—"
-    prefix = branch_code_prefix(branch_code)
+    code = (branch_code or "").strip() or None
+    if not code:
+        home = getattr(student, "branch", None)
+        if home is not None and getattr(home, "code", None):
+            code = str(home.code)
+    prefix = branch_code_prefix(code)
     return f"{prefix}{name}" if prefix else name
 
 
