@@ -1316,19 +1316,51 @@ def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
 
 
 def _backfill_student_phones_e164(db: Session) -> int:
-    """[F005][S003] Persist +852 on student.phone in DB — WhatsApp must not invent country code at send."""
+    """[F005][S003] Persist +852 on student.phone in DB — WhatsApp must not invent country code at send.
+
+    Skips live duplicates; frees soft-deleted holders of the same E.164 so active rows can upgrade.
+    """
+    deleted_ids = {
+        int(row[0])
+        for row in db.query(DeletedRecord.entity_id)
+        .filter(DeletedRecord.entity_type == "students")
+        .all()
+    }
+    students = db.query(Student).order_by(Student.id.asc()).all()
+    phone_owner: dict[str, Student] = {st.phone: st for st in students if st.phone}
     n = 0
-    for st in db.query(Student).all():
+    skipped = 0
+    for st in students:
         canonical = canonical_hk_mobile_e164(st.phone)
         if not canonical or st.phone == canonical:
             continue
-        # Only rewrite recognizable HK mobiles (bare 8 / 852…); leave foreign/odd values alone.
         digits = "".join(ch for ch in (st.phone or "") if ch.isdigit())
-        if len(digits) == 8 or (len(digits) == 11 and digits.startswith("852")):
-            st.phone = canonical
-            n += 1
-    if n:
-        log_event("student_phone_e164_backfill", updated=n)
+        if not (len(digits) == 8 or (len(digits) == 11 and digits.startswith("852"))):
+            continue
+        owner = phone_owner.get(canonical)
+        if owner is not None and owner.id != st.id:
+            if owner.id in deleted_ids:
+                # Free unique index so the live 8-digit row can take +852…
+                freed = f"{canonical[:18]}~{owner.id}"[:30]
+                owner.phone = freed
+                phone_owner.pop(canonical, None)
+                phone_owner[freed] = owner
+            else:
+                skipped += 1
+                log_event(
+                    "student_phone_e164_skip_dup",
+                    student_id=st.id,
+                    phone=canonical,
+                    owner_id=owner.id,
+                )
+                continue
+        old = st.phone
+        st.phone = canonical
+        phone_owner.pop(old, None)
+        phone_owner[canonical] = st
+        n += 1
+    if n or skipped:
+        log_event("student_phone_e164_backfill", updated=n, skipped_dup=skipped)
     return n
 
 
@@ -2625,7 +2657,12 @@ def _sync_startup() -> None:
         _seed_default_branches(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
-        _backfill_student_phones_e164(db)
+        # [F005][S003] Never let phone backfill take down boot (unique conflicts → nested rollback).
+        try:
+            with db.begin_nested():
+                _backfill_student_phones_e164(db)
+        except Exception as exc:  # noqa: BLE001 — boot must continue
+            log_event("student_phone_e164_backfill_error", error=str(exc)[:240])
         db.commit()
 
 
