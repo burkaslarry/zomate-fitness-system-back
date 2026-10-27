@@ -8339,11 +8339,12 @@ def coach_book_session(
         duration_hours=payload.duration_hours,
     )
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    # [F003][S007] Lock enrollment only — joinedload+FOR UPDATE breaks Postgres (outer join).
     enr = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == payload.enrollment_id)
-        .with_for_update().populate_existing()
+        .with_for_update(of=CourseEnrollment)
+        .populate_existing()
         .first()
     )
     if not enr or _is_deleted(db, "course_enrollments", enr.id):
@@ -8373,11 +8374,12 @@ def coach_confirm_enrollment_schedule(
 ) -> CourseOut:
     """[F003][S002] Coach assigns 0.5–2h slot; blocks double-booking via confirmed enrollments."""
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    # [F003][S002] Lock enrollment row only — FOR UPDATE + joinedload(branch) → Postgres 500.
     enr = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == enrollment_id)
-        .with_for_update().populate_existing()
+        .with_for_update(of=CourseEnrollment)
+        .populate_existing()
         .first()
     )
     if not enr:
