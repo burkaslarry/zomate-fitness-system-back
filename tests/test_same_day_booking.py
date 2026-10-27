@@ -90,11 +90,16 @@ def test_permission_conflict_and_reconfirmation_rejected(db_session, monkeypatch
 
 
 def test_reschedule_notices_still_enforced(monkeypatch):
-    """[F003][S004] Initial booking exception never relaxes change/cancellation notice."""
+    """[F003][S004] Admin keeps 24h; coach may change until lesson start."""
     monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 23, 15, 5))
-    for check in (main._assert_change_notice,):
-        with pytest.raises(HTTPException) as exc:
-            check(datetime(2026, 10, 23, 16))
-        assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        main._assert_change_notice(datetime(2026, 10, 23, 16))
+    assert exc.value.status_code == 400
+    # Coach: still before start → allowed
+    main._assert_change_notice(datetime(2026, 10, 23, 16), actor_role="COACH")
+    # Coach: at/after start → blocked
+    with pytest.raises(HTTPException) as coach_exc:
+        main._assert_change_notice(datetime(2026, 10, 23, 15, 5), actor_role="COACH")
+    assert coach_exc.value.status_code == 400
     with pytest.raises(HTTPException):
         main._assert_initial_staff_booking(datetime(2026, 10, 23, 14), datetime(2026, 10, 23, 15, 5))
