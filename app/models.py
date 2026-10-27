@@ -90,7 +90,7 @@ class CourseEnrollment(Base):
     # [F005][S003] Course-specific payment snapshot; never aggregate unrelated student receipts.
     payment_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: False until coach assigns this student a calendar slot on the coach dashboard.
-    coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     branch: Mapped["Branch"] = relationship(back_populates="course_enrollments")
@@ -444,3 +444,17 @@ class AuthSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user: Mapped["AppUser"] = relationship()
+
+
+class CoachPersonalBlock(Base):
+    """[F003][S003] Coach private calendar marks（其他事項）— not student lessons."""
+
+    __tablename__ = "zomate_fs_coach_personal_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    coach_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(200), nullable=False, default="其他事項")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

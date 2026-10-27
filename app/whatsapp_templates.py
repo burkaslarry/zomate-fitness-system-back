@@ -223,11 +223,12 @@ def build_payment_context(
     total_amount: float | None,
     amount_owing: float | None,
     installment_notes: str,
+    student_display_name: str | None = None,
 ) -> dict[str, str]:
     """[F005][S003] Context map for template rendering."""
     return {
         "course_title": course_title or "—",
-        "student_name": student.full_name,
+        "student_name": (student_display_name or student.full_name or "—"),
         "student_phone": _display_phone(student.phone),
         "pin": pin or "—",
         "next_lesson_date": next_lesson_date or "—",

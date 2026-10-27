@@ -72,6 +72,7 @@ from .models import (
     CategoryEnrollment,
     CheckinLog,
     Coach,
+    CoachPersonalBlock,
     CoachSkill,
     CourseCategory,
     CourseEnrollment,
@@ -118,6 +119,8 @@ from .schemas import (
     CoachAttendanceReportRowOut,
     CoachBookSession,
     CoachEnrollmentCancelBody,
+    CoachPersonalBlockCreate,
+    CoachPersonalBlockOut,
     CoachSessionCancelBody,
     CoachSessionRescheduleBody,
     CoachTrialGrantBody,
@@ -179,9 +182,11 @@ from .medical_clearance import (
 )
 from .payment_notifications import (
     apply_receipt_payment_match,
+    format_student_display_name,
     send_checkin_coach_whatsapp,
     send_payment_whatsapp_notifications,
     send_receipt_upload_request_whatsapp,
+    send_schedule_booking_whatsapp,
 )
 from .payment_records import (
     build_payment_records,
@@ -205,7 +210,7 @@ from .coach_sessions import (
     build_coach_session_rows,
     sort_coach_attendance_ledger_rows,
 )
-from .whatsapp_templates import seed_whatsapp_templates, get_template_body
+from .whatsapp_templates import count_course_checkins, seed_whatsapp_templates, get_template_body
 from .whatsapp_business import dispatch_reminder, get_whatsapp_client, verify_whatsapp_webhook_signature
 from .storage import FileStorageService
 
@@ -793,6 +798,7 @@ def _assert_coach_slot_available(
     *,
     exclude_enrollment_id: int | None = None,
     exclude_original_date: date | None = None,
+    exclude_personal_block_id: int | None = None,
 ) -> None:
     for a0, a1 in _coach_confirmed_intervals_on_day(
         db,
@@ -803,6 +809,23 @@ def _assert_coach_slot_available(
     ):
         if start < a1 and a0 < end:
             raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
+    # [F003][S003] Also block against coach private「其他事項」marks.
+    day_start = datetime.combine(day, time(0, 0))
+    day_end = datetime.combine(day, time(23, 59, 59))
+    blocks = (
+        db.query(CoachPersonalBlock)
+        .filter(
+            CoachPersonalBlock.coach_id == coach_id,
+            CoachPersonalBlock.start_at <= day_end,
+            CoachPersonalBlock.end_at >= day_start,
+        )
+        .all()
+    )
+    for blk in blocks:
+        if exclude_personal_block_id is not None and blk.id == exclude_personal_block_id:
+            continue
+        if start < blk.end_at and blk.start_at < end:
+            raise HTTPException(status_code=409, detail="Time slot conflicts with a personal block.")
 
 
 def _coach_teaches_student(db: Session, coach_id: int, student_id: int) -> bool:
@@ -1003,27 +1026,22 @@ def _save_member_receipt_row(
             pending = state.setdefault("pending_payments", {})
             pending["full" if full_payment else str(installment_no) if installment_no else "unassigned"] = {"amount": amount, "receipt_id": receipt.id, "full_payment": full_payment}
             paid_course.payment_state_json = json.dumps(state, ensure_ascii=False)
-    # [F005][S003] File saved = Zomate 已收到收據 for WhatsApp API wording (student + coach).
-    # payment_confirmed still gates PIN unlock separately from this acknowledgement.
-    if send_whatsapp:
-        wa_receipt_confirmed = True
-    elif payment_confirmed:
-        wa_receipt_confirmed = None if course_enrollment_id is not None else True
-    else:
-        wa_receipt_confirmed = False
-    whatsapp_result = send_payment_whatsapp_notifications(
-        db,
-        log_whatsapp,
-        student=student,
-        receipt_confirmed=wa_receipt_confirmed,
-        notify_coach=notify_coach,
-        course_enrollment_id=course_enrollment_id,
-        installment_no=installment_no,
-        installment_plan_id=installment_plan_id,
-        amount=amount,
-        full_payment=full_payment,
-        log_messages=send_whatsapp,
-    )
+    # [F005][S003] SOP3: upload is evidence only — payment WhatsApp fires after Admin confirm.
+    whatsapp_result: dict = {}
+    if payment_confirmed and send_whatsapp:
+        whatsapp_result = send_payment_whatsapp_notifications(
+            db,
+            log_whatsapp,
+            student=student,
+            receipt_confirmed=None if course_enrollment_id is not None else True,
+            notify_coach=notify_coach,
+            course_enrollment_id=course_enrollment_id,
+            installment_no=installment_no,
+            installment_plan_id=installment_plan_id,
+            amount=amount,
+            full_payment=full_payment,
+            log_messages=True,
+        )
     return {
         "id": receipt.id,
         "file_path": path,
@@ -7882,7 +7900,9 @@ def coach_pending_students(
             enrollment_id=enr.id,
             course_id=enr.id,
             student_id=enr.student.id,
-            student_name=enr.student.full_name,
+            student_name=format_student_display_name(
+                enr.student, enr.branch.code if enr.branch else None
+            ),
             student_phone=enr.student.phone,
             course_title=enr.title,
             branch_name=enr.branch.name,
@@ -8079,7 +8099,7 @@ def coach_list_students(
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     rows = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.student))
+        .options(joinedload(CourseEnrollment.student), joinedload(CourseEnrollment.branch))
         .filter(
             CourseEnrollment.coach_id == cid,
             ~CourseEnrollment.id.in_(deleted_e),
@@ -8092,10 +8112,11 @@ def coach_list_students(
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
+        display = format_student_display_name(st, enr.branch.code if enr.branch else None)
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
                 student_id=st.id,
-                full_name=st.full_name,
+                full_name=display,
                 phone=st.phone,
                 lesson_balance=_lesson_balance_sum(db, st.id),
                 enrollment_count=1,
@@ -8260,8 +8281,10 @@ def _book_next_lesson(db: Session, user: AppUser, enr: CourseEnrollment, payload
     db.add(row)
     record_activity(db, enr.student, "coach_book_next_lesson", enr.id)
     db.commit()
-    send_payment_whatsapp_notifications(db, log_whatsapp, student=enr.student,
-        course_enrollment_id=enr.id, notify_coach=True)
+    # [F005][S003] Booking notice — not payment templates.
+    send_schedule_booking_whatsapp(
+        db, log_whatsapp, student=enr.student, enrollment=enr, notify_coach=True,
+    )
     db.commit()
     return enrollment_to_out(enr)
 
@@ -8352,10 +8375,9 @@ def coach_confirm_enrollment_schedule(
     enr.coach_time_confirmed = True
     record_activity(db, enr.student, "coach_confirm_schedule", enr.id)
     db.commit()
-    # [F005][S003] Schedule updates also use one agreed complete message per recipient.
-    send_payment_whatsapp_notifications(
-        db, log_whatsapp, student=enr.student, course_enrollment_id=enr.id,
-        receipt_confirmed=None, notify_coach=True,
+    # [F005][S003] First booking uses schedule wording (PIN + 上堂時間 + 教練), not payment copy.
+    send_schedule_booking_whatsapp(
+        db, log_whatsapp, student=enr.student, enrollment=enr, notify_coach=True,
     )
     db.commit()
     full = (
@@ -8375,11 +8397,17 @@ def coach_cancel_enrollment(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> dict:
-    """[F003][S009] Coach soft-cancels an assigned enrollment (removes from calendar)."""
+    """[F003][S009] Soft-cancel whole course — Admin/Clerk only; reverses unused lesson credit."""
+    # [F003][S009] Coaches may cancel one session; whole-course cancel is Master/Admin only.
+    if user.role == "COACH":
+        raise HTTPException(
+            status_code=403,
+            detail="教練不可取消整個課程；請改期或取消單一課堂，或聯絡 Admin。",
+        )
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
     enr = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.student))
+        .options(joinedload(CourseEnrollment.student), joinedload(CourseEnrollment.branch))
         .filter(CourseEnrollment.id == enrollment_id)
         .first()
     )
@@ -8390,10 +8418,24 @@ def coach_cancel_enrollment(
     next_session_start = _next_effective_session_start(db, enr)
     if next_session_start is not None:
         _assert_change_notice(next_session_start)
+    attended = count_course_checkins(db, enr.student_id, enr.id) if enr.student else 0
+    unused = max(0, int(enr.total_lessons or 0) - int(attended))
+    if enr.student and unused > 0:
+        # [F007][S002] Reverse remaining package credit so 餘下堂數 updates after cancel.
+        apply_lesson_ledger_delta(
+            db,
+            enr.student,
+            -unused,
+            "course_cancel_reverse",
+            enrollment_id=enr.id,
+            created_by_role=user.role.lower(),
+        )
     _record_soft_delete(db, "course_enrollments", enr.id, user)
-    record_activity(db, enr.student, "coach_cancel_enrollment", enr.id)
+    if enr.student:
+        record_activity(db, enr.student, "coach_cancel_enrollment", enr.id)
     db.commit()
-    return {"ok": True, "enrollment_id": enr.id}
+    bal = _lesson_balance_sum(db, enr.student_id) if enr.student_id else 0
+    return {"ok": True, "enrollment_id": enr.id, "lessons_reversed": unused, "lesson_balance": bal}
 
 
 def _require_enrollment_session(
@@ -8566,6 +8608,73 @@ def coach_cancel_one_session(
     )
     db.commit()
     return {"ok": True, "enrollment_id": enr.id, "original_date": original_date}
+
+
+@app.get("/api/coach/personal-blocks", response_model=list[CoachPersonalBlockOut])
+def coach_list_personal_blocks(
+    coach_id: int | None = None,
+    day: date | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> list[CoachPersonalBlockOut]:
+    """[F003][S003] List coach private calendar marks（其他事項）."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    q = db.query(CoachPersonalBlock).filter(CoachPersonalBlock.coach_id == cid)
+    if day is not None:
+        start = datetime.combine(day, time(0, 0))
+        end = datetime.combine(day, time(23, 59, 59))
+        q = q.filter(CoachPersonalBlock.start_at <= end, CoachPersonalBlock.end_at >= start)
+    else:
+        if from_date is not None:
+            q = q.filter(CoachPersonalBlock.end_at >= datetime.combine(from_date, time(0, 0)))
+        if to_date is not None:
+            q = q.filter(CoachPersonalBlock.start_at <= datetime.combine(to_date, time(23, 59, 59)))
+    rows = q.order_by(CoachPersonalBlock.start_at.asc()).all()
+    return [CoachPersonalBlockOut.model_validate(r) for r in rows]
+
+
+@app.post("/api/coach/personal-blocks", response_model=CoachPersonalBlockOut)
+def coach_create_personal_block(
+    payload: CoachPersonalBlockCreate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CoachPersonalBlockOut:
+    """[F003][S003] Create a private calendar block for the coach."""
+    cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
+    end = start + timedelta(hours=payload.duration_hours)
+    _assert_initial_staff_booking(start, end)
+    _assert_coach_slot_available(db, cid, payload.day, start, end)
+    row = CoachPersonalBlock(
+        coach_id=cid,
+        title=(payload.title or "其他事項").strip() or "其他事項",
+        notes=(payload.notes or "").strip() or None,
+        start_at=start,
+        end_at=end,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return CoachPersonalBlockOut.model_validate(row)
+
+
+@app.delete("/api/coach/personal-blocks/{block_id}")
+def coach_delete_personal_block(
+    block_id: int,
+    coach_id: int | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> dict:
+    """[F003][S003] Remove a private calendar block."""
+    cid = _resolve_coach_id_param(db, user, coach_id)
+    row = db.get(CoachPersonalBlock, block_id)
+    if row is None or row.coach_id != cid:
+        raise HTTPException(status_code=404, detail="Personal block not found.")
+    db.delete(row)
+    db.commit()
+    return {"ok": True, "id": block_id}
 
 
 @app.patch("/api/coach/students/{student_id}/signature")

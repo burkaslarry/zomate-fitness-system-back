@@ -367,6 +367,12 @@ def send_payment_whatsapp_notifications(
             else "已分期（部分付款待補足）"
         )
     installment_notes = build_installment_notes_from_segments(segment_dicts) if segment_dicts else ""
+    branch_code = None
+    if enr is not None and enr.branch_id:
+        from .models import Branch
+
+        br = db.get(Branch, enr.branch_id)
+        branch_code = br.code if br else None
 
     ctx = build_payment_context(
         student=student,
@@ -380,6 +386,7 @@ def send_payment_whatsapp_notifications(
         total_amount=total_amt,
         amount_owing=owing,
         installment_notes=installment_notes,
+        student_display_name=format_student_display_name(student, branch_code),
     )
 
     student_key = resolve_payment_template_key(
@@ -433,6 +440,129 @@ def send_payment_whatsapp_notifications(
             "template_key": coach_key,
         }
 
+    return result
+
+
+def branch_code_prefix(branch_code: str | None) -> str:
+    """[F005][S003] Display prefix e.g. (sw) / (tst) from branch code."""
+    code = (branch_code or "").strip().lower()
+    if not code:
+        return ""
+    if code in {"sheungwan", "sw"}:
+        return "(sw)"
+    if code in {"tst", "tsimshatsui", "tsim_sha_tsui"}:
+        return "(tst)"
+    return f"({code})"
+
+
+def format_student_display_name(student: Student, branch_code: str | None = None) -> str:
+    """[F005][S003] Prefixed name for UI / WhatsApp: ``(sw)Alex``."""
+    name = (student.full_name or "").strip() or "—"
+    prefix = branch_code_prefix(branch_code)
+    return f"{prefix}{name}" if prefix else name
+
+
+def send_schedule_booking_whatsapp(
+    db: Session,
+    log_whatsapp_fn,
+    *,
+    student: Student,
+    enrollment: CourseEnrollment,
+    coach: Coach | None = None,
+    notify_coach: bool = True,
+) -> dict[str, Any]:
+    """[F005][S003]
+    Feature: Balance Sync & Integrations
+    Step: WhatsApp after coach books / confirms schedule (not payment templates)
+    Logic: Match reminder_student.txt 教練booking wording.
+    """
+    if coach is None and enrollment.coach_id:
+        coach = db.get(Coach, enrollment.coach_id)
+    branch_code = None
+    if enrollment.branch_id:
+        from .models import Branch
+
+        br = db.get(Branch, enrollment.branch_id)
+        branch_code = br.code if br else None
+    student_label = format_student_display_name(student, branch_code)
+    phone_display = "".join(ch for ch in (student.phone or "") if ch.isdigit())
+    if len(phone_display) == 11 and phone_display.startswith("852"):
+        phone_display = phone_display[3:]
+    attended = count_course_checkins(db, student.id, enrollment.id)
+    total_lessons = int(enrollment.total_lessons or 0)
+    remaining = max(0, total_lessons - attended) if total_lessons else 0
+    payment_state = course_payment_state(enrollment)
+    payment_status = "已付款" if payment_state.get("confirmed") or payment_state.get("fully_paid") else "未付款"
+    lesson_when = format_lesson_datetime(enrollment) if enrollment.coach_time_confirmed else "待教練安排"
+    if enrollment.scheduled_start and enrollment.coach_time_confirmed:
+        lesson_when = enrollment.scheduled_start.strftime("%Y-%m-%d %H:%M")
+    coach_name = (coach.full_name if coach else "") or "—"
+    pin = str(enrollment.checkin_pin or "—")
+    msg = (
+        f"【Zomate 開課】{enrollment.title}\n"
+        f"{student_label}（{phone_display or student.phone}）\n"
+        f"課堂 PIN：{pin}\n"
+        f"上堂時間 : {lesson_when}\n"
+        f"教練 : {coach_name}\n"
+        f"已上堂數: {attended}\n"
+        f"餘下堂數: {remaining}\n"
+        f"付款狀態: {payment_status}\n"
+        "如需要改期，請於24小時前通知教練"
+    )
+    result: dict[str, Any] = {"student": None, "coach": None}
+    log_whatsapp_fn(
+        db,
+        student,
+        student.phone,
+        msg,
+        template_key="schedule_booking_student",
+        template_context={
+            "student_name": student_label,
+            "course_title": enrollment.title,
+            "pin": pin,
+            "next_lesson_date": lesson_when,
+            "coach_name": coach_name,
+            "lessons_attended": str(attended),
+            "lessons_remaining": str(remaining),
+            "payment_status": payment_status,
+            "branch_code": branch_code or "",
+        },
+    )
+    result["student"] = {
+        "recipient": student.phone,
+        "message": msg,
+        "wa_me_url": wa_me_link(student.phone, msg),
+        "template_key": "schedule_booking_student",
+    }
+    if notify_coach and coach and (coach.phone or "").strip():
+        coach_msg = (
+            f"【Zomate 排程確認】{enrollment.title}\n"
+            f"學生：{student_label}（{phone_display or student.phone}）\n"
+            f"上堂時間：{lesson_when}\n"
+            f"已上堂數：{attended}　餘下：{remaining}\n"
+            f"付款狀態：{payment_status}"
+        )
+        log_whatsapp_fn(
+            db,
+            student,
+            coach.phone,
+            coach_msg,
+            template_key="schedule_booking_coach",
+            template_context={
+                "student_name": student_label,
+                "course_title": enrollment.title,
+                "next_lesson_date": lesson_when,
+                "lessons_attended": str(attended),
+                "lessons_remaining": str(remaining),
+                "payment_status": payment_status,
+            },
+        )
+        result["coach"] = {
+            "recipient": coach.phone,
+            "message": coach_msg,
+            "wa_me_url": wa_me_link(coach.phone, coach_msg),
+            "template_key": "schedule_booking_coach",
+        }
     return result
 
 

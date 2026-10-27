@@ -873,6 +873,28 @@ class WhatsAppTestSendBody(BaseModel):
     body_parameters: list[str] = Field(default_factory=list)
 
 
+class CoachPersonalBlockCreate(BaseModel):
+    """[F003][S003] Coach private calendar block（其他事項）."""
+
+    day: date
+    start_hour: int = Field(ge=0, le=23)
+    start_minute: int = Field(default=0, ge=0, le=59)
+    duration_hours: float = Field(default=1.0, ge=0.5, le=8.0)
+    title: str = Field(default="其他事項", min_length=1, max_length=200)
+    notes: str | None = Field(default=None, max_length=500)
+    coach_id: int | None = None
+
+
+class CoachPersonalBlockOut(BaseModel):
+    id: int
+    coach_id: int
+    title: str
+    notes: str | None = None
+    start_at: datetime
+    end_at: datetime
+    created_at: datetime
+
+
 class PaymentRecordUpdate(BaseModel):
     """[F004][S002] Scoped Admin corrections; payment confirmation is a separate action."""
     model_config = {"extra": "forbid"}
