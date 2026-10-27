@@ -562,6 +562,7 @@ def send_schedule_booking_whatsapp(
             template_key="schedule_booking_coach",
             template_context={
                 "student_name": student_label,
+                "student_phone": phone_display or (student.phone or ""),
                 "course_title": enrollment.title,
                 "next_lesson_date": lesson_when,
                 "coach_name": coach_name,
