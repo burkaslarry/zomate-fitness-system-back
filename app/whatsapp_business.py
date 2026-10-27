@@ -49,13 +49,18 @@ class WhatsAppSendResult:
 
 
 def normalize_whatsapp_phone(phone: str) -> str:
-    """[F005][S003] Meta Cloud API expects E.164 digits without '+'; default HK country code."""
+    """[F005][S003] Meta Cloud API expects E.164 digits without '+'.
+
+    Country code must already live on the stored phone (DB ``+852…``).
+    This helper only strips non-digits — it does **not** invent ``852``.
+    """
     digits = "".join(ch for ch in phone if ch.isdigit())
     if not digits:
         return ""
-    if digits.startswith("852"):
-        return digits
-    return f"852{digits.lstrip('0')}"
+    # Reject bare local numbers; callers must persist international form in DB first.
+    if len(digits) < 10:
+        return ""
+    return digits
 
 
 def _graph_messages_url(phone_number_id: str) -> str:

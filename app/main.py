@@ -211,7 +211,12 @@ from .coach_sessions import (
     sort_coach_attendance_ledger_rows,
 )
 from .whatsapp_templates import count_course_checkins, seed_whatsapp_templates, get_template_body
-from .whatsapp_business import dispatch_reminder, get_whatsapp_client, verify_whatsapp_webhook_signature
+from .whatsapp_business import (
+    dispatch_reminder,
+    get_whatsapp_client,
+    normalize_whatsapp_phone,
+    verify_whatsapp_webhook_signature,
+)
 from .storage import FileStorageService
 
 # -----------------------------------------------------------------------------
@@ -905,13 +910,17 @@ def log_whatsapp(
         )
         return
     # [F005][S003] Dispatch first; log prefix shows Meta accepted vs dry-run vs failed (not phone delivery).
+    # Recipient logged as Meta digits (from DB E.164) — country code must already be on student.phone.
+    meta_recipient = normalize_whatsapp_phone(recip) or recip
     result = dispatch_reminder(
-        recipient,
+        recip,
         message,
         template_key=template_key,
         template_context=template_context,
     )
-    if result.dry_run:
+    if not normalize_whatsapp_phone(recip):
+        prefix = "[send_failed:phone_missing_country_code_in_db] "
+    elif result.dry_run:
         prefix = f"[dry_run:{result.error or 'not_dispatched'}] "
     elif not result.ok:
         prefix = f"[send_failed:{result.error or 'error'}] "
@@ -919,7 +928,7 @@ def log_whatsapp(
         prefix = f"[api_accepted:{result.message_id}] "
     else:
         prefix = "[api_accepted] "
-    log = WhatsAppLog(student_id=student.id, recipient=recipient, message=f"{prefix}{message}")
+    log = WhatsAppLog(student_id=student.id, recipient=meta_recipient, message=f"{prefix}{message}")
     db.add(log)
 
 
@@ -1285,7 +1294,7 @@ def normalize_hkid(raw: str) -> str:
 
 
 def normalize_hk_phone_local_eight(raw: str | None) -> str | None:
-    """香港手機號：庫入面用 8 位數字；接受 +852 / 852 前綴或淨填 8 位。"""
+    """[F001][S001] Parse HK mobile to 8 local digits; accept +852 / 852 / bare 8."""
     digits = "".join(ch for ch in (raw or "") if ch.isdigit())
     if len(digits) == 11 and digits.startswith("852"):
         tail = digits[3:]
@@ -1295,9 +1304,32 @@ def normalize_hk_phone_local_eight(raw: str | None) -> str | None:
     return None
 
 
+def canonical_hk_mobile_e164(raw: str | None) -> str | None:
+    """[F001][S001] Canonical DB form for student/coach mobiles: ``+852XXXXXXXX``."""
+    local = normalize_hk_phone_local_eight(raw)
+    return f"+852{local}" if local else None
+
+
 def _hk_phone_lookup_variants(local_eight: str) -> list[str]:
     """比對資料庫內現有紀錄可能存 8 位、+852 或 852 前置。"""
     return [local_eight, f"+852{local_eight}", f"852{local_eight}"]
+
+
+def _backfill_student_phones_e164(db: Session) -> int:
+    """[F005][S003] Persist +852 on student.phone in DB — WhatsApp must not invent country code at send."""
+    n = 0
+    for st in db.query(Student).all():
+        canonical = canonical_hk_mobile_e164(st.phone)
+        if not canonical or st.phone == canonical:
+            continue
+        # Only rewrite recognizable HK mobiles (bare 8 / 852…); leave foreign/odd values alone.
+        digits = "".join(ch for ch in (st.phone or "") if ch.isdigit())
+        if len(digits) == 8 or (len(digits) == 11 and digits.startswith("852")):
+            st.phone = canonical
+            n += 1
+    if n:
+        log_event("student_phone_e164_backfill", updated=n)
+    return n
 
 
 def _student_import_has_name_column(fieldnames: list[str]) -> bool:
@@ -2593,6 +2625,7 @@ def _sync_startup() -> None:
         _seed_default_branches(db)
         _seed_management_defaults(db)
         _seed_default_users(db)
+        _backfill_student_phones_e164(db)
         db.commit()
 
 
@@ -2905,7 +2938,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
     student = Student(
         full_name=payload.full_name.strip(),
         hkid=hkid,
-        phone=phone_raw,
+        phone=f"+852{phone_raw}",
         email=(payload.email or "").strip() or None,
         date_of_birth=payload.date_of_birth,
         emergency_contact_name=payload.emergency_contact_name.strip(),
@@ -3056,7 +3089,7 @@ def _create_member_impl(
         nickname=(payload.nickname or "").strip() or None,
         gender=payload.gender,
         hkid=hkid,
-        phone=phone_raw,
+        phone=f"+852{phone_raw}",
         email=(payload.email or "").strip() or None,
         date_of_birth=payload.date_of_birth,
         emergency_contact_name=payload.emergency_contact_name.strip(),
@@ -3410,7 +3443,8 @@ def update_member_by_id(
         phone_raw = normalize_hk_phone_local_eight(payload.phone.strip())
         if not phone_raw:
             raise HTTPException(status_code=400, detail="電話須為香港 8 位手機號碼。")
-        if phone_raw != student.phone:
+        phone_e164 = f"+852{phone_raw}"
+        if phone_raw != normalize_hk_phone_local_eight(student.phone):
             variants = _hk_phone_lookup_variants(phone_raw)
             active_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
             other = (
@@ -3428,7 +3462,10 @@ def update_member_by_id(
                 student.used_mobile_number = ",".join(used)[-30:]
             else:
                 student.used_mobile_number = previous
-            student.phone = phone_raw
+            student.phone = phone_e164
+        elif student.phone != phone_e164:
+            # [F001][S001] Same local number already on row — still canonicalize to +852 in DB.
+            student.phone = phone_e164
     db.add(
         AuditLog(
             action="member_profile_update",
@@ -8110,9 +8147,9 @@ def coach_student_payments(
 
 def _wa_me_link(phone: str, message: str) -> str:
     """[F003][S006] Build wa.me deep link for coach payment reminders."""
-    digits = "".join(c for c in phone if c.isdigit())
-    hk = digits if digits.startswith("852") else f"852{digits.lstrip('0')}"
-    return f"https://wa.me/{hk}?text={quote(message, safe='')}"
+    # Prefer DB E.164 digits; do not invent 852 here — phone should already be +852… in DB.
+    hk = normalize_whatsapp_phone(phone)
+    return f"https://wa.me/{hk}?text={quote(message, safe='')}" if hk else ""
 
 
 def _installment_reminder_message(db: Session, student: Student, enr: CourseEnrollment) -> str:

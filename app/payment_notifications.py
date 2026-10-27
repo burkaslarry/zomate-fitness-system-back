@@ -44,8 +44,10 @@ if TYPE_CHECKING:
 
 
 def wa_me_link(phone: str, message: str) -> str:
-    """[F005][S003] Manual fallback links use the same default +852 as API delivery."""
+    """[F005][S003] Manual fallback — phone must already be E.164 in DB (``+852…``)."""
     digits = normalize_whatsapp_phone(phone)
+    if not digits:
+        return ""
     return f"https://wa.me/{digits}?text={quote(message)}"
 
 
