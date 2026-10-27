@@ -5102,7 +5102,10 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
     if projection is None:
         raise HTTPException(status_code=404, detail="Active payment record not found.")
     changes = payload.model_dump(exclude_unset=True)
-    if any(value is None for value in changes.values()):
+    # [F004][S002] branch_id is applied to renewal / course / student — not a column on every payment row.
+    branch_id = changes.pop("branch_id", None) if "branch_id" in changes else None
+    branch_touched = "branch_id" in payload.model_fields_set
+    if any(value is None for value in changes.values()) or (branch_touched and branch_id is None):
         raise HTTPException(status_code=400, detail="修改欄位不可為 null。")
     amount_changed = "amount" in changes and float(changes["amount"]) != float(row.amount or 0)
     if amount_changed and projection["status"] == "paid":
@@ -5113,6 +5116,10 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
         raise HTTPException(status_code=400, detail="分期記錄不支援備註修改。")
     if "due_date" in changes and record_type != "installment":
         raise HTTPException(status_code=400, detail="此記錄沒有到期日欄位。")
+    if branch_touched:
+        branch = db.get(Branch, int(branch_id))
+        if branch is None:
+            raise HTTPException(status_code=400, detail="分店不存在。")
     # [F004][S002] Lock fresh course state before editing; concurrent Admin confirmation must win safely.
     linked = db.query(CourseEnrollment).filter(CourseEnrollment.student_id == projection["student_id"]).with_for_update().populate_existing().all()
     # [F004][S002] A renewal with both confirmed and pending installments still owns historical money.
@@ -5143,6 +5150,20 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
                 if matches or (record_type == "receipt" and pending.get("receipt_id") == ref_id):
                     pending["amount"] = changes["amount"]
             enr.payment_state_json = json.dumps(state, ensure_ascii=False)
+    if branch_touched:
+        before["branch_id"] = str(projection.get("branch_id"))
+        changes["branch_id"] = branch_id
+        if record_type == "renewal":
+            row.branch_id = int(branch_id)
+        course_enr_id = projection.get("course_enrollment_id")
+        if course_enr_id:
+            for enr in linked:
+                if enr.id == int(course_enr_id):
+                    enr.branch_id = int(branch_id)
+                    break
+        student = db.get(Student, projection["student_id"])
+        if student is not None:
+            student.branch_id = int(branch_id)
     db.add(AuditLog(action="payment_record_edit", student_id=projection["student_id"],
         detail=json.dumps({"record_type": record_type, "ref_id": ref_id, "edited_by": user.username,
                            "before": before, "after": {k: str(v) for k,v in changes.items()}}, ensure_ascii=False)))

@@ -87,6 +87,7 @@ def _index_course_links_by_renewal(db: Session, student_ids: list[int]) -> dict[
             "installment_no": installment_no,
             "has_pending": bool(pending),
             "confirmed": bool(payments),
+            "branch_id": enr.branch_id,
         }
     return by_renewal
 
@@ -294,6 +295,7 @@ def build_payment_records(
     from sqlalchemy.orm import joinedload
 
     from .models import (
+        Branch,
         CategoryEnrollment,
         DeletedRecord,
         InstallmentPlan,
@@ -318,6 +320,16 @@ def build_payment_records(
     student_ids = list(students.keys())
     rows: list[dict] = []
     course_by_renewal = _index_course_links_by_renewal(db, student_ids)
+    branch_map = {b.id: b for b in db.query(Branch).all()}
+
+    def _branch_fields(bid: int | None) -> dict:
+        """[F004][S002] Attach SW/TST branch fields for 付款詳情."""
+        if not bid:
+            return {"branch_id": None, "branch_name": None, "branch_code": None}
+        b = branch_map.get(int(bid))
+        if b is None:
+            return {"branch_id": int(bid), "branch_name": None, "branch_code": None}
+        return {"branch_id": b.id, "branch_name": b.name, "branch_code": b.code}
 
     renewals = (
         db.query(RenewalRecord)
@@ -357,6 +369,11 @@ def build_payment_records(
             rec_status = "outstanding"
         pkg = package_map.get(rr.package_id) if rr.package_id else None
         category_name = extract_renewal_category_label(rr.remarks) or (pkg.name if pkg else None)
+        resolved_branch = (
+            rr.branch_id
+            or (course_link.get("branch_id") if course_link else None)
+            or st.branch_id
+        )
         row: dict = {
             "id": f"renewal-{rr.id}",
             "record_type": "renewal",
@@ -381,6 +398,7 @@ def build_payment_records(
             "receipt_file_path": rec.file_path if rec else None,
             "download_url": f"/api/receipts/{rr.receipt_id}/download" if rr.receipt_id else None,
             "created_at": payment_created_at_iso(rr.created_at),
+            **_branch_fields(resolved_branch),
         }
         if course_link:
             row["course_enrollment_id"] = course_link["course_enrollment_id"]
@@ -421,6 +439,7 @@ def build_payment_records(
                 "receipt_file_path": rec.file_path,
                 "download_url": f"/api/receipts/{rec.id}/download",
                 "created_at": payment_created_at_iso(rec.created_at),
+                **_branch_fields(st.branch_id),
             }
         )
 
@@ -467,6 +486,7 @@ def build_payment_records(
                         "created_at": payment_created_at_iso(
                             pay.paid_at or pay.due_date or ce.started_at
                         ),
+                        **_branch_fields(st.branch_id),
                     }
                 )
 

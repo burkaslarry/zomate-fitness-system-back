@@ -913,3 +913,5 @@ class PaymentRecordUpdate(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
     created_at: datetime | None = None
     due_date: date | None = None
+    #: [F004][S002] SW / TST on 付款詳情 — persists to renewal / course / student home branch.
+    branch_id: int | None = Field(default=None, ge=1)
