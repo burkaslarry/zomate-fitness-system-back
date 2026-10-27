@@ -4698,11 +4698,12 @@ def finance_summary(from_: date | None = Query(default=None, alias="from"), to: 
 def admin_payment_records(
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    month: str | None = Query(default=None, description="yyyy-MM optional filter"),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
     """[F004][S002] Global payment / receipt / installment history for admin CRM."""
-    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    rows = build_payment_records(db, status=status, q=q, month=month, file_url_fn=_file_url)
     return {"records": rows, "total": len(rows)}
 
 
@@ -4738,8 +4739,9 @@ def _payment_records_csv_text(
     *,
     status: str | None = None,
     q: str | None = None,
+    month: str | None = None,
 ) -> tuple[str, list[dict]]:
-    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    rows = build_payment_records(db, status=status, q=q, month=month, file_url_fn=_file_url)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(_PAYMENT_CSV_HEADERS)
@@ -4752,15 +4754,17 @@ def _payment_records_csv_text(
 def export_payment_records_csv(
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    month: str | None = Query(default=None, description="yyyy-MM; export one calendar month"),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> PlainTextResponse:
     """[F004][S002] Export payment records (full detail columns) as CSV."""
-    text, _ = _payment_records_csv_text(db, status=status, q=q)
+    text, _ = _payment_records_csv_text(db, status=status, q=q, month=month)
+    filename = f'payment-records-{month}.csv' if month else "payment-records.csv"
     return PlainTextResponse(
         text,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="payment-records.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -4768,11 +4772,12 @@ def export_payment_records_csv(
 def export_payment_records_zip(
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    month: str | None = Query(default=None, description="yyyy-MM; export one calendar month"),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> Response:
     """[F004][S002] Export payment CSV + related receipt photo/PDF folders as ZIP."""
-    csv_text, rows = _payment_records_csv_text(db, status=status, q=q)
+    csv_text, rows = _payment_records_csv_text(db, status=status, q=q, month=month)
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("payment-records.csv", csv_text.encode("utf-8-sig"))
@@ -4798,10 +4803,11 @@ def export_payment_records_zip(
             ),
         )
     mem.seek(0)
+    zip_name = f"payment-records-{month}.zip" if month else "payment-records-export.zip"
     return Response(
         content=mem.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="payment-records-export.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
     )
 
 
@@ -4809,11 +4815,12 @@ def export_payment_records_zip(
 def export_payment_records_fung_csv(
     status: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    month: str | None = Query(default=None, description="yyyy-MM; export one calendar month"),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> PlainTextResponse:
     """[F004][S002] Fung 收錢template-compatible payment CSV for re-import."""
-    rows = build_payment_records(db, status=status, q=q, file_url_fn=_file_url)
+    rows = build_payment_records(db, status=status, q=q, month=month, file_url_fn=_file_url)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(FUNG_PAYMENT_HEADERS)
@@ -4851,10 +4858,11 @@ def export_payment_records_fung_csv(
                 installment_cell,
             ]
         )
+    fung_name = f"payment-records-fung-{month}.csv" if month else "payment-records-fung.csv"
     return PlainTextResponse(
         "\ufeff" + buf.getvalue(),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="payment-records-fung.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="{fung_name}"'},
     )
 
 

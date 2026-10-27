@@ -288,9 +288,13 @@ def build_payment_records(
     student_id: int | None = None,
     status: str | None = None,
     q: str | None = None,
+    month: str | None = None,
     file_url_fn=None,
 ) -> list[dict]:
-    """[F004][S002] Aggregate renewals, receipts, and category installment payments."""
+    """[F004][S002] Aggregate renewals, receipts, and category installment payments.
+
+    Optional ``month`` (yyyy-MM) filters by Hong Kong ``created_at`` month — used by CSV export.
+    """
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
 
@@ -512,6 +516,11 @@ def build_payment_records(
             or needle in (r.get("student_phone") or "")
             or needle in (r.get("label") or "").lower()
         ]
+
+    # [F004][S002] Month filter for export / optional list scope (HK wall-date prefix).
+    if month and len(month.strip()) >= 7 and month.strip()[4] == "-":
+        month_key = month.strip()[:7]
+        rows = [r for r in rows if str(r.get("created_at") or "").startswith(month_key)]
 
     return rows
 
