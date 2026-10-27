@@ -782,6 +782,9 @@ class CoachAttendanceLedgerRowOut(BaseModel):
     coach_id: int
     coach_name: str
     coach_username: str | None = None
+    student_id: int | None = None
+    student_name: str = ""
+    student_phone: str = ""
     session_date: str
     check_in_time: str
     check_out_time: str

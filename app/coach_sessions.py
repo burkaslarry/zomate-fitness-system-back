@@ -191,7 +191,7 @@ def build_coach_session_rows(
 
 
 def build_coach_attendance_report_rows(session_rows: list[dict]) -> list[dict]:
-    """[F008][S004] Group sessions by course type → students + 上堂日期 (comma-separated)."""
+    """[F008][S004] Group sessions by course type → students (+ phone) + 上堂日期."""
     groups: dict[str, dict[str, set[str]]] = {}
     order: list[str] = []
     for row in session_rows:
@@ -199,12 +199,14 @@ def build_coach_attendance_report_rows(session_rows: list[dict]) -> list[dict]:
         if not course_type or course_type == "—":
             continue
         student = str(row.get("student_name") or "").strip()
+        phone = str(row.get("student_phone") or "").strip()
+        student_label = f"{student}（{phone}）" if student and phone else student
         session_date = str(row.get("session_date") or "").strip()
         if course_type not in groups:
             groups[course_type] = {"students": set(), "dates": set()}
             order.append(course_type)
-        if student:
-            groups[course_type]["students"].add(student)
+        if student_label:
+            groups[course_type]["students"].add(student_label)
         if session_date:
             groups[course_type]["dates"].add(session_date)
 
@@ -320,6 +322,9 @@ def build_coach_attendance_ledger_rows(
                 "coach_id": coach_id,
                 "coach_name": coach_name,
                 "coach_username": coach_username,
+                "student_id": row.get("student_id"),
+                "student_name": str(row.get("student_name") or ""),
+                "student_phone": str(row.get("student_phone") or ""),
                 "session_date": session_date.isoformat(),
                 "check_in_time": check_in,
                 "check_out_time": check_out,
