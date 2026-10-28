@@ -582,6 +582,75 @@ def send_schedule_booking_whatsapp(
     return result
 
 
+def _checkin_whatsapp_clock(checked_in_at: datetime | None) -> str:
+    """[F003][S003] Hong Kong wall-clock string for check-in WhatsApp templates."""
+    from .timezone import utc_to_hk
+
+    when_dt = utc_to_hk(checked_in_at) if checked_in_at is not None else utc_to_hk(datetime.utcnow())
+    return when_dt.strftime("%Y-%m-%d %H:%M") if when_dt is not None else datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+
+
+def _student_phone_display(student: Student) -> str:
+    phone_display = "".join(ch for ch in (student.phone or "") if ch.isdigit())
+    if len(phone_display) == 11 and phone_display.startswith("852"):
+        return phone_display[3:]
+    if len(phone_display) > 8 and phone_display.startswith("852"):
+        return phone_display[-8:]
+    return phone_display or (student.phone or "")
+
+
+def send_checkin_student_whatsapp(
+    db: Session,
+    log_whatsapp_fn,
+    *,
+    student: Student,
+    enrollment: CourseEnrollment,
+    lesson_balance_after: int,
+    checked_in_at: datetime | None = None,
+) -> dict[str, Any] | None:
+    """[F003][S003]
+    Feature: Attendance & Today-Only QR Check-in
+    Step: WhatsApp confirm to student after successful check-in
+    Logic: Meta template ``zomate_checkin_student`` via internal key ``checkin_student``.
+    """
+    if not (student.phone or "").strip():
+        return None
+    attended = count_course_checkins(db, student.id, enrollment.id)
+    remaining = max(0, int(lesson_balance_after))
+    when = _checkin_whatsapp_clock(checked_in_at)
+    msg = (
+        f"【Zomate 簽到確認】\n"
+        f"{student.full_name}，你已成功簽到。\n"
+        f"課程：{enrollment.title}\n"
+        f"簽到時間（香港）：{when}\n"
+        f"帳戶剩餘堂數：{remaining}\n\n"
+        "查詢請 WhatsApp 6052 9291。此號碼用作系統通知。"
+    )
+    log_whatsapp_fn(
+        db,
+        student,
+        student.phone,
+        msg,
+        template_key="checkin_student",
+        template_context={
+            # Keys match Meta zomate_checkin_student body_params.
+            "student_name": student.full_name,
+            "course_title": enrollment.title,
+            "checkin_time": when,
+            "lesson_balance": str(remaining),
+            "lessons_attended": str(attended),
+            "lessons_remaining": str(remaining),
+            "checked_in_at": when,
+        },
+    )
+    return {
+        "recipient": student.phone,
+        "message": msg,
+        "wa_me_url": wa_me_link(student.phone, msg),
+        "template_key": "checkin_student",
+    }
+
+
 def send_checkin_coach_whatsapp(
     db: Session,
     log_whatsapp_fn,
@@ -600,18 +669,9 @@ def send_checkin_coach_whatsapp(
     if coach is None or not (coach.phone or "").strip():
         return None
     attended = count_course_checkins(db, student.id, enrollment.id)
-    total_lessons = int(enrollment.total_lessons or 0)
     remaining = max(0, int(lesson_balance_after))
-    # [F003][S003] Always show Hong Kong wall clock in coach check-in WhatsApp.
-    from .timezone import utc_to_hk
-
-    when_dt = utc_to_hk(checked_in_at) if checked_in_at is not None else utc_to_hk(datetime.utcnow())
-    when = when_dt.strftime("%Y-%m-%d %H:%M") if when_dt is not None else datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    phone_display = "".join(ch for ch in (student.phone or "") if ch.isdigit())
-    if len(phone_display) == 11 and phone_display.startswith("852"):
-        phone_display = phone_display[3:]
-    elif len(phone_display) > 8 and phone_display.startswith("852"):
-        phone_display = phone_display[-8:]
+    when = _checkin_whatsapp_clock(checked_in_at)
+    phone_display = _student_phone_display(student)
     msg = (
         f"【Zomate 簽到通知】{enrollment.title}\n"
         f"學生：{student.full_name}（{phone_display or student.phone}）\n"

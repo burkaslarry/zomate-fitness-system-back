@@ -184,6 +184,7 @@ from .payment_notifications import (
     apply_receipt_payment_match,
     format_student_display_name,
     send_checkin_coach_whatsapp,
+    send_checkin_student_whatsapp,
     send_payment_whatsapp_notifications,
     send_receipt_upload_request_whatsapp,
     send_schedule_booking_whatsapp,
@@ -2635,10 +2636,18 @@ def perform_lesson_checkin(
     db.refresh(student)
     db.refresh(checkin_log)
 
-    # [F003][S003] After successful check-in, notify the assigned coach via WhatsApp API.
+    # [F003][S003] After successful check-in: student confirm + coach notify (Meta templates).
     if resolved_enrollment is not None:
         coach = notified_coach or (
             db.get(Coach, resolved_enrollment.coach_id) if resolved_enrollment.coach_id else None
+        )
+        send_checkin_student_whatsapp(
+            db,
+            log_whatsapp,
+            student=student,
+            enrollment=resolved_enrollment,
+            lesson_balance_after=bal_after,
+            checked_in_at=attended_at,
         )
         send_checkin_coach_whatsapp(
             db,
