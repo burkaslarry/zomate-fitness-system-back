@@ -58,6 +58,7 @@ from .excel_csv_compat import (
     upload_bytes_to_csv_text,
 )
 from .health_app import liveness_payload
+from .installments import build_installment_ledger, summarize_installments
 from .keepalive import keepalive_loop
 from .logutil import configure_logging, instance_id, log_event
 from .register_public import router as register_public_router
@@ -462,6 +463,111 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
     canvas.showPage()
     canvas.save()
     return packet.getvalue()
+
+
+def _build_official_receipt_pdf_bytes(
+    *, date_str: str, name: str, tel: str, item: str, method: str | None, price: float
+) -> bytes:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Official receipt PDF generation
+    Logic: A4 layout matching the pre-printed Zomate receipt (company header, Date/Name/Tel,
+    Item|Price table, payment method, Total, signature footer). STSong-Light covers Chinese text.
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+    if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    font = "STSong-Light"
+
+    def money(value: float) -> str:
+        return f"${value:,.0f}" if float(value).is_integer() else f"${value:,.2f}"
+
+    def fit(text: str, size: int, max_width: float) -> str:
+        if canvas.stringWidth(text, font, size) <= max_width:
+            return text
+        while text and canvas.stringWidth(text + "…", font, size) > max_width:
+            text = text[:-1]
+        return text + "…"
+
+    packet = io.BytesIO()
+    canvas = Canvas(packet, pagesize=A4)
+    width, _ = A4
+    center = width / 2
+
+    canvas.setFont(font, 20)
+    title = "Zomate Fitness Limited"
+    canvas.drawString((width - canvas.stringWidth(title, font, 20)) / 2, 790, title)
+    canvas.setFont(font, 9)
+    addr = "22/F, No.102 Austin Road, Tsim Sha Tsui, Kowloon"
+    canvas.drawString((width - canvas.stringWidth(addr, font, 9)) / 2, 772, addr)
+
+    canvas.setFont(font, 15)
+    heading = "Official Receipt"
+    heading_w = canvas.stringWidth(heading, font, 15)
+    canvas.drawString((width - heading_w) / 2, 712, heading)
+    canvas.setLineWidth(0.8)
+    canvas.line((width - heading_w) / 2, 708, (width + heading_w) / 2, 708)
+
+    left, right = 70, width - 70
+    canvas.setFont(font, 10)
+    canvas.drawString(left, 668, f"Date: {date_str}")
+    canvas.drawString(left, 650, f"Name: {name}")
+    canvas.drawString(left, 632, f"Tel: {tel}")
+
+    canvas.setFillGray(0.75)
+    canvas.rect(left, 590, right - left, 18, stroke=0, fill=1)
+    canvas.setFillGray(0)
+    canvas.setFont(font, 10)
+    canvas.drawString(left + 8, 596, "Item")
+    canvas.drawRightString(right - 8, 596, "Price")
+
+    canvas.setFont(font, 11)
+    item_line = fit(item, 11, right - left - 120)
+    canvas.drawString((width - canvas.stringWidth(item_line, font, 11)) / 2, 540, item_line)
+    if method:
+        canvas.setFont(font, 9)
+        canvas.setFillGray(0.35)
+        method_line = fit(method, 9, right - left - 120)
+        canvas.drawString((width - canvas.stringWidth(method_line, font, 9)) / 2, 524, method_line)
+        canvas.setFillGray(0)
+    canvas.setFont(font, 11)
+    canvas.drawRightString(right - 8, 540, money(price))
+
+    canvas.setFont(font, 12)
+    canvas.drawRightString(right - 60, 480, "Total:")
+    canvas.drawRightString(right - 8, 480, money(price))
+
+    canvas.setLineWidth(0.8)
+    canvas.line(left, 150, left + 170, 150)
+    canvas.setFont(font, 10)
+    canvas.drawString(left, 134, "Zomate Fitness Limited")
+
+    canvas.showPage()
+    canvas.save()
+    return packet.getvalue()
+
+
+def _receipt_pdf_date(value) -> str:
+    """[F004][S002] Normalize an ISO date/datetime to DD/MM/YYYY for the receipt."""
+    if value is None:
+        return ""
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return text[:10]
+
+
+def _receipt_pdf_tel(phone: str | None) -> str:
+    """[F004][S002] Show an 8-digit HK mobile on the receipt (strip 852 country code)."""
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("852"):
+        return digits[3:]
+    if len(digits) > 8 and digits.startswith("852"):
+        return digits[-8:]
+    return digits
 
 
 def _seed_default_users(db: Session) -> None:
@@ -3097,8 +3203,7 @@ def register_student_v1(payload: StudentRegisterV1, db: Session = Depends(get_db
 def member_duplicate_check(payload: MemberProspectDupCheck, db: Session = Depends(get_db)) -> dict:
     """Feature F008:F01 -- 第一步「下一步」前預檢；毋須 Bearer。"""
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
-    base = db.query(Student).filter(~Student.id.in_(deleted_ids_sq))
-    hkid_n = normalize_hkid(payload.hkid)
+    active = db.query(Student).filter(~Student.id.in_(deleted_ids_sq))
     phone_local = normalize_hk_phone_local_eight(payload.phone.strip())
     if not phone_local:
         raise HTTPException(
@@ -3106,13 +3211,41 @@ def member_duplicate_check(payload: MemberProspectDupCheck, db: Session = Depend
             detail="電話須為香港 8 位手機號碼（預設 +852，只可填數字八位亦可）。",
         )
     variants = _hk_phone_lookup_variants(phone_local)
-    dup_phone = base.filter(Student.phone.in_(variants)).first()
-    if dup_phone:
+    if active.filter(Student.phone.in_(variants)).first():
         return {
             "blocked": True,
             "message": "此電話號碼已被登記。請改用「續會」或聯絡櫃台。",
         }
+    # [F001][S001] phone has a DB unique index, so a soft-deleted row still blocks new registration.
+    if db.query(Student.id).filter(Student.phone.in_(variants)).first():
+        return {
+            "blocked": True,
+            "message": "此電話號碼屬於已刪除紀錄，請聯絡職員完整刪除後再登記。",
+        }
     return {"blocked": False, "message": None}
+
+
+@app.get("/api/members/phone-check")
+def member_phone_check(phone: str = Query(..., min_length=3), db: Session = Depends(get_db)) -> dict:
+    """[F001][S001] Public onboarding phone pre-check — booleans only, never member PII."""
+    phone_local = normalize_hk_phone_local_eight(phone.strip())
+    if not phone_local:
+        return {"registered": False, "deleted": False, "message": None}
+    variants = _hk_phone_lookup_variants(phone_local)
+    deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    if db.query(Student.id).filter(~Student.id.in_(deleted_ids_sq), Student.phone.in_(variants)).first():
+        return {
+            "registered": True,
+            "deleted": False,
+            "message": "此電話號碼已登記。請改用「續會」或聯絡櫃台。",
+        }
+    if db.query(Student.id).filter(Student.phone.in_(variants)).first():
+        return {
+            "registered": True,
+            "deleted": True,
+            "message": "此電話號碼屬於已刪除紀錄，請聯絡職員處理後再登記。",
+        }
+    return {"registered": False, "deleted": False, "message": None}
 
 
 def _resolve_coach_id_from_registration(
@@ -3155,7 +3288,13 @@ def _create_member_impl(
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     # HKID may repeat; phone is the unique identity key.
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
-        raise HTTPException(status_code=409, detail="Phone already registered.")
+        raise HTTPException(status_code=409, detail="此電話號碼已被登記。請改用「續會」或聯絡櫃台。")
+    # [F001][S001] Soft-deleted rows keep the unique phone index — surface a clear 409, not a 500.
+    if db.query(Student.id).filter(Student.phone.in_(phone_vars)).first():
+        raise HTTPException(
+            status_code=409,
+            detail="此電話號碼屬於已刪除紀錄，請聯絡職員完整刪除後再登記。",
+        )
 
     parq_data = payload.parq.model_dump()
     any_yes = payload.parq.any_yes()
@@ -3183,15 +3322,18 @@ def _create_member_impl(
             f"PAR-Q JSON: {json.dumps(parq_data, ensure_ascii=False)}",
             f"Medical clearance file: {medical_label or (medical_path or '')}",
             f"PDPO acknowledged: {payload.pdpo_acknowledged}",
-            f"Branch id: {payload.branch_id}",
+            f"Branch id: {payload.branch_id or '-'}",
+            f"Coach: {(payload.coach_username or '').strip() or '-'} / {payload.coach_id or '-'}",
         ]
     )
-    branch = db.get(Branch, payload.branch_id)
-    if branch is None or _is_deleted(db, "branches", branch.id) or not branch.active:
-        raise HTTPException(status_code=400, detail="請選擇有效分店（尖沙咀 TST 或上環 SW）。")
-    code_u = (branch.code or "").strip().upper()
-    if code_u not in {"TST", "SW", "SHEUNGWAN"}:
-        raise HTTPException(status_code=400, detail="新會友分店只可選尖沙咀 (TST) 或上環 (SW)。")
+    branch: Branch | None = None
+    if payload.branch_id:
+        branch = db.get(Branch, payload.branch_id)
+        if branch is None or _is_deleted(db, "branches", branch.id) or not branch.active:
+            raise HTTPException(status_code=400, detail="請選擇有效分店（尖沙咀 TST 或上環 SW）。")
+        code_u = (branch.code or "").strip().upper()
+        if code_u not in {"TST", "SW", "SHEUNGWAN"}:
+            raise HTTPException(status_code=400, detail="新會友分店只可選尖沙咀 (TST) 或上環 (SW)。")
     student = Student(
         full_name=payload.full_name.strip(),
         chinese_name=payload.chinese_name.strip(),
@@ -3211,7 +3353,7 @@ def _create_member_impl(
         disclaimer_accepted=True,
         whatsapp_reminder_opt_in=bool(payload.whatsapp_reminder_opt_in),
         whatsapp_reminder_opt_in_at=datetime.utcnow() if payload.whatsapp_reminder_opt_in else None,
-        branch_id=branch.id,
+        branch_id=(branch.id if branch else None),
     )
     db.add(student)
     db.flush()
@@ -3221,10 +3363,12 @@ def _create_member_impl(
         coach_id=payload.coach_id,
         coach_username=payload.coach_username,
     )
-    if resolved_coach_id is not None and payload.course_category_id is not None:
+    if resolved_coach_id is not None:
         coach = db.get(Coach, resolved_coach_id)
         if not coach or _is_deleted(db, "coaches", coach.id) or not coach.active:
             raise HTTPException(status_code=400, detail="Invalid or inactive coach.")
+    # [F001][S001] Course category is optional now — only create the ledger when one is supplied.
+    if resolved_coach_id is not None and payload.course_category_id is not None:
         _assert_coach_teaches_category(db, resolved_coach_id, payload.course_category_id)
         cat = _resolve_active_course_category(db, payload.course_category_id)
         coach_label = (payload.coach_username or "").strip() or str(resolved_coach_id)
@@ -3272,7 +3416,7 @@ def create_member(
     disclaimer_accepted: str = Form(default="false"),
     whatsapp_reminder_opt_in: str = Form(default="false"),
     digital_signature: str = Form(default=""),
-    branch_id: int = Form(...),
+    branch_id: int | None = Form(default=None),
     coach_id: int | None = Form(default=None),
     coach_username: str | None = Form(default=None),
     course_category_id: int | None = Form(default=None),
@@ -5337,6 +5481,46 @@ def admin_update_payment_record(record_type: str, ref_id: int, payload: PaymentR
     return {"ok": True, "record": updated}
 
 
+@app.get("/api/admin/payment-records/{record_type}/{ref_id}/receipt.pdf")
+def admin_payment_record_receipt_pdf(
+    record_type: str,
+    ref_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> Response:
+    """[F004][S002] Generate the Zomate official receipt PDF for a confirmed (paid) payment record."""
+    norm = record_type.strip().lower()
+    records = build_payment_records(db, file_url_fn=_file_url)
+    projection = next(
+        (r for r in records if r["record_type"] == norm and r["ref_id"] == ref_id),
+        None,
+    )
+    if projection is None:
+        raise HTTPException(status_code=404, detail="Payment record not found.")
+    if projection["status"] != "paid":
+        raise HTTPException(status_code=409, detail="待 Admin 確認付款後先可以出收據。")
+    amount = projection.get("amount")
+    if amount is None or float(amount) <= 0:
+        raise HTTPException(status_code=400, detail="此記錄沒有已付金額，未能產生收據。")
+    student = db.get(Student, projection["student_id"])
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found.")
+    pdf = _build_official_receipt_pdf_bytes(
+        date_str=_receipt_pdf_date(projection.get("paid_at") or projection.get("created_at")),
+        name=student.full_name or "",
+        tel=_receipt_pdf_tel(student.phone),
+        item=str(projection.get("label") or ""),
+        method=(str(projection.get("payment_method") or "").strip() or None),
+        price=float(amount),
+    )
+    print(f"[F004][S002] Success: Official receipt PDF generated for {norm}-{ref_id} by {user.username}.")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="receipt-{norm}-{ref_id}.pdf"'},
+    )
+
+
 @app.delete("/api/admin/payment-records/{record_type}/{ref_id}")
 def admin_delete_payment_record(
     record_type: str,
@@ -5396,6 +5580,46 @@ def admin_missing_receipt_registrations(
     return {"records": rows, "total": len(rows)}
 
 
+def _hk_day_start_utc(day: date) -> datetime:
+    """[F004][S003] HK calendar midnight as naive UTC for CheckinLog.created_at filters."""
+    return datetime(day.year, day.month, day.day, tzinfo=HK).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _checkin_counts(db: Session, today: date) -> dict:
+    """[F004][S003] 簽到次數 dashboard: today, this HK month, and the last 7 HK days."""
+    today_start = _hk_day_start_utc(today)
+    tomorrow_start = _hk_day_start_utc(today + timedelta(days=1))
+    month_start = _hk_day_start_utc(today.replace(day=1))
+    first_day = today - timedelta(days=6)
+    week_start = _hk_day_start_utc(first_day)
+    today_count = (
+        db.query(func.count(CheckinLog.id))
+        .filter(CheckinLog.created_at >= today_start, CheckinLog.created_at < tomorrow_start)
+        .scalar()
+        or 0
+    )
+    month_count = (
+        db.query(func.count(CheckinLog.id))
+        .filter(CheckinLog.created_at >= month_start, CheckinLog.created_at < tomorrow_start)
+        .scalar()
+        or 0
+    )
+    buckets = {(first_day + timedelta(days=i)).isoformat(): 0 for i in range(7)}
+    for (created_at,) in (
+        db.query(CheckinLog.created_at)
+        .filter(CheckinLog.created_at >= week_start, CheckinLog.created_at < tomorrow_start)
+        .all()
+    ):
+        key = hk_calendar_date(created_at).isoformat()
+        if key in buckets:
+            buckets[key] += 1
+    return {
+        "today": today_count,
+        "month": month_count,
+        "last_7_days": [{"date": key, "count": count} for key, count in buckets.items()],
+    }
+
+
 @app.get("/api/admin/summary")
 def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)) -> dict:
     total_students = (
@@ -5405,6 +5629,7 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         or 0
     )
     total_checkins = db.query(func.count(CheckinLog.id)).scalar() or 0
+    checkin_stats = _checkin_counts(db, hk_calendar_date())
     total_messages = db.query(func.count(WhatsAppLog.id)).scalar() or 0
     seven_days_ago = datetime.utcnow() - timedelta(days=7)
     whatsapp_messages_7d = (
@@ -5442,23 +5667,8 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         .scalar()
         or 0
     )
-    # Category-enrollment installments: distinct students with an active plan, and those still owing a period.
-    installment_students_total = (
-        db.query(func.count(distinct(CategoryEnrollment.student_id)))
-        .join(InstallmentPlan, InstallmentPlan.enrollment_id == CategoryEnrollment.id)
-        .filter(InstallmentPlan.status == "active")
-        .scalar()
-        or 0
-    )
-    installment_students_unpaid = (
-        db.query(func.count(distinct(CategoryEnrollment.student_id)))
-        .join(InstallmentPlan, InstallmentPlan.enrollment_id == CategoryEnrollment.id)
-        .join(InstallmentPayment, InstallmentPayment.installment_plan_id == InstallmentPlan.id)
-        .filter(InstallmentPlan.status == "active")
-        .filter(InstallmentPayment.paid_at.is_(None))
-        .scalar()
-        or 0
-    )
+    # [F004][S003] Same ledger as 付款紀錄/分期 board — course seg-PIN + category plans, period counts.
+    installment_summary = summarize_installments(build_installment_ledger(db))
     deleted_student_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     medical_clearance_pending = (
         db.query(func.count(Student.id))
@@ -5472,17 +5682,39 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         "total_students": total_students,
         "active_students": active_students,
         "total_checkins": total_checkins,
+        "checkins_today": checkin_stats["today"],
+        "checkins_this_month": checkin_stats["month"],
+        "checkins_last_7_days": checkin_stats["last_7_days"],
         "whatsapp_messages": total_messages,
         "whatsapp_messages_7d": whatsapp_messages_7d,
         "audit_logs": audit_rows,
         "branches": branches,
         "coaches": coaches,
         "courses": courses,
-        "installment_students_unpaid": installment_students_unpaid,
-        "installment_students_total": installment_students_total,
+        "installment_students_unpaid": installment_summary["students_unpaid"],
+        "installment_students_total": installment_summary["students_total"],
+        "installment_periods_unpaid": installment_summary["periods_unpaid"],
+        "installment_periods_total": installment_summary["periods_total"],
+        "installment_periods_paid": installment_summary["periods_paid"],
+        "installment_outstanding_amount": installment_summary["outstanding_amount"],
         "medical_clearance_pending": medical_clearance_pending,
         "missing_receipt_registrations": missing_receipt_registrations,
     }
+
+
+@app.get("/api/admin/installments")
+def admin_installments(
+    only_unpaid: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin_or_clerk),
+) -> dict:
+    """[F004][S003] 分期付款學生 board: one row per course/category installment plan."""
+    rows = build_installment_ledger(db)
+    summary = summarize_installments(rows)
+    if only_unpaid:
+        rows = [r for r in rows if r["unpaid_installments"] > 0]
+    return {"rows": rows, "summary": summary}
+
 
 
 @app.get("/api/admin/course-categories")
@@ -8114,6 +8346,20 @@ def _next_unpaid_installment_meta(enr: CourseEnrollment) -> tuple[int | None, in
     return None, None
 
 
+def _enrollment_receipt_source(db: Session, enr: CourseEnrollment) -> RenewalRecord | None:
+    """[F004][S002] Paid renewal backing a fully paid enrollment — the official receipt money source."""
+    rid = course_payment_state(enr).get("renewal_id")
+    if rid is None:
+        return None
+    try:
+        renewal = db.get(RenewalRecord, int(rid))
+    except (TypeError, ValueError):
+        return None
+    if renewal is None or renewal.amount is None or float(renewal.amount) <= 0:
+        return None
+    return renewal
+
+
 @app.get("/api/coach/me", response_model=CoachMeOut)
 def coach_me(
     db: Session = Depends(get_db),
@@ -8232,6 +8478,7 @@ def coach_student_payments(
                 next_installment_no=next_inst,
                 next_reminder_lesson=next_reminder,
                 signature_image_url=_signature_image_for_member(student),
+                receipt_available=pay_st == "Paid" and _enrollment_receipt_source(db, enr) is not None,
             )
         )
     # [F004][S003] Surface renewals logged under this coach but missing receipt upload.
@@ -8272,6 +8519,47 @@ def coach_student_payments(
             )
         )
     return out
+
+
+@app.get("/api/coach/enrollments/{enrollment_id}/receipt.pdf")
+def coach_enrollment_receipt_pdf(
+    enrollment_id: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> Response:
+    """[F004][S002] Coach workbench 已付 — official receipt PDF for a fully paid course enrollment."""
+    enr = (
+        db.query(CourseEnrollment)
+        .options(joinedload(CourseEnrollment.student))
+        .filter(
+            CourseEnrollment.id == enrollment_id,
+            ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+        )
+        .first()
+    )
+    if enr is None or enr.student is None:
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    if user.role == "COACH":
+        coach = _coach_row_for_user(db, user)
+        if coach is None or enr.coach_id != coach.id:
+            raise HTTPException(status_code=403, detail="This receipt is not linked to your login.")
+    renewal = _enrollment_receipt_source(db, enr)
+    if renewal is None:
+        raise HTTPException(status_code=409, detail="未有已確認付款紀錄，未能產生收據。")
+    pdf = _build_official_receipt_pdf_bytes(
+        date_str=_receipt_pdf_date(renewal.created_at),
+        name=enr.student.full_name or "",
+        tel=_receipt_pdf_tel(enr.student.phone),
+        item=f"{int(enr.total_lessons or 0)} Lessons – {enr.title}",
+        method=(str(renewal.payment_method or "").strip() or None),
+        price=float(renewal.amount),
+    )
+    print(f"[F004][S002] Success: Official receipt PDF generated for enrollment {enrollment_id} by {user.username}.")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="receipt-course-{enrollment_id}.pdf"'},
+    )
 
 
 def _wa_me_link(phone: str, message: str) -> str:
