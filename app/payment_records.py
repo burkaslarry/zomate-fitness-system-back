@@ -99,7 +99,16 @@ def payment_created_at_iso(dt: datetime | None) -> str:
     return utc_to_hk(dt).isoformat()
 
 _ONBOARDING_COACH_RE = re.compile(r"Onboarding coach=([^\s,]+)", re.I)
+_HEALTH_NOTES_COACH_RE = re.compile(r"^Coach:\s*([^\s/]+)\s*/\s*(\d+)\s*$", re.I | re.M)
 _RENEWAL_CATEGORY_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def _coach_label_from_health_notes(notes: str | None) -> str | None:
+    """[F001][S002] Onboarding writes ``Coach: <username> / <id>``; prefer the numeric id."""
+    match = _HEALTH_NOTES_COACH_RE.search(notes or "")
+    if not match:
+        return None
+    return match.group(2) or match.group(1)
 
 
 def extract_renewal_category_label(remarks: str | None) -> str | None:
@@ -201,6 +210,14 @@ def student_onboarding_coach(db: Session, student_id: int) -> tuple[int | None, 
         resolved = _resolve_onboarding_coach_label(db, match.group(1).strip())
         if resolved[0] is not None:
             return resolved
+    from .models import Student
+
+    student = db.get(Student, student_id)
+    label = _coach_label_from_health_notes(student.health_notes if student else None)
+    if label:
+        resolved = _resolve_onboarding_coach_label(db, label)
+        if resolved[0] is not None:
+            return resolved
     renewal = (
         db.query(RenewalRecord)
         .filter(RenewalRecord.student_id == student_id, RenewalRecord.coach_id.isnot(None))
@@ -279,6 +296,21 @@ def students_onboarded_to_coach(
             continue
         cat_name = enr.course_category.name if enr.course_category is not None else None
         out[st.id] = (st, cat_name)
+    # [F001][S002] Coach-only onboarding creates no category ledger; read the coach from student notes.
+    for st in (
+        db.query(Student)
+        .filter(~Student.id.in_(deleted_s), Student.health_notes.like("%Coach:%"))
+        .all()
+    ):
+        if st.id in out:
+            continue
+        label = _coach_label_from_health_notes(st.health_notes)
+        if not label:
+            continue
+        resolved_id, _ = _resolve_onboarding_coach_label(db, label)
+        if resolved_id != coach_id:
+            continue
+        out[st.id] = (st, None)
     return list(out.values())
 
 
