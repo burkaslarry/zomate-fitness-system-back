@@ -7638,8 +7638,12 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
         pkg_sessions = payload.total_lessons
         credit_delta = 0
         if pkg_sessions > 0:
+            # [F002][S002] Checkout (reg-course) records the payment with skip_lesson_ledger, so the
+            # purchase must be credited in full here. Topping up to the balance would swallow the
+            # student's unused lessons from an earlier package (e.g. 9 left + 15 bought → only 6 added).
+            checkout_credits_ledger = linked_renewal is not None and linked_renewal.student_id == student.id
             current_bal = _lesson_balance_sum(db, student.id)
-            credit_delta = max(0, pkg_sessions - current_bal)
+            credit_delta = pkg_sessions if checkout_credits_ledger else max(0, pkg_sessions - current_bal)
             if credit_delta > 0:
                 apply_lesson_ledger_delta(
                     db,

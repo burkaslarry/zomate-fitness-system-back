@@ -294,3 +294,24 @@ def test_unassigned_receipt_is_linked_to_admin_selected_term_without_double_coun
     assert state["paid_total"] == 3000
     assert state["payments"]["installment:2"]["receipt_id"] == 1
     assert state["pending_payments"] == {}
+
+
+def test_linked_checkout_credits_full_package_after_leftover_from_earlier_package(db_session, monkeypatch):
+    """[F002][S002] A second package must add its own lessons on top of any unused balance."""
+    student, coach, _ = _course(db_session)
+    main.apply_lesson_ledger_delta(db_session, student, 10, "course_open_package", created_by_role="admin")
+    main.apply_lesson_ledger_delta(db_session, student, -1, "checkin_redeem", created_by_role="student")
+    renewal = RenewalRecord(student_id=student.id, student_name=student.full_name, phone=student.phone,
+        course_ratio="1:1", lessons=15, payment_method="FPS", coach_id=coach.id, amount=10000,
+        applicant_name=student.full_name, signature="Test", renewal_date=datetime(2026, 10, 30).date())
+    db_session.add(renewal)
+    db_session.commit()
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: SimpleNamespace(
+        dry_run=True, ok=False, message_id=None, error="test"))
+    body = CourseCreate(title="New Package", branch_id=coach.branch_id, coach_id=coach.id,
+        scheduled_start=datetime(2026, 10, 30, 10), scheduled_end=datetime(2026, 10, 30, 11),
+        student_ids=[student.id], total_lessons=15, whatsapp_reminder_opt_in=True,
+        payment_renewal_id=renewal.id, payment_total_amount=10000)
+    main._create_course_impl(body, db_session, SimpleNamespace(role="ADMIN"))
+    # 9 unused + 15 new — the checkout skipped the ledger, so all 15 must land.
+    assert main._lesson_balance_sum(db_session, student.id) == 24
