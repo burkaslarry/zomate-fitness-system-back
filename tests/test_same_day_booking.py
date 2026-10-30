@@ -1,5 +1,6 @@
 """[F007][S005] Same-day staff booking through real scheduling/PIN/check-in logic, isolated DB."""
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -13,7 +14,11 @@ def _fixture(db, monkeypatch):
     """[F007][S005] Freeze HKT and suppress provider calls without bypassing policy checks."""
     monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 23, 15, 5))
     monkeypatch.setattr(main, "send_payment_whatsapp_notifications", lambda *a, **k: None)
-    monkeypatch.setattr(main, "dispatch_reminder", lambda *a, **k: None)
+    monkeypatch.setattr(
+        main,
+        "dispatch_reminder",
+        lambda *a, **k: SimpleNamespace(dry_run=True, ok=False, message_id=None, error="test"),
+    )
     branch = Branch(name="QA", code="SAMEDAY", address="QA", active=True)
     coach = Coach(full_name="QA Coach", phone="90000001", branch=branch, active=True)
     student = Student(full_name="QA Student", phone="90000002", whatsapp_reminder_opt_in=False)
@@ -62,8 +67,8 @@ def test_ended_or_past_bookings_rejected(db_session, monkeypatch, day, hour):
     assert not enr.coach_time_confirmed
 
 
-def test_permission_conflict_and_reconfirmation_rejected(db_session, monkeypatch):
-    """[F003][S004] Same-day exception cannot cross coach ownership or overwrite a series."""
+def test_permission_conflict_rejected_but_lesson_overlap_allowed(db_session, monkeypatch):
+    """[F003][S004] Ownership still enforced; overlapping lessons are allowed (F008 教班時間可重疊)."""
     _, _, enr, user = _fixture(db_session, monkeypatch)
     args = dict(enrollment_id=enr.id, day=date(2026, 10, 23), start_hour=15,
                 start_minute=0, duration_hours=1)
@@ -80,13 +85,27 @@ def test_permission_conflict_and_reconfirmation_rejected(db_session, monkeypatch
         scheduled_end=datetime(2026, 10, 23, 16), total_lessons=1, checkin_pin="20202", lesson_weekdays="4",
         series_start_date=date(2026, 10, 23), series_end_date=date(2026, 10, 23), coach_time_confirmed=True)
     db_session.add(conflict); db_session.commit()
-    with pytest.raises(HTTPException) as exc:
-        main.coach_book_session(CoachBookSession(**args), db_session, user)
-    assert exc.value.status_code == 409
-    enr.coach_time_confirmed = True
+    main.coach_book_session(CoachBookSession(**args), db_session, user)
+    assert enr.coach_time_confirmed is True
+    assert enr.scheduled_start == datetime(2026, 10, 23, 15)
     with pytest.raises(HTTPException) as exc:
         main.coach_confirm_enrollment_schedule(enr.id, CoachScheduleConfirm(**args), db_session, user)
     assert exc.value.status_code == 400
+    # [F008] Private marks remain protected even when lessons may overlap.
+    main.coach_create_personal_block(
+        main.CoachPersonalBlockCreate(title="PT meeting", day=date(2026, 10, 23),
+                                      start_hour=16, start_minute=0, duration_hours=1),
+        db_session,
+        SimpleNamespace(role="COACH", coach_id=original, username="qa-coach"),
+    )
+    with pytest.raises(HTTPException) as blocked:
+        main.coach_create_personal_block(
+            main.CoachPersonalBlockCreate(title="Clash", day=date(2026, 10, 23),
+                                          start_hour=16, start_minute=30, duration_hours=1),
+            db_session,
+            SimpleNamespace(role="COACH", coach_id=original, username="qa-coach"),
+        )
+    assert blocked.value.status_code == 409
 
 
 def test_reschedule_notices_still_enforced(monkeypatch):

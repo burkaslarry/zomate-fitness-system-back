@@ -18,6 +18,19 @@ from app.enrollment_schedule import parse_segment_pins_json
 from app.whatsapp_templates import DEFAULT_WHATSAPP_TEMPLATES, get_template_body
 
 
+def _dry_run() -> SimpleNamespace:
+    """[F005][S003] Provider stub: log_whatsapp reads result.dry_run after dispatch."""
+    return SimpleNamespace(dry_run=True, ok=False, message_id=None, error="test")
+
+
+def _dispatch_capture(emitted: list) -> object:
+    """[F005][S003] Capture rendered bodies and still return a provider result."""
+    def capture(*args, **kwargs):
+        emitted.append(kwargs)
+        return _dry_run()
+    return capture
+
+
 def _course(db):
     """[F005][S003] Set up three FPS installments with their own scoped financial facts."""
     branch = Branch(name="Drill", code="DRILL", address="Test", active=True)
@@ -120,6 +133,7 @@ def test_linked_checkout_notifies_after_course_pin_and_payment_are_saved(db_sess
         assert course_payment_state(enrollment)["renewal_id"] == renewal.id
         assert kwargs["template_context"]["pin"] == enrollment.checkin_pin
         captured.append(kwargs)
+        return _dry_run()
 
     monkeypatch.setattr(main, "dispatch_reminder", capture)
     body = CourseCreate(title="New Pilates", branch_id=coach.branch_id, coach_id=coach.id,
@@ -188,7 +202,7 @@ def test_first_unpaid_pin_has_grace_but_cannot_cross_installment_boundary(db_ses
 def test_new_course_issues_only_first_pin_before_payment(db_session, monkeypatch):
     """[F002][S001] Later PINs are not generated or exposed at checkout."""
     student, coach, _ = _course(db_session)
-    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: _dry_run())
     result = main._create_course_impl(CourseCreate(title="Grace Pilates", branch_id=coach.branch_id,
         coach_id=coach.id, student_ids=[student.id], total_lessons=30, total_installments=3,
         installment_amounts=[3000]*3, whatsapp_reminder_opt_in=True,
@@ -208,7 +222,7 @@ def test_public_receipt_waits_for_admin_then_issues_new_pin_and_notifies_once(db
         row["pin"] = ""
     enrollment.segment_pins_json = json.dumps(rows)
     emitted = []
-    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    monkeypatch.setattr(main, "dispatch_reminder", _dispatch_capture(emitted))
     monkeypatch.setattr(main, "_save_upload_file", lambda *args: "receipts/sample.png")
     result = main._save_member_receipt_row(db_session, student=student, file=None, member_key="DRILL",
         amount=3000, payment_method="FPS", note="Test", context="Test", source="RENEWAL",
@@ -251,7 +265,7 @@ def test_admin_handles_partial_installment_and_final_balance(db_session, monkeyp
     state["pending_payments"] = {"full" if full_payment else "3": {"amount": amount, "receipt_id":3,"full_payment":full_payment}}
     enrollment.payment_state_json = json.dumps(state)
     emitted = []
-    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    monkeypatch.setattr(main, "dispatch_reminder", _dispatch_capture(emitted))
     result = main.admin_course_mark_installment_paid(enrollment.id,
         CourseInstallmentMarkPaid(student_id=student.id, installment_no=3), db_session, SimpleNamespace(role="ADMIN"))
     assert emitted[0]["template_key"] == expected_key
@@ -274,7 +288,7 @@ def test_single_payment_course_pending_receipt_can_be_confirmed(db_session, monk
     enrollment.segment_pins_json = None
     enrollment.payment_state_json = json.dumps({"total_amount":9000,"pending_payments":{"1":{"amount":9000,"receipt_id":1}}})
     emitted=[]
-    monkeypatch.setattr(main, "dispatch_reminder", lambda *args, **kwargs: emitted.append(kwargs))
+    monkeypatch.setattr(main, "dispatch_reminder", _dispatch_capture(emitted))
     result=main.admin_course_mark_installment_paid(enrollment.id,
         CourseInstallmentMarkPaid(student_id=student.id,installment_no=1),db_session,SimpleNamespace(role="ADMIN"))
     assert result.enrollments[0].installment_segments[0].pin == enrollment.checkin_pin
@@ -286,7 +300,7 @@ def test_unassigned_receipt_is_linked_to_admin_selected_term_without_double_coun
     """[F004][S002] An Admin selects the term for an unscoped uploaded proof, counting it once."""
     student, _, enrollment = _course(db_session)
     enrollment.payment_state_json = json.dumps({"total_amount":9000,"pending_payments":{"unassigned":{"amount":3000,"receipt_id":1}}})
-    monkeypatch.setattr(main,"dispatch_reminder",lambda *args,**kwargs:None)
+    monkeypatch.setattr(main,"dispatch_reminder",lambda *args,**kwargs:_dry_run())
     body=CourseInstallmentMarkPaid(student_id=student.id,installment_no=2)
     main.admin_course_mark_installment_paid(enrollment.id,body,db_session,SimpleNamespace(role="ADMIN"))
     main.admin_course_mark_installment_paid(enrollment.id,body,db_session,SimpleNamespace(role="ADMIN"))

@@ -450,7 +450,7 @@ class AuthSession(Base):
 
 
 class CoachPersonalBlock(Base):
-    """[F003][S003] Coach private calendar marks（其他事項）— not student lessons."""
+    """[F003][S003] Coach private calendar marks（其他事項／試堂）— not student lessons."""
 
     __tablename__ = "zomate_fs_coach_personal_blocks"
 
@@ -458,6 +458,9 @@ class CoachPersonalBlock(Base):
     coach_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_coaches.id"), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="其他事項")
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # [F003][S003] "personal" = 其他事項; "trial" = 新學生試堂 (name in title, phone below).
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="personal", server_default="personal")
+    student_phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
     start_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

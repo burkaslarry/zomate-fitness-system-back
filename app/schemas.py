@@ -528,6 +528,21 @@ class CoachStudentPaymentOut(BaseModel):
     receipt_available: bool = False
 
 
+class CoachStudentPackageOut(BaseModel):
+    """[F003][S005] One course package (= one enrollment) on the coach roster row."""
+
+    enrollment_id: int
+    course_title: str
+    branch_name: str | None = None
+    branch_code: str | None = None
+    total_lessons: int
+    used_lessons: int
+    remaining_lessons: int
+    coach_time_confirmed: bool
+    payment_status: str
+    installment_status: str
+
+
 class CoachStudentBriefOut(BaseModel):
     """[F003][S005] Coach roster — students assigned via course enrollments."""
 
@@ -537,6 +552,7 @@ class CoachStudentBriefOut(BaseModel):
     lesson_balance: int
     enrollment_count: int
     pending_schedule: bool
+    packages: list[CoachStudentPackageOut] = []
 
 
 class CoachStudentEnrollmentOut(BaseModel):
@@ -795,6 +811,26 @@ class CoachAttendanceLedgerRowOut(BaseModel):
     remarks: str = ""
 
 
+class CoachAttendanceLedgerPackageOut(BaseModel):
+    """[F008][S005] One coached package with its lesson counts."""
+
+    enrollment_id: int
+    student_name: str
+    course_title: str
+    branch_name: str | None = None
+    total_lessons: int
+    used_lessons: int
+    remaining_lessons: int
+
+
+class CoachAttendanceLedgerSummaryOut(BaseModel):
+    """[F008][S005] 本月 + 累計簽到 counters for the attendance page."""
+
+    month_checkins: int = 0
+    cumulative_checkins: int = 0
+    month_lessons: int = 0
+
+
 class CoachAttendanceLedgerOut(BaseModel):
     """[F008][S005] Filterable coach attendance ledger for admin / coach UI."""
 
@@ -802,6 +838,8 @@ class CoachAttendanceLedgerOut(BaseModel):
     from_date: date
     to_date: date
     rows: list[CoachAttendanceLedgerRowOut] = Field(default_factory=list)
+    summary: CoachAttendanceLedgerSummaryOut = Field(default_factory=CoachAttendanceLedgerSummaryOut)
+    packages: list[CoachAttendanceLedgerPackageOut] = Field(default_factory=list)
 
 
 class CourseCategoryCreate(BaseModel):
@@ -887,7 +925,7 @@ class WhatsAppTestSendBody(BaseModel):
 
 
 class CoachPersonalBlockCreate(BaseModel):
-    """[F003][S003] Coach private calendar block（其他事項）."""
+    """[F003][S003] Coach private calendar block（其他事項）or 新學生試堂."""
 
     day: date
     start_hour: int = Field(ge=0, le=23)
@@ -895,6 +933,8 @@ class CoachPersonalBlockCreate(BaseModel):
     duration_hours: float = Field(default=1.0, ge=0.5, le=8.0)
     title: str = Field(default="其他事項", min_length=1, max_length=200)
     notes: str | None = Field(default=None, max_length=500)
+    kind: Literal["personal", "trial"] = "personal"
+    student_phone: str | None = Field(default=None, max_length=30)
     coach_id: int | None = None
 
 
@@ -903,6 +943,8 @@ class CoachPersonalBlockOut(BaseModel):
     coach_id: int
     title: str
     notes: str | None = None
+    kind: str = "personal"
+    student_phone: str | None = None
     start_at: datetime
     end_at: datetime
     created_at: datetime

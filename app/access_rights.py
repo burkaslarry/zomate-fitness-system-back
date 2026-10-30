@@ -65,6 +65,13 @@ ACCESS_FEATURES: list[dict] = [
         "remark": None,
     },
     {
+        "key": "coach_schedule_board",
+        "label_zh": "教練課堂排程",
+        "href": "/admin/coach-schedule",
+        "roles": ("MASTER_ADMIN", "CLERK"),
+        "remark": None,
+    },
+    {
         "key": "qr_checkin_console",
         "label_zh": "QR 簽到中心",
         "href": "/admin/attendance/qr-console",
@@ -117,6 +124,13 @@ ACCESS_FEATURES: list[dict] = [
         "key": "payments",
         "label_zh": "付款紀錄",
         "href": "/admin/payments",
+        "roles": ("MASTER_ADMIN", "CLERK"),
+        "remark": None,
+    },
+    {
+        "key": "installments",
+        "label_zh": "分期付款學生",
+        "href": "/admin/installments",
         "roles": ("MASTER_ADMIN", "CLERK"),
         "remark": None,
     },

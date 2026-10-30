@@ -106,6 +106,7 @@ from .schemas import (
     CoachSignatureUpdate,
     CoachStudentPaymentOut,
     CoachStudentBriefOut,
+    CoachStudentPackageOut,
     CoachStudentRecordOut,
     CoachStudentEnrollmentOut,
     CoachStudentCheckinOut,
@@ -116,7 +117,9 @@ from .schemas import (
     CoachSessionOut,
     CoachAttendanceReportOut,
     CoachAttendanceLedgerOut,
+    CoachAttendanceLedgerPackageOut,
     CoachAttendanceLedgerRowOut,
+    CoachAttendanceLedgerSummaryOut,
     CoachAttendanceReportRowOut,
     CoachBookSession,
     CoachEnrollmentCancelBody,
@@ -486,83 +489,214 @@ def _build_qr_code_pdf_bytes(label: str, payload: str) -> bytes:
 
 
 def _build_official_receipt_pdf_bytes(
-    *, date_str: str, name: str, tel: str, item: str, method: str | None, price: float
+    *,
+    date_str: str,
+    name: str,
+    tel: str,
+    item: str,
+    method: str | None,
+    price: float,
+    receipt_no: str | None = None,
 ) -> bytes:
     """[F004][S002]
     Feature: Admin Reports & Financials
     Step: Official receipt PDF generation
-    Logic: A4 layout matching the pre-printed Zomate receipt (company header, Date/Name/Tel,
-    Item|Price table, payment method, Total, signature footer). STSong-Light covers Chinese text.
+    Logic: A4 layout with a vector Zomate logo, mixed MSung-Light/Helvetica text, a wrapped
+    description column and a reserved right-aligned amount column (no overlapping text),
+    a summary block and a signature footer.
     """
+    from reportlab.lib.colors import HexColor
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
     if "STSong-Light" not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-    font = "STSong-Light"
+    cjk = "STSong-Light"
 
-    def money(value: float) -> str:
-        return f"${value:,.0f}" if float(value).is_integer() else f"${value:,.2f}"
+    ink = HexColor("#2d2422")
+    muted = HexColor("#8a7f7b")
+    rule = HexColor("#e7e0dc")
+    peach = HexColor("#e8a598")
+    paper = HexColor("#f7f2f1")
 
-    def fit(text: str, size: int, max_width: float) -> str:
-        if canvas.stringWidth(text, font, size) <= max_width:
-            return text
-        while text and canvas.stringWidth(text + "…", font, size) > max_width:
-            text = text[:-1]
-        return text + "…"
+    def segments(text: str, latin: str) -> list[tuple[str, str]]:
+        """[F004][S002] Split a string into Latin/CJK runs so both scripts render cleanly."""
+        runs: list[list] = []
+        for ch in text:
+            font = latin if 32 <= ord(ch) < 127 else cjk
+            if runs and runs[-1][0] == font:
+                runs[-1][1].append(ch)
+            else:
+                runs.append([font, [ch]])
+        return [(font, "".join(chars)) for font, chars in runs]
 
     packet = io.BytesIO()
     canvas = Canvas(packet, pagesize=A4)
-    width, _ = A4
-    center = width / 2
+    width, height = A4
+    left, right = 48.0, width - 48.0
 
-    canvas.setFont(font, 20)
-    title = "Zomate Fitness Limited"
-    canvas.drawString((width - canvas.stringWidth(title, font, 20)) / 2, 790, title)
-    canvas.setFont(font, 9)
-    addr = "22/F, No.102 Austin Road, Tsim Sha Tsui, Kowloon"
-    canvas.drawString((width - canvas.stringWidth(addr, font, 9)) / 2, 772, addr)
+    def text_width(text: str, size: float, latin: str = "Helvetica") -> float:
+        return sum(canvas.stringWidth(chunk, font, size) for font, chunk in segments(text, latin))
 
-    canvas.setFont(font, 15)
-    heading = "Official Receipt"
-    heading_w = canvas.stringWidth(heading, font, 15)
-    canvas.drawString((width - heading_w) / 2, 712, heading)
+    def draw_text(
+        x: float,
+        y: float,
+        text: str,
+        size: float,
+        *,
+        latin: str = "Helvetica",
+        color=ink,
+        align: str = "left",
+    ) -> float:
+        total = text_width(text, size, latin)
+        if align == "center":
+            x -= total / 2
+        elif align == "right":
+            x -= total
+        canvas.setFillColor(color)
+        for font, chunk in segments(text, latin):
+            canvas.setFont(font, size)
+            canvas.drawString(x, y, chunk)
+            x += canvas.stringWidth(chunk, font, size)
+        return total
+
+    def draw_tracked(x: float, y: float, text: str, size: float, tracking: float, color) -> None:
+        canvas.setFont("Helvetica", size)
+        canvas.setFillColor(color)
+        for ch in text:
+            canvas.drawString(x, y, ch)
+            x += canvas.stringWidth(ch, "Helvetica", size) + tracking
+
+    def wrap(text: str, size: float, max_width: float) -> list[str]:
+        lines: list[str] = []
+        current = ""
+        for ch in text:
+            if ch == "\n":
+                lines.append(current)
+                current = ""
+                continue
+            if current and text_width(current + ch, size) > max_width:
+                lines.append(current.rstrip())
+                current = ch.lstrip()
+                continue
+            current += ch
+        lines.append(current.rstrip())
+        return [ln for ln in lines if ln] or [""]
+
+    money = f"HK$ {price:,.2f}"
+
+    canvas.setFillColor(peach)
+    canvas.rect(0, height - 6, width, 6, stroke=0, fill=1)
+
+    # Header: vector logo mark + wordmark on the left, company address on the right.
+    canvas.setFillColor(ink)
+    canvas.roundRect(left, height - 84, 42, 42, 10, stroke=0, fill=1)
+    canvas.setFillColor(peach)
+    canvas.setFont("Helvetica-Bold", 26)
+    z_w = canvas.stringWidth("Z", "Helvetica-Bold", 26)
+    canvas.drawString(left + (42 - z_w) / 2, height - 74, "Z")
+    draw_text(left + 54, height - 58, "ZOMATE", 19, latin="Helvetica-Bold")
+    draw_tracked(left + 55.5, height - 72, "FITNESS LIMITED", 7.2, 1.6, muted)
+    canvas.setFillColor(muted)
+    canvas.setFont("Helvetica", 8)
+    canvas.drawRightString(right, height - 56, "Zomate Fitness Limited")
+    canvas.drawRightString(right, height - 68, "22/F, No.102 Austin Road")
+    canvas.drawRightString(right, height - 80, "Tsim Sha Tsui, Kowloon, Hong Kong")
+
+    canvas.setStrokeColor(rule)
     canvas.setLineWidth(0.8)
-    canvas.line((width - heading_w) / 2, 708, (width + heading_w) / 2, 708)
+    canvas.line(left, height - 100, right, height - 100)
 
-    left, right = 70, width - 70
-    canvas.setFont(font, 10)
-    canvas.drawString(left, 668, f"Date: {date_str}")
-    canvas.drawString(left, 650, f"Name: {name}")
-    canvas.drawString(left, 632, f"Tel: {tel}")
+    # Title + receipt number.
+    draw_tracked(left, height - 136, "OFFICIAL RECEIPT", 15, 2.2, ink)
+    draw_text(left + 0.5, height - 154, "正式收據", 9.5, color=muted)
+    if receipt_no:
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.drawRightString(right, height - 128, "RECEIPT NO.")
+        canvas.setFillColor(ink)
+        canvas.setFont("Helvetica-Bold", 10.5)
+        canvas.drawRightString(right, height - 142, receipt_no)
 
-    canvas.setFillGray(0.75)
-    canvas.rect(left, 590, right - left, 18, stroke=0, fill=1)
-    canvas.setFillGray(0)
-    canvas.setFont(font, 10)
-    canvas.drawString(left + 8, 596, "Item")
-    canvas.drawRightString(right - 8, 596, "Price")
+    # Details band.
+    band_top = height - 172
+    canvas.setFillColor(paper)
+    canvas.rect(left, band_top - 44, right - left, 44, stroke=0, fill=1)
+    canvas.setFillColor(peach)
+    canvas.rect(left, band_top - 44, 3, 44, stroke=0, fill=1)
+    columns = [(left + 18, "DATE / 日期", date_str), (left + 190, "NAME / 姓名", name), (left + 360, "TEL / 電話", tel)]
+    for x, label, value in columns:
+        draw_text(x, band_top - 16, label, 6.8, color=muted)
+        draw_text(x, band_top - 33, value or "—", 10.5)
 
-    canvas.setFont(font, 11)
-    item_line = fit(item, 11, right - left - 120)
-    canvas.drawString((width - canvas.stringWidth(item_line, font, 11)) / 2, 540, item_line)
+    # Items table header.
+    table_top = band_top - 72
+    canvas.setFillColor(ink)
+    canvas.rect(left, table_top - 24, right - left, 24, stroke=0, fill=1)
+    draw_text(left + 10, table_top - 16, "DESCRIPTION / 項目", 8, latin="Helvetica-Bold", color=HexColor("#ffffff"))
+    canvas.setFillColor(HexColor("#ffffff"))
+    canvas.setFont("Helvetica-Bold", 8)
+    canvas.drawRightString(right - 10, table_top - 16, "AMOUNT (HKD)")
+
+    amount_col = 120.0
+    desc_width = (right - left) - amount_col - 30
+    item_lines = wrap(item, 11, desc_width)
+    row_height = 22 + 15 * (len(item_lines) - 1) + (14 if method else 0)
+    canvas.setStrokeColor(rule)
+    canvas.setLineWidth(0.6)
+    canvas.line(left, table_top - 24 - row_height, right, table_top - 24 - row_height)
+
+    baseline = table_top - 42
+    for line_text in item_lines:
+        draw_text(left + 10, baseline, line_text, 11)
+        baseline -= 15
+    canvas.setFillColor(ink)
+    canvas.setFont("Helvetica-Bold", 12)
+    canvas.drawRightString(right - 10, table_top - 42, money)
     if method:
-        canvas.setFont(font, 9)
-        canvas.setFillGray(0.35)
-        method_line = fit(method, 9, right - left - 120)
-        canvas.drawString((width - canvas.stringWidth(method_line, font, 9)) / 2, 524, method_line)
-        canvas.setFillGray(0)
-    canvas.setFont(font, 11)
-    canvas.drawRightString(right - 8, 540, money(price))
+        draw_text(left + 10, baseline + 4, f"付款方式：{method}", 8.5, color=muted)
 
-    canvas.setFont(font, 12)
-    canvas.drawRightString(right - 60, 480, "Total:")
-    canvas.drawRightString(right - 8, 480, money(price))
+    # Total block.
+    total_y = table_top - 24 - row_height - 44
+    draw_text(right - 10, total_y + 14, "TOTAL / 總額", 8, color=muted, align="right")
+    canvas.setFillColor(ink)
+    canvas.setFont("Helvetica-Bold", 17)
+    canvas.drawRightString(right - 10, total_y - 6, money)
+    canvas.setFillColor(peach)
+    canvas.rect(right - 150, total_y - 12, 140, 2.5, stroke=0, fill=1)
 
+    # Footer: company note on the left, signature on the right.
+    footer_y = 150.0
+    canvas.setStrokeColor(rule)
     canvas.setLineWidth(0.8)
-    canvas.line(left, 150, left + 170, 150)
-    canvas.setFont(font, 10)
-    canvas.drawString(left, 134, "Zomate Fitness Limited")
+    canvas.line(left, footer_y + 46, right, footer_y + 46)
+    draw_text(left, footer_y + 26, "Thank you for training with Zomate. / 多謝惠顧。", 8.5, color=muted)
+    canvas.setFillColor(muted)
+    canvas.setFont("Helvetica", 7.5)
+    canvas.drawString(left, footer_y + 12, "This receipt is generated by the Zomate Fitness system.")
+    draw_text(left, 64, "Zomate Fitness Limited | 22/F, No.102 Austin Road, Tsim Sha Tsui, Kowloon", 7.5, color=muted)
+
+    sign_left, sign_right = right - 170, right
+    canvas.saveState()
+    canvas.translate(sign_right - 96, footer_y + 24)
+    canvas.rotate(-5)
+    canvas.setFillColor(ink)
+    canvas.setFont("Times-Italic", 25)
+    canvas.drawString(0, 0, "Zomate")
+    canvas.setStrokeColor(ink)
+    canvas.setLineWidth(1.1)
+    path = canvas.beginPath()
+    path.moveTo(-4, -4)
+    path.curveTo(30, -12, 96, -14, 128, -2)
+    canvas.drawPath(path, stroke=1, fill=0)
+    canvas.restoreState()
+    canvas.setStrokeColor(ink)
+    canvas.setLineWidth(0.8)
+    canvas.line(sign_left, footer_y + 4, sign_right, footer_y + 4)
+    draw_text(sign_left, footer_y - 10, "Authorised Signature 授權簽署", 7.5, color=muted)
+    canvas.setFillColor(ink)
+    canvas.setFont("Helvetica-Bold", 8.5)
+    canvas.drawString(sign_left, footer_y - 22, "Zomate Fitness Limited")
 
     canvas.showPage()
     canvas.save()
@@ -945,16 +1079,20 @@ def _assert_coach_slot_available(
     exclude_enrollment_id: int | None = None,
     exclude_original_date: date | None = None,
     exclude_personal_block_id: int | None = None,
+    allow_lesson_overlap: bool = False,
 ) -> None:
-    for a0, a1 in _coach_confirmed_intervals_on_day(
-        db,
-        coach_id,
-        day,
-        exclude_enrollment_id=exclude_enrollment_id,
-        exclude_original_date=exclude_original_date,
-    ):
-        if start < a1 and a0 < end:
-            raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
+    # [F003][S003] Teaching blocks may overlap (1-to-many / co-coaching), so lesson
+    # collisions are only rejected for private 其他事項 marks.
+    if not allow_lesson_overlap:
+        for a0, a1 in _coach_confirmed_intervals_on_day(
+            db,
+            coach_id,
+            day,
+            exclude_enrollment_id=exclude_enrollment_id,
+            exclude_original_date=exclude_original_date,
+        ):
+            if start < a1 and a0 < end:
+                raise HTTPException(status_code=409, detail="Time slot conflicts with another lesson.")
     # [F003][S003] Also block against coach private「其他事項」marks.
     day_start = datetime.combine(day, time(0, 0))
     day_end = datetime.combine(day, time(23, 59, 59))
@@ -2786,6 +2924,10 @@ def perform_lesson_checkin(
         )
     db.commit()
 
+    checkin_branch = None
+    if resolved_enrollment is not None and resolved_enrollment.branch_id:
+        checkin_branch = db.get(Branch, resolved_enrollment.branch_id)
+
     event_payload = {
         "event": "checkin_acknowledged",
         "checkin_id": checkin_log.id,
@@ -2800,6 +2942,7 @@ def perform_lesson_checkin(
         "course_id": resolved_enrollment.id if resolved_enrollment else None,
         "session_calendar_date": session_day.isoformat() if resolved_enrollment else None,
         "course_title": resolved_enrollment.title if resolved_enrollment else None,
+        "branch_name": checkin_branch.name if checkin_branch else None,
     }
 
     return (
@@ -2818,6 +2961,9 @@ def perform_lesson_checkin(
                 else None
             ),
             "resolved_course_id": resolved_enrollment.id if resolved_enrollment else None,
+            "course_title": resolved_enrollment.title if resolved_enrollment else None,
+            "branch_name": checkin_branch.name if checkin_branch else None,
+            "branch_code": checkin_branch.code if checkin_branch else None,
         },
         event_payload,
     )
@@ -2827,6 +2973,23 @@ def _migrate_user_custom_permissions(db: Session) -> None:
     """[F007][S003] Per-user Access Rights overrides (JSON feature keys)."""
     try:
         db.execute(text("ALTER TABLE zomate_fs_users ADD COLUMN IF NOT EXISTS custom_permissions JSONB NULL"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _migrate_coach_personal_block_kind(db: Session) -> None:
+    """[F003][S003] Coach calendar marks gain 試堂 kind + trial student phone."""
+    try:
+        db.execute(
+            text(
+                "ALTER TABLE zomate_fs_coach_personal_blocks "
+                "ADD COLUMN IF NOT EXISTS kind VARCHAR(20) NOT NULL DEFAULT 'personal'"
+            )
+        )
+        db.execute(
+            text("ALTER TABLE zomate_fs_coach_personal_blocks ADD COLUMN IF NOT EXISTS student_phone VARCHAR(30) NULL")
+        )
         db.commit()
     except Exception:
         db.rollback()
@@ -2846,6 +3009,7 @@ def _sync_startup() -> None:
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
         _migrate_user_custom_permissions(db)
+        _migrate_coach_personal_block_kind(db)
         seed_whatsapp_templates(db)
         _seed_default_branches(db)
         _seed_management_defaults(db)
@@ -3014,7 +3178,7 @@ def public_student_today_lessons(
     today = now_hk().date()
     rows = (
         db.query(CourseEnrollment)
-        .options(joinedload(CourseEnrollment.coach))
+        .options(joinedload(CourseEnrollment.coach), joinedload(CourseEnrollment.branch))
         .filter(
             CourseEnrollment.student_id == student_id,
             ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
@@ -3040,6 +3204,8 @@ def public_student_today_lessons(
                     "course_id": enr.id,
                     "title": enr.title or "Course",
                     "coach_name": coach.full_name if coach else "—",
+                    "branch_name": enr.branch.name if enr.branch else None,
+                    "branch_code": enr.branch.code if enr.branch else None,
                     "scheduled_start": start.isoformat(),
                     "scheduled_end": end.isoformat(),
                 }
@@ -5540,6 +5706,7 @@ def admin_payment_record_receipt_pdf(
         item=str(projection.get("label") or ""),
         method=(str(projection.get("payment_method") or "").strip() or None),
         price=float(amount),
+        receipt_no=f"ZC-{ref_id:05d}",
     )
     print(f"[F004][S002] Success: Official receipt PDF generated for {norm}-{ref_id} by {user.username}.")
     return Response(
@@ -8242,6 +8409,33 @@ def coach_attendance_ledger(
         coach_name=coach_row.full_name,
         coach_username=login_user.username if login_user else None,
     )
+    # [F008][S005] 本月／累計簽到 counters and per-package lesson counts.
+    month_checkins = sum(1 for r in ledger_rows if r.get("check_in_time") not in (None, "", "--:--"))
+    month_lessons = len(ledger_rows)
+    enr_ids = [enr.id for enr in enrollments]
+    used_by_course: dict[int, int] = {}
+    if enr_ids:
+        used_by_course = {
+            course_id: int(count)
+            for course_id, count in db.query(Attendance.course_id, func.count(Attendance.id))
+            .filter(Attendance.course_id.in_(enr_ids))
+            .group_by(Attendance.course_id)
+            .all()
+            if course_id is not None
+        }
+    package_rows = [
+        CoachAttendanceLedgerPackageOut(
+            enrollment_id=enr.id,
+            student_name=enr.student.full_name if enr.student else "",
+            course_title=enr.title,
+            branch_name=enr.branch.name if enr.branch else None,
+            total_lessons=int(enr.total_lessons or 0),
+            used_lessons=used_by_course.get(enr.id, 0),
+            remaining_lessons=max(0, int(enr.total_lessons or 0) - used_by_course.get(enr.id, 0)),
+        )
+        for enr in enrollments
+    ]
+    package_rows.sort(key=lambda p: (p.student_name, p.course_title))
 
     if branch_ids is not None:
         ledger_rows = [r for r in ledger_rows if r.get("branch_id") in branch_ids]
@@ -8266,6 +8460,12 @@ def coach_attendance_ledger(
         from_date=from_d,
         to_date=to_d,
         rows=[CoachAttendanceLedgerRowOut.model_validate(r) for r in ledger_rows],
+        summary=CoachAttendanceLedgerSummaryOut(
+            month_checkins=month_checkins,
+            cumulative_checkins=sum(used_by_course.values()),
+            month_lessons=month_lessons,
+        ),
+        packages=package_rows,
     )
 
 
@@ -8292,7 +8492,13 @@ def coach_reschedule_course(
         raise HTTPException(status_code=403, detail="This class is not assigned to this coach.")
     day = payload.scheduled_start.date()
     _assert_coach_slot_available(
-        db, coach_id, day, payload.scheduled_start, payload.scheduled_end, exclude_enrollment_id=enr.id
+        db,
+        coach_id,
+        day,
+        payload.scheduled_start,
+        payload.scheduled_end,
+        exclude_enrollment_id=enr.id,
+        allow_lesson_overlap=True,
     )
     enr.scheduled_start = payload.scheduled_start
     enr.scheduled_end = payload.scheduled_end
@@ -8585,6 +8791,7 @@ def coach_enrollment_receipt_pdf(
         item=f"{int(enr.total_lessons or 0)} Lessons – {enr.title}",
         method=(str(renewal.payment_method or "").strip() or None),
         price=float(renewal.amount),
+        receipt_no=f"ZE-{enrollment_id:05d}",
     )
     print(f"[F004][S002] Success: Official receipt PDF generated for enrollment {enrollment_id} by {user.username}.")
     return Response(
@@ -8703,12 +8910,39 @@ def coach_list_students(
         .all()
     )
     by_student: dict[int, CoachStudentBriefOut] = {}
+    # [F003][S005] Per-package lesson usage comes from attendance rows on that course package.
+    enr_ids = [enr.id for enr in rows]
+    used_by_course: dict[int, int] = {}
+    if enr_ids:
+        used_by_course = {
+            course_id: int(count)
+            for course_id, count in db.query(Attendance.course_id, func.count(Attendance.id))
+            .filter(Attendance.course_id.in_(enr_ids))
+            .group_by(Attendance.course_id)
+            .all()
+            if course_id is not None
+        }
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
         display = format_student_display_name(
             st,
             _student_home_branch_code(db, st) or (enr.branch.code if enr.branch else None),
+        )
+        total = int(enr.total_lessons or 0)
+        used = used_by_course.get(enr.id, 0)
+        pay_status, inst_status = _coach_payment_summary(db, enr, st)
+        package = CoachStudentPackageOut(
+            enrollment_id=enr.id,
+            course_title=enr.title or "Course",
+            branch_name=enr.branch.name if enr.branch else None,
+            branch_code=enr.branch.code if enr.branch else None,
+            total_lessons=total,
+            used_lessons=used,
+            remaining_lessons=max(0, total - used),
+            coach_time_confirmed=bool(enr.coach_time_confirmed),
+            payment_status=pay_status,
+            installment_status=inst_status,
         )
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
@@ -8718,6 +8952,7 @@ def coach_list_students(
                 lesson_balance=_lesson_balance_sum(db, st.id),
                 enrollment_count=1,
                 pending_schedule=pending,
+                packages=[package],
             )
         else:
             cur = by_student[st.id]
@@ -8728,6 +8963,7 @@ def coach_list_students(
                 lesson_balance=cur.lesson_balance,
                 enrollment_count=cur.enrollment_count + 1,
                 pending_schedule=cur.pending_schedule or pending,
+                packages=[*cur.packages, package],
             )
     # [F001][S002] New members who selected this coach before any CourseEnrollment exists.
     for st, _cat in students_onboarded_to_coach(db, cid):
@@ -8872,7 +9108,7 @@ def _book_next_lesson(db: Session, user: AppUser, enr: CourseEnrollment, payload
         raise HTTPException(status_code=409, detail="此課程當日已有排程；已簽到課堂已鎖定，請選下一個上堂日期。")
     if len(slots) >= enr.total_lessons:
         raise HTTPException(status_code=400, detail="已排滿課程堂數。")
-    _assert_coach_slot_available(db, cid, payload.day, start, end)
+    _assert_coach_slot_available(db, cid, payload.day, start, end, allow_lesson_overlap=True)
     row = db.query(CourseSessionOverride).filter(CourseSessionOverride.enrollment_id == enr.id,
         CourseSessionOverride.original_date == payload.day).first()
     row = row or CourseSessionOverride(enrollment_id=enr.id, original_date=payload.day)
@@ -8923,7 +9159,7 @@ def coach_book_session(
     start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_initial_staff_booking(start, end)
-    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id)
+    _assert_coach_slot_available(db, cid, payload.day, start, end, exclude_enrollment_id=enr.id, allow_lesson_overlap=True)
     return coach_confirm_enrollment_schedule(
         enrollment_id=payload.enrollment_id,
         payload=confirm_payload,
@@ -8964,7 +9200,7 @@ def coach_confirm_enrollment_schedule(
     start = datetime.combine(first_day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_initial_staff_booking(start, end)
-    _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id)
+    _assert_coach_slot_available(db, cid, first_day, start, end, exclude_enrollment_id=enr.id, allow_lesson_overlap=True)
     # [F003][S002] First booking uses coach-picked calendar day (not legacy placeholder weekday).
     ws_raw = [first_day.weekday()]
     lesson_dates = enumerate_lesson_dates(first_day, ws_raw, enr.total_lessons)
@@ -9249,16 +9485,30 @@ def coach_create_personal_block(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> CoachPersonalBlockOut:
-    """[F003][S003] Create a private calendar block for the coach."""
+    """[F003][S003] Create a private calendar block — 其他事項 or 新學生試堂."""
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    kind = payload.kind if payload.kind in ("personal", "trial") else "personal"
+    title = (payload.title or "").strip()
+    student_phone = None
+    if kind == "trial":
+        if len(title) < 2:
+            raise HTTPException(status_code=400, detail="請輸入試堂學生姓名。")
+        digits = "".join(ch for ch in (payload.student_phone or "") if ch.isdigit())
+        if len(digits) < 8:
+            raise HTTPException(status_code=400, detail="請輸入有效的試堂學生電話。")
+        student_phone = digits
+    else:
+        title = title or "其他事項"
     start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
     end = start + timedelta(hours=payload.duration_hours)
     _assert_initial_staff_booking(start, end)
     _assert_coach_slot_available(db, cid, payload.day, start, end)
     row = CoachPersonalBlock(
         coach_id=cid,
-        title=(payload.title or "其他事項").strip() or "其他事項",
+        title=title,
         notes=(payload.notes or "").strip() or None,
+        kind=kind,
+        student_phone=student_phone,
         start_at=start,
         end_at=end,
     )

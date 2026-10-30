@@ -1,4 +1,4 @@
-"""[F004][S003]
+"""[F004][S008]
 Feature: Admin Reports & Financials
 Step: Unified installment ledger for dashboard KPIs and 分期付款學生 board
 Logic: Merge course segment-PIN installments with category InstallmentPlan rows so admin counts
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 def _as_float(value) -> float | None:
-    """[F004][S003] Numeric/Decimal/str → float; never invent a missing amount."""
+    """[F004][S008] Numeric/Decimal/str → float; never invent a missing amount."""
     if value is None:
         return None
     try:
@@ -30,7 +30,7 @@ def _as_float(value) -> float | None:
 
 
 def _segment_paid(segment: dict) -> bool:
-    """[F004][S003] Match PIN gating: legacy rows without `paid` treat the first tranche as paid."""
+    """[F004][S008] Match PIN gating: legacy rows without `paid` treat the first tranche as paid."""
     raw = segment.get("paid")
     if raw is None:
         return int(segment.get("installment_no") or 0) <= 1
@@ -38,7 +38,7 @@ def _segment_paid(segment: dict) -> bool:
 
 
 def _course_periods(enr, paid_at_by_receipt: dict[int, str]) -> list[dict]:
-    """[F004][S003] Build one period per course installment segment (never a single full payment)."""
+    """[F004][S008] Build one period per course installment segment (never a single full payment)."""
     try:
         segments = json.loads(enr.segment_pins_json or "[]")
     except (TypeError, json.JSONDecodeError):
@@ -73,7 +73,7 @@ def _course_periods(enr, paid_at_by_receipt: dict[int, str]) -> list[dict]:
 
 
 def _category_periods(plan) -> list[dict]:
-    """[F004][S003] Category plans already store one row per due period."""
+    """[F004][S008] Category plans already store one row per due period."""
     return [
         {
             "installment_no": pay.installment_no,
@@ -89,7 +89,7 @@ def _category_periods(plan) -> list[dict]:
 
 
 def _summarize_row(row: dict) -> dict:
-    """[F004][S003] Derive progress fields from periods so both sources share one contract."""
+    """[F004][S008] Derive progress fields from periods so both sources share one contract."""
     periods = row["periods"]
     paid_periods = [p for p in periods if p["paid"]]
     unpaid_periods = [p for p in periods if not p["paid"]]
@@ -115,7 +115,7 @@ def _summarize_row(row: dict) -> dict:
 
 
 def build_installment_ledger(db: Session, *, student_id: int | None = None) -> list[dict]:
-    """[F004][S003] All installment-bearing enrollments for admin reporting."""
+    """[F004][S008] All installment-bearing enrollments for admin reporting."""
     from .models import (
         Branch,
         CategoryEnrollment,
@@ -264,7 +264,7 @@ def build_installment_ledger(db: Session, *, student_id: int | None = None) -> l
 
 
 def summarize_installments(rows: list[dict]) -> dict:
-    """[F004][S003] Dashboard totals: periods to follow up, students, and unpaid money."""
+    """[F004][S008] Dashboard totals: periods to follow up, students, and unpaid money."""
     return {
         "students_total": len({r["student_id"] for r in rows}),
         "students_unpaid": len({r["student_id"] for r in rows if r["unpaid_installments"] > 0}),
