@@ -19,6 +19,7 @@ class FileStorageService:
         ".jpeg": {"image/jpeg"},
         ".png": {"image/png"},
         ".webp": {"image/webp"},
+        ".gif": {"image/gif"},
         ".pdf": {"application/pdf"},
     }
     max_bytes_by_kind = {
@@ -30,14 +31,14 @@ class FileStorageService:
         self.uploads_dir = (uploads_dir or settings.uploads_dir).resolve()
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_upload(self, file: UploadFile, kind: str, hkid: str) -> str:
+    def save_upload(self, file: UploadFile, kind: str, hkid: str, max_bytes: int | None = None) -> str:
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in self.allowed_mime_by_suffix:
-            raise HTTPException(status_code=400, detail="Only jpg/png/webp/pdf files are allowed.")
+            raise HTTPException(status_code=400, detail="只接受 JPG／PNG／WebP／GIF／PDF 檔案。")
         if file.content_type not in self.allowed_mime_by_suffix[suffix]:
-            raise HTTPException(status_code=400, detail="File MIME type does not match the allowed upload types.")
+            raise HTTPException(status_code=400, detail="檔案類型與副檔名不符，請重新選擇。")
 
-        max_bytes = self.max_bytes_by_kind.get(kind, 5 * 1024 * 1024)
+        limit = max_bytes or self.max_bytes_by_kind.get(kind, 5 * 1024 * 1024)
         normalized_hkid = "".join(hkid.upper().split())
         safe_name = "".join(ch for ch in Path(file.filename or f"upload{suffix}").name if ch.isalnum() or ch in "._-")
         timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
@@ -54,12 +55,15 @@ class FileStorageService:
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > max_bytes:
+                if size > limit:
                     out.close()
                     try:
                         out_path.unlink()
                     except OSError:
                         pass
-                    raise HTTPException(status_code=413, detail="File is too large.")
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"檔案過大（上限 {max(1, limit // (1024 * 1024))}MB）。",
+                    )
                 out.write(chunk)
         return str(relative_path).replace(os.sep, "/")

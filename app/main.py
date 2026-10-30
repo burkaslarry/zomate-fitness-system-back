@@ -309,6 +309,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# [F006][S002] Upload ceiling — matches the 25MB allowance of the Vercel rewrite path.
+MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
+
+
+@app.middleware("http")
+async def reject_oversized_body(request: Request, call_next):
+    """Return a readable 413 instead of a proxy/uvicorn aborted socket."""
+    if request.method in {"POST", "PUT", "PATCH"}:
+        raw_len = request.headers.get("content-length", "")
+        if raw_len.isdigit() and int(raw_len) > MAX_REQUEST_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "payload_too_large", "message": "上載內容過大（上限 25MB）。", "details": None},
+            )
+    return await call_next(request)
+
 UPLOADS_DIR = settings.uploads_dir.resolve()
 ACTIVE_MEMBER_DAYS = settings.active_member_days
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -331,7 +347,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     details = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
     return JSONResponse(
         status_code=422,
-        content={"error": "validation_error", "message": "Request validation failed.", "details": details},
+        content={
+            "error": "validation_error",
+            "message": "資料格式有誤，請檢查必填欄位（姓名、電話、生日、同意聲明）後再試。",
+            "details": details,
+        },
     )
 
 
@@ -1759,9 +1779,9 @@ def _assert_coach_teaches_category(db: Session, coach_id: int, category_id: int)
     """[F011][S002] Registration — selected category must be ticked on coach skills."""
     skill_rows = _coach_skill_category_ids(db, coach_id)
     if not skill_rows:
-        raise HTTPException(status_code=400, detail="This coach has no course categories assigned.")
+        raise HTTPException(status_code=400, detail="此教練未獲分配任何課程種類，請聯絡職員。")
     if category_id not in skill_rows:
-        raise HTTPException(status_code=400, detail="Selected course category is not assigned to this coach.")
+        raise HTTPException(status_code=400, detail="所選課程種類未分配俾此教練，請重新選擇。")
 
 
 def coach_row_to_out(
@@ -1834,13 +1854,13 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
     prefix = "data:image/png;base64,"
     raw = data_url.strip()
     if not raw.startswith(prefix):
-        raise HTTPException(status_code=400, detail="Signature must be a PNG canvas data URL.")
+        raise HTTPException(status_code=400, detail="簽名格式不正確，請清除後重新簽署。")
     try:
         payload = base64.b64decode(raw[len(prefix) :], validate=True)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid signature image data.") from exc
+        raise HTTPException(status_code=400, detail="簽名資料損壞，請清除後重新簽署。") from exc
     if len(payload) > 9_000_000:
-        raise HTTPException(status_code=413, detail="Signature image is too large.")
+        raise HTTPException(status_code=413, detail="簽名圖檔過大，請清除後重新簽署。")
     relative_dir = f"signatures/{student_id}"
     out_dir = UPLOADS_DIR / relative_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1874,7 +1894,7 @@ def _apply_signature_image(student: Student, data_url: str | None) -> None:
 
 
 def _save_upload_file(file: UploadFile, kind: str, hkid: str, max_bytes: int) -> str:
-    return storage_service.save_upload(file, kind, hkid)
+    return storage_service.save_upload(file, kind, hkid, max_bytes=max_bytes)
 
 
 def _is_active_member(db: Session, student_id: int) -> bool:
@@ -3285,6 +3305,9 @@ def _create_member_impl(
     eco_raw = normalize_hk_phone_local_eight(payload.emergency_contact_phone.strip())
     if not eco_raw:
         raise HTTPException(status_code=400, detail="緊急聯絡電話須為香港 8 位手機號碼。")
+    # [F001][S004] Client requires a signature at registration; staff can only re-sign from admin detail.
+    if len((payload.digital_signature or "").strip()) < 20:
+        raise HTTPException(status_code=400, detail="請先於第 3 步簽署，方可提交登記。")
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     # HKID may repeat; phone is the unique identity key.
     if db.query(Student).filter(~Student.id.in_(deleted_ids_sq)).filter(Student.phone.in_(phone_vars)).first():
@@ -3366,7 +3389,7 @@ def _create_member_impl(
     if resolved_coach_id is not None:
         coach = db.get(Coach, resolved_coach_id)
         if not coach or _is_deleted(db, "coaches", coach.id) or not coach.active:
-            raise HTTPException(status_code=400, detail="Invalid or inactive coach.")
+            raise HTTPException(status_code=400, detail="所選教練無效或已停用，請重新選擇。")
     # [F001][S001] Course category is optional now — only create the ledger when one is supplied.
     if resolved_coach_id is not None and payload.course_category_id is not None:
         _assert_coach_teaches_category(db, resolved_coach_id, payload.course_category_id)
@@ -3458,7 +3481,12 @@ def create_member(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     student = _create_member_impl(db, payload, medical_file=medical_clearance)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # [F001][S001] Concurrent submits can pass the pre-check; the unique phone index still wins.
+        db.rollback()
+        raise HTTPException(status_code=409, detail="此電話號碼已被登記。請改用「續會」或聯絡櫃台。")
     db.refresh(student)
     return {"member": student_to_member_dict(db, student)}
 
@@ -5581,12 +5609,12 @@ def admin_missing_receipt_registrations(
 
 
 def _hk_day_start_utc(day: date) -> datetime:
-    """[F004][S003] HK calendar midnight as naive UTC for CheckinLog.created_at filters."""
+    """[F004][S008] HK calendar midnight as naive UTC for CheckinLog.created_at filters."""
     return datetime(day.year, day.month, day.day, tzinfo=HK).astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _checkin_counts(db: Session, today: date) -> dict:
-    """[F004][S003] 簽到次數 dashboard: today, this HK month, and the last 7 HK days."""
+    """[F004][S008] 簽到次數 dashboard: today, this HK month, and the last 7 HK days."""
     today_start = _hk_day_start_utc(today)
     tomorrow_start = _hk_day_start_utc(today + timedelta(days=1))
     month_start = _hk_day_start_utc(today.replace(day=1))
@@ -5667,7 +5695,7 @@ def admin_summary(db: Session = Depends(get_db), user: AppUser = Depends(require
         .scalar()
         or 0
     )
-    # [F004][S003] Same ledger as 付款紀錄/分期 board — course seg-PIN + category plans, period counts.
+    # [F004][S008] Same ledger as 付款紀錄/分期 board — course seg-PIN + category plans, period counts.
     installment_summary = summarize_installments(build_installment_ledger(db))
     deleted_student_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     medical_clearance_pending = (
@@ -5708,7 +5736,7 @@ def admin_installments(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin_or_clerk),
 ) -> dict:
-    """[F004][S003] 分期付款學生 board: one row per course/category installment plan."""
+    """[F004][S008] 分期付款學生 board: one row per course/category installment plan."""
     rows = build_installment_ledger(db)
     summary = summarize_installments(rows)
     if only_unpaid:
