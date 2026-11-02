@@ -312,8 +312,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# [F006][S002] Upload ceiling — matches the 25MB allowance of the Vercel rewrite path.
-MAX_REQUEST_BODY_BYTES = 25 * 1024 * 1024
+# [F006][S002] Upload ceiling — matches the 100MB allowance of the Vercel rewrite path.
+MAX_REQUEST_BODY_BYTES = 100 * 1024 * 1024
 
 
 @app.middleware("http")
@@ -324,7 +324,7 @@ async def reject_oversized_body(request: Request, call_next):
         if raw_len.isdigit() and int(raw_len) > MAX_REQUEST_BODY_BYTES:
             return JSONResponse(
                 status_code=413,
-                content={"error": "payload_too_large", "message": "上載內容過大（上限 25MB）。", "details": None},
+                content={"error": "payload_too_large", "message": "上載內容過大（上限 100MB）。", "details": None},
             )
     return await call_next(request)
 
@@ -2014,7 +2014,7 @@ def _save_signature_image(data_url: str, student_id: int) -> str:
 def _apply_signature_image(student: Student, data_url: str | None) -> None:
     """[F001][S004] Persist signature PNG when provided; empty = skip (staff 候補 later)."""
     raw = (data_url or "").strip()
-    if len(raw) < 20:
+    if not raw:
         return
     prefix = "data:image/png;base64,"
     if not raw.startswith(prefix):
@@ -3472,7 +3472,7 @@ def _create_member_impl(
     if not eco_raw:
         raise HTTPException(status_code=400, detail="緊急聯絡電話須為香港 8 位手機號碼。")
     # [F001][S004] Client requires a signature at registration; staff can only re-sign from admin detail.
-    if len((payload.digital_signature or "").strip()) < 20:
+    if not (payload.digital_signature or "").strip():
         raise HTTPException(status_code=400, detail="請先於第 3 步簽署，方可提交登記。")
     deleted_ids_sq = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
     # HKID may repeat; phone is the unique identity key.

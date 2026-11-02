@@ -489,7 +489,7 @@ class CoachScheduleConfirm(BaseModel):
 
 
 class CoachSignatureUpdate(BaseModel):
-    digital_signature: str = Field(min_length=20, max_length=12_000_000)
+    digital_signature: str = Field(min_length=1, max_length=12_000_000)
 
 
 class CoachMeOut(BaseModel):
