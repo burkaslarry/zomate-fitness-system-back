@@ -76,7 +76,7 @@ def medical_clearance_payload(student: Student, file_url_fn) -> dict:
 
 
 def validate_medical_upload(file) -> None:
-    """[F001][S002] PDF or image, max 100MB — mirrors register wizard rules."""
+    """[F001][S002] PDF or image, max 3MB — mirrors register wizard rules."""
     from fastapi import HTTPException
 
     if not file or not getattr(file, "filename", None):
