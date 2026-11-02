@@ -501,9 +501,9 @@ def _build_official_receipt_pdf_bytes(
     """[F004][S002]
     Feature: Admin Reports & Financials
     Step: Official receipt PDF generation
-    Logic: A4 layout with a vector Zomate logo, mixed MSung-Light/Helvetica text, a wrapped
+    Logic: A4 layout with the company logo, mixed MSung-Light/Helvetica text, a wrapped
     description column and a reserved right-aligned amount column (no overlapping text),
-    a summary block and a signature footer.
+    a summary block and a company-chop footer.
     """
     from reportlab.lib.colors import HexColor
     from reportlab.pdfbase import pdfmetrics
@@ -588,15 +588,27 @@ def _build_official_receipt_pdf_bytes(
     canvas.setFillColor(peach)
     canvas.rect(0, height - 6, width, 6, stroke=0, fill=1)
 
-    # Header: vector logo mark + wordmark on the left, company address on the right.
-    canvas.setFillColor(ink)
-    canvas.roundRect(left, height - 84, 42, 42, 10, stroke=0, fill=1)
-    canvas.setFillColor(peach)
-    canvas.setFont("Helvetica-Bold", 26)
-    z_w = canvas.stringWidth("Z", "Helvetica-Bold", 26)
-    canvas.drawString(left + (42 - z_w) / 2, height - 74, "Z")
-    draw_text(left + 54, height - 58, "ZOMATE", 19, latin="Helvetica-Bold")
-    draw_tracked(left + 55.5, height - 72, "FITNESS LIMITED", 7.2, 1.6, muted)
+    # Header: company logo image on the left, company address on the right.
+    logo_path = Path(__file__).resolve().parent / "assets" / "zomate-logo.png"
+    if logo_path.exists():
+        canvas.drawImage(
+            ImageReader(str(logo_path)),
+            left,
+            height - 102,
+            width=56,
+            height=56,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+    else:
+        canvas.setFillColor(ink)
+        canvas.roundRect(left, height - 84, 42, 42, 10, stroke=0, fill=1)
+        canvas.setFillColor(peach)
+        canvas.setFont("Helvetica-Bold", 26)
+        z_w = canvas.stringWidth("Z", "Helvetica-Bold", 26)
+        canvas.drawString(left + (42 - z_w) / 2, height - 74, "Z")
+        draw_text(left + 54, height - 58, "ZOMATE", 19, latin="Helvetica-Bold")
+        draw_tracked(left + 55.5, height - 72, "FITNESS LIMITED", 7.2, 1.6, muted)
     canvas.setFillColor(muted)
     canvas.setFont("Helvetica", 8)
     canvas.drawRightString(right, height - 56, "Zomate Fitness Limited")
@@ -677,19 +689,32 @@ def _build_official_receipt_pdf_bytes(
     draw_text(left, 64, "Zomate Fitness Limited | 22/F, No.102 Austin Road, Tsim Sha Tsui, Kowloon", 7.5, color=muted)
 
     sign_left, sign_right = right - 170, right
-    canvas.saveState()
-    canvas.translate(sign_right - 96, footer_y + 24)
-    canvas.rotate(-5)
-    canvas.setFillColor(ink)
-    canvas.setFont("Times-Italic", 25)
-    canvas.drawString(0, 0, "Zomate")
-    canvas.setStrokeColor(ink)
-    canvas.setLineWidth(1.1)
-    path = canvas.beginPath()
-    path.moveTo(-4, -4)
-    path.curveTo(30, -12, 96, -14, 128, -2)
-    canvas.drawPath(path, stroke=1, fill=0)
-    canvas.restoreState()
+    chop_path = Path(__file__).resolve().parent / "assets" / "zomate-chop.png"
+    if chop_path.exists():
+        chop_w = 72.0
+        canvas.drawImage(
+            ImageReader(str(chop_path)),
+            (sign_left + sign_right) / 2 - chop_w / 2,
+            footer_y + 5,
+            width=chop_w,
+            height=chop_w * 244 / 284,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+    else:
+        canvas.saveState()
+        canvas.translate(sign_right - 96, footer_y + 24)
+        canvas.rotate(-5)
+        canvas.setFillColor(ink)
+        canvas.setFont("Times-Italic", 25)
+        canvas.drawString(0, 0, "Zomate")
+        canvas.setStrokeColor(ink)
+        canvas.setLineWidth(1.1)
+        path = canvas.beginPath()
+        path.moveTo(-4, -4)
+        path.curveTo(30, -12, 96, -14, 128, -2)
+        canvas.drawPath(path, stroke=1, fill=0)
+        canvas.restoreState()
     canvas.setStrokeColor(ink)
     canvas.setLineWidth(0.8)
     canvas.line(sign_left, footer_y + 4, sign_right, footer_y + 4)
