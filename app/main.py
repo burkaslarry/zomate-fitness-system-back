@@ -8931,7 +8931,7 @@ def coach_list_students(
         )
         total = int(enr.total_lessons or 0)
         used = used_by_course.get(enr.id, 0)
-        pay_status, inst_status = _coach_payment_summary(db, enr, st)
+        pay_status, inst_status, _, _ = _coach_payment_summary(db, enr, st)
         package = CoachStudentPackageOut(
             enrollment_id=enr.id,
             course_title=enr.title or "Course",
