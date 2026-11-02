@@ -3491,7 +3491,7 @@ def _create_member_impl(
     medical_label = (payload.medical_clearance_file_name or "").strip()
     if medical_file is not None and medical_file.filename:
         validate_medical_upload(medical_file)
-        medical_path = _save_upload_file(medical_file, "medical_clearance", hkid, 3 * 1024 * 1024)
+        medical_path = _save_upload_file(medical_file, "medical_clearance", hkid, 100 * 1024 * 1024)
         medical_label = medical_file.filename or medical_label
 
     clearance_status = compute_medical_clearance_status(
@@ -4104,7 +4104,7 @@ def upload_medical_clearance_by_id(
         raise HTTPException(status_code=400, detail="此學員 PAR-Q 毋須醫生證明。")
     validate_medical_upload(file)
     key = student.hkid or f"student-{student.id}"
-    path = _save_upload_file(file, "medical_clearance", key, 3 * 1024 * 1024)
+    path = _save_upload_file(file, "medical_clearance", key, 100 * 1024 * 1024)
     student.medical_clearance_path = path
     student.medical_clearance_status = compute_medical_clearance_status(parq_any_yes=True, has_file=True)
     db.add(
