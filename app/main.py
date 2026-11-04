@@ -8734,7 +8734,7 @@ def coach_student_payments(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> list[CoachStudentPaymentOut]:
-    """[F003][S003] Payment / installment overview for students on this coach's courses."""
+    """[F003][S003]/[F004][S002] Payment overview; unpaid_installment_nos for 第N期 upload buttons."""
     cid = _resolve_coach_id_param(db, user, coach_id)
     deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
