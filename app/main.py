@@ -7708,7 +7708,7 @@ def admin_courses_by_day(
 
 
 def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> CourseOut:
-    """[F002][S002] Shared course enrollment + PIN issuance for staff and coach register-course."""
+    """[F002][S002]/[S003] Shared enrollment + PIN; credits package and seeds「以上堂數」attendance."""
     if not db.query(Branch).filter(
         Branch.id == payload.branch_id,
         ~Branch.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "branches")),
@@ -7828,12 +7828,16 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                                "renewal_id": payload.payment_renewal_id}, ensure_ascii=False),
         ))
         pkg_sessions = payload.total_lessons
+        prior = min(int(getattr(payload, "lessons_already_taken", 0) or 0), int(payload.total_lessons or 0))
         credit_delta = 0
         if pkg_sessions > 0:
             # [F002][S002] Checkout (reg-course) records the payment with skip_lesson_ledger, so the
             # purchase must be credited in full here. Topping up to the balance would swallow the
             # student's unused lessons from an earlier package (e.g. 9 left + 15 bought → only 6 added).
-            checkout_credits_ledger = linked_renewal is not None and linked_renewal.student_id == student.id
+            # [F002][S003] Importing「以上堂數」also needs the full package credited before deduction.
+            checkout_credits_ledger = (
+                (linked_renewal is not None and linked_renewal.student_id == student.id) or prior > 0
+            )
             current_bal = _lesson_balance_sum(db, student.id)
             credit_delta = pkg_sessions if checkout_credits_ledger else max(0, pkg_sessions - current_bal)
             if credit_delta > 0:
@@ -7844,6 +7848,29 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                     "course_open_package",
                     created_by_role=user.role.lower(),
                 )
+        # [F002][S003] Seed prior attended lessons so package「已上堂數」matches paper records.
+        if prior > 0:
+            base_day = lesson_dates[0] - timedelta(days=1)
+            for i in range(prior):
+                day = base_day - timedelta(days=i)
+                db.add(
+                    Attendance(
+                        student_id=student.id,
+                        enrollment_id=None,
+                        coach_id=payload.coach_id,
+                        branch_id=payload.branch_id,
+                        course_id=enr.id,
+                        attended_at=datetime.combine(day, time(12, 0)),
+                        session_calendar_date=day,
+                    )
+                )
+            apply_lesson_ledger_delta(
+                db,
+                student,
+                -prior,
+                "course_prior_lessons_import",
+                created_by_role=user.role.lower(),
+            )
     if first_created is None:
         raise HTTPException(status_code=400, detail="No valid student_ids to enroll.")
     db.commit()
@@ -8609,6 +8636,11 @@ def _next_unpaid_installment_meta(enr: CourseEnrollment) -> tuple[int | None, in
     return None, None
 
 
+def _unpaid_installment_nos(enr: CourseEnrollment) -> list[int]:
+    """[F004][S002] Every unpaid installment no (1–3) for coach multi-button upload UI."""
+    return [seg.installment_no for seg in parse_segment_pins_json(enr.segment_pins_json) if not seg.paid]
+
+
 def _enrollment_receipt_source(db: Session, enr: CourseEnrollment) -> RenewalRecord | None:
     """[F004][S002] Paid renewal backing a fully paid enrollment — the official receipt money source."""
     rid = course_payment_state(enr).get("renewal_id")
@@ -8727,6 +8759,7 @@ def coach_student_payments(
         if pay_st == "Pending":
             pending_from_enrollment.add(student.id)
         next_inst, next_reminder = _next_unpaid_installment_meta(enr)
+        unpaid_nos = _unpaid_installment_nos(enr)
         out.append(
             CoachStudentPaymentOut(
                 student_id=student.id,
@@ -8740,6 +8773,7 @@ def coach_student_payments(
                 amount_total=total_amt,
                 next_installment_no=next_inst,
                 next_reminder_lesson=next_reminder,
+                unpaid_installment_nos=unpaid_nos,
                 signature_image_url=_signature_image_for_member(student),
                 receipt_available=pay_st == "Paid" and _enrollment_receipt_source(db, enr) is not None,
             )
@@ -8919,7 +8953,7 @@ def coach_list_students(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> list[CoachStudentBriefOut]:
-    """[F003][S005] Students on this coach's courses, plus /register onboarding picks."""
+    """[F003][S005]/[F008][S005] Coach roster — plain names; packages carry branch + usage."""
     cid = _resolve_coach_id_param(db, user, coach_id)
     deleted_e = _deleted_course_enrollment_ids()
     deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
@@ -8950,10 +8984,7 @@ def coach_list_students(
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
-        display = format_student_display_name(
-            st,
-            _student_home_branch_code(db, st) or (enr.branch.code if enr.branch else None),
-        )
+        # [F003][S005] Student name stays plain; branch lives on each package row.
         total = int(enr.total_lessons or 0)
         used = used_by_course.get(enr.id, 0)
         pay_status, inst_status, _, _ = _coach_payment_summary(db, enr, st)
@@ -8972,7 +9003,7 @@ def coach_list_students(
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
                 student_id=st.id,
-                full_name=display,
+                full_name=st.full_name,
                 phone=st.phone,
                 lesson_balance=_lesson_balance_sum(db, st.id),
                 enrollment_count=1,
@@ -8996,7 +9027,7 @@ def coach_list_students(
             continue
         by_student[st.id] = CoachStudentBriefOut(
             student_id=st.id,
-            full_name=format_student_display_name(st, _student_home_branch_code(db, st)),
+            full_name=st.full_name,
             phone=st.phone,
             lesson_balance=_lesson_balance_sum(db, st.id),
             enrollment_count=0,

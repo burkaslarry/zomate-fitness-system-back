@@ -407,6 +407,8 @@ class CoachUpdate(BaseModel):
 
 
 class CourseCreate(BaseModel):
+    """[F002][S003] Register/open a course package — total_lessons + optional lessons_already_taken."""
+
     title: str = Field(min_length=1, max_length=200)
     branch_id: int
     coach_id: int
@@ -418,6 +420,8 @@ class CourseCreate(BaseModel):
     lesson_weekdays: list[int] = Field(default_factory=lambda: [0])
     # [F002][S003] Coach/staff may set any package size when registering a course for a student.
     total_lessons: int = Field(default=10, ge=1, le=999)
+    # [F002][S003] Lessons already taken before this package was entered into the system.
+    lessons_already_taken: int = Field(default=0, ge=0, le=998)
     # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
     total_installments: int = Field(default=1, ge=1, le=3)
     # Optional HKD split per installment (length must match total_installments when set).
@@ -452,6 +456,8 @@ class CourseCreate(BaseModel):
     def validate_installments_vs_lessons(self) -> "CourseCreate":
         if self.total_installments > self.total_lessons:
             raise ValueError("total_installments cannot exceed total_lessons.")
+        if self.lessons_already_taken > self.total_lessons:
+            raise ValueError("lessons_already_taken cannot exceed total_lessons.")
         if self.installment_amounts is not None:
             if len(self.installment_amounts) != self.total_installments:
                 raise ValueError("installment_amounts length must match total_installments.")
@@ -513,6 +519,8 @@ class CoachPendingStudentOut(BaseModel):
 
 
 class CoachStudentPaymentOut(BaseModel):
+    """[F004][S002] Coach payments tab row — unpaid_installment_nos drives 第N期 upload buttons."""
+
     student_id: int
     student_name: str
     student_phone: str
@@ -524,6 +532,8 @@ class CoachStudentPaymentOut(BaseModel):
     amount_total: float | None = None
     next_installment_no: int | None = None
     next_reminder_lesson: int | None = None
+    # [F004][S002] All unpaid tranche numbers so coach UI can offer 第2／第3期 upload buttons.
+    unpaid_installment_nos: list[int] = Field(default_factory=list)
     signature_image_url: str | None = None
     receipt_available: bool = False
 
