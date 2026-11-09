@@ -129,6 +129,7 @@ from .schemas import (
     CoachSessionRescheduleBody,
     CoachTrialGrantBody,
     CoachUpdate,
+    CategoryInstallmentConfirm,
     CourseCategoryCreate,
     CourseCategoryAdminUpdate,
     CourseAssignCoach,
@@ -185,8 +186,10 @@ from .medical_clearance import (
     validate_medical_upload,
 )
 from .payment_notifications import (
+    _mark_category_installment_paid,
     apply_receipt_payment_match,
     format_student_display_name,
+    mark_category_installment_pending,
     send_checkin_coach_whatsapp,
     send_checkin_student_whatsapp,
     send_payment_whatsapp_notifications,
@@ -1263,7 +1266,8 @@ def _save_member_receipt_row(
     needs_course_scope = (
         installment_no is not None or full_payment or installment_plan_id is not None
     )
-    if course_enrollment_id is None:
+    # [F004][S002] A category installment plan owns its own periods — never infer a Course.
+    if course_enrollment_id is None and installment_plan_id is None:
         courses = db.query(CourseEnrollment).filter(
             CourseEnrollment.student_id == student.id,
             ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
@@ -1313,6 +1317,17 @@ def _save_member_receipt_row(
         amount=amount,
         full_payment=full_payment,
     ) if payment_confirmed else {"installment_marked_paid": False, "pending_admin_confirmation": True}
+    # [F004][S002] Category plans keep the proof on the period row until Admin confirms.
+    if installment_plan_id is not None and installment_no is not None and not payment_confirmed:
+        mark_category_installment_pending(
+            db,
+            student_id=student.id,
+            plan_id=installment_plan_id,
+            installment_no=installment_no,
+            receipt_id=receipt.id,
+            amount=amount,
+        )
+        match_result["proof_pending_confirmation"] = True
     db.add(
         AuditLog(
             action="receipt_upload",
@@ -2499,6 +2514,20 @@ def _migrate_attendance_ledger_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_installment_proof_columns(db: Session) -> None:
+    """[F004][S002] Category installment proof upload state (coach uploads, Admin confirms)."""
+    stmts = [
+        "ALTER TABLE zomate_fs_installment_payments ADD COLUMN IF NOT EXISTS proof_receipt_id INTEGER NULL",
+        "ALTER TABLE zomate_fs_installment_payments ADD COLUMN IF NOT EXISTS proof_uploaded_at TIMESTAMP NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def _migrate_medical_clearance_columns(db: Session) -> None:
     """[F001][S002] PAR-Q JSON + medical clearance status/path on students."""
     stmts = [
@@ -3028,6 +3057,7 @@ def _sync_startup() -> None:
         _migrate_enrollment_merged_columns(db)
         _migrate_management_columns(db)
         _migrate_medical_clearance_columns(db)
+        _migrate_installment_proof_columns(db)
         _migrate_member_profile_columns(db)
         _migrate_attendance_ledger_columns(db)
         _backfill_medical_clearance_columns(db)
@@ -3834,6 +3864,10 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
                                 "due_date": pay.due_date.isoformat(),
                                 "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
                                 "status": pay.status,
+                                "proof_receipt_id": pay.proof_receipt_id,
+                                "proof_uploaded_at": (
+                                    pay.proof_uploaded_at.isoformat() if pay.proof_uploaded_at else None
+                                ),
                             }
                             for pay in sorted(plan.payments, key=lambda p: p.installment_no)
                         ],
@@ -5934,6 +5968,90 @@ def admin_installments(
     if only_unpaid:
         rows = [r for r in rows if r["unpaid_installments"] > 0]
     return {"rows": rows, "summary": summary}
+
+
+@app.patch("/api/admin/installment-plans/{plan_id}/payments/{installment_no}/confirm")
+def admin_confirm_category_installment(
+    plan_id: int,
+    installment_no: int,
+    payload: CategoryInstallmentConfirm | None = None,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Admin 確認付款 for a coach-uploaded category installment proof
+    Logic: Mark that period paid once, then notify student/coach with the confirmed status.
+    """
+    plan = db.query(InstallmentPlan).filter(InstallmentPlan.id == plan_id).first()
+    if plan is None:
+        raise HTTPException(status_code=404, detail="Installment plan not found.")
+    enrollment = db.get(CategoryEnrollment, plan.enrollment_id)
+    if enrollment is None:
+        raise HTTPException(status_code=404, detail="Category enrollment not found.")
+    student = db.get(Student, enrollment.student_id)
+    if student is None or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    pay = (
+        db.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan_id,
+            InstallmentPayment.installment_no == installment_no,
+        )
+        .with_for_update()
+        .first()
+    )
+    if pay is None:
+        raise HTTPException(status_code=404, detail="Installment payment row not found.")
+    if pay.paid_at is not None:
+        return {
+            "ok": True,
+            "already_paid": True,
+            "payment_id": pay.id,
+            "installment_plan_id": plan_id,
+            "installment_no": installment_no,
+            "paid_at": pay.paid_at.isoformat(),
+        }
+    amount = payload.amount if payload is not None and payload.amount is not None else None
+    if amount is None and pay.amount:
+        amount = float(pay.amount)
+    _mark_category_installment_paid(db, plan_id, installment_no, amount)
+    db.add(
+        AuditLog(
+            action="category_installment_confirmed",
+            student_id=student.id,
+            detail=json.dumps(
+                {
+                    "installment_plan_id": plan_id,
+                    "installment_no": installment_no,
+                    "proof_receipt_id": pay.proof_receipt_id,
+                    "amount": amount,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    record_activity(db, student, "admin_confirm_installment_payment", plan_id)
+    db.commit()
+    whatsapp = send_payment_whatsapp_notifications(
+        db,
+        log_whatsapp,
+        student=student,
+        receipt_confirmed=True,
+        notify_coach=True,
+        installment_plan_id=plan_id,
+        installment_no=installment_no,
+        amount=amount,
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "payment_id": pay.id,
+        "installment_plan_id": plan_id,
+        "installment_no": installment_no,
+        "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
+        "whatsapp": whatsapp,
+    }
 
 
 
@@ -8817,6 +8935,12 @@ def coach_student_payments(
             pending_from_enrollment.add(student.id)
         next_inst, next_reminder = _next_unpaid_installment_meta(enr)
         unpaid_nos = _unpaid_installment_nos(enr)
+        pending_nos: list[int] = []
+        for key in (course_payment_state(enr).get("pending_payments") or {}).keys():
+            try:
+                pending_nos.append(int(key))
+            except (TypeError, ValueError):
+                continue
         out.append(
             CoachStudentPaymentOut(
                 student_id=student.id,
@@ -8831,10 +8955,66 @@ def coach_student_payments(
                 next_installment_no=next_inst,
                 next_reminder_lesson=next_reminder,
                 unpaid_installment_nos=unpaid_nos,
+                pending_installment_nos=sorted(pending_nos),
                 signature_image_url=_signature_image_for_member(student),
                 receipt_available=pay_st == "Paid" and _enrollment_receipt_source(db, enr) is not None,
             )
         )
+    # [F004][S002] Category installment plans for students this coach teaches — 第2／第3期 uploads.
+    if seen_student_ids:
+        category_plans = (
+            db.query(InstallmentPlan)
+            .options(
+                joinedload(InstallmentPlan.payments),
+                joinedload(InstallmentPlan.enrollment).joinedload(CategoryEnrollment.course_category),
+                joinedload(InstallmentPlan.enrollment).joinedload(CategoryEnrollment.student),
+            )
+            .filter(
+                InstallmentPlan.status == "active",
+                InstallmentPlan.enrollment.has(
+                    CategoryEnrollment.student_id.in_(seen_student_ids)
+                ),
+            )
+            .all()
+        )
+        for plan in category_plans:
+            enrollment = plan.enrollment
+            if enrollment is None or enrollment.student is None:
+                continue
+            student = enrollment.student
+            periods = sorted(plan.payments or [], key=lambda p: p.installment_no)
+            if not periods:
+                continue
+            paid_periods = [p for p in periods if p.paid_at is not None]
+            unpaid_periods = [p for p in periods if p.paid_at is None]
+            total_n = len(periods)
+            paid_n = len(paid_periods)
+            inst_label = "全數已付" if not unpaid_periods else f"第{paid_n}/{total_n}期已付"
+            out.append(
+                CoachStudentPaymentOut(
+                    student_id=student.id,
+                    student_name=student.full_name,
+                    student_phone=student.phone,
+                    course_id=0,
+                    course_title=(
+                        f"{enrollment.course_category.name if enrollment.course_category else '課程種類'} · 分期"
+                    ),
+                    payment_status="Paid" if not unpaid_periods else "Pending",
+                    installment_status=inst_label,
+                    amount_paid=round(sum(float(p.amount or 0) for p in paid_periods), 2),
+                    amount_total=round(sum(float(p.amount or 0) for p in periods), 2),
+                    next_installment_no=(
+                        unpaid_periods[0].installment_no if unpaid_periods else None
+                    ),
+                    unpaid_installment_nos=[p.installment_no for p in unpaid_periods],
+                    pending_installment_nos=[
+                        p.installment_no for p in unpaid_periods if p.proof_receipt_id is not None
+                    ],
+                    installment_plan_id=plan.id,
+                    installment_source="category",
+                    signature_image_url=_signature_image_for_member(student),
+                )
+            )
     # [F004][S003] Surface renewals logged under this coach but missing receipt upload.
     missing_receipt_renewals = (
         db.query(RenewalRecord)
@@ -8960,15 +9140,18 @@ def coach_upload_student_receipt(
     note: str | None = Form(default=None),
     course_enrollment_id: int | None = Form(default=None),
     installment_no: int | None = Form(default=None),
+    installment_plan_id: int | None = Form(default=None),
     full_payment: str | None = Form(default="false"),
     send_whatsapp: str | None = Form(default="true"),
     coach_id: int | None = Form(default=None),
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> dict:
-    """[F004][S002] Coach uploads receipt and maps it to full pay or installment 1–3."""
+    """[F004][S002] Coach uploads a course or category installment proof; Admin confirms payment."""
     cid = _resolve_coach_id_param(db, user, coach_id)
     student = _coach_require_student_access(db, user, cid, student_id)
+    if course_enrollment_id is not None and installment_plan_id is not None:
+        raise HTTPException(status_code=400, detail="請選擇 Course 或分期計劃其中之一。")
     if course_enrollment_id is not None:
         enr = (
             db.query(CourseEnrollment)
@@ -8981,7 +9164,16 @@ def coach_upload_student_receipt(
         )
         if enr is None or _is_deleted(db, "course_enrollments", course_enrollment_id):
             raise HTTPException(status_code=404, detail="Course enrollment not found for this coach/student.")
-    if installment_no is not None and not 1 <= installment_no <= 3:
+    if installment_plan_id is not None:
+        plan = db.get(InstallmentPlan, installment_plan_id)
+        enrollment = db.get(CategoryEnrollment, plan.enrollment_id) if plan else None
+        if plan is None or enrollment is None or enrollment.student_id != student_id:
+            raise HTTPException(status_code=404, detail="Installment plan not found for this coach/student.")
+        if installment_no is not None and not 1 <= installment_no <= plan.total_installments:
+            raise HTTPException(status_code=400, detail="installment_no is outside this installment plan.")
+    if installment_no is not None and installment_no < 1:
+        raise HTTPException(status_code=400, detail="installment_no must be 1 or above.")
+    if installment_no is not None and installment_plan_id is None and installment_no > 3:
         raise HTTPException(status_code=400, detail="installment_no must be 1, 2, or 3.")
     result = _save_member_receipt_row(
         db,
@@ -8995,11 +9187,12 @@ def coach_upload_student_receipt(
         source="RENEWAL",
         installment_no=installment_no,
         course_enrollment_id=course_enrollment_id,
+        installment_plan_id=installment_plan_id,
         full_payment=_form_bool(full_payment, default=False),
         send_whatsapp=_form_bool(send_whatsapp),
         notify_coach=True,
     )
-    record_activity(db, student, "coach_receipt_upload", course_enrollment_id)
+    record_activity(db, student, "coach_receipt_upload", course_enrollment_id or installment_plan_id)
     db.commit()
     return result
 

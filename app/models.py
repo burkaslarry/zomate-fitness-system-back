@@ -232,6 +232,11 @@ class InstallmentPayment(Base):
     due_date: Mapped[date] = mapped_column(DateColumn, nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    # [F004][S002] Uploaded proof is evidence only; paid_at/status change after Admin confirms.
+    proof_receipt_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_receipts.id", ondelete="SET NULL"), nullable=True
+    )
+    proof_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     plan: Mapped["InstallmentPlan"] = relationship(back_populates="payments")

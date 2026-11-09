@@ -92,10 +92,49 @@ def _index_course_links_by_renewal(db: Session, student_ids: list[int]) -> dict[
     return by_renewal
 
 
+def _linked_installment_receipt_ids(db: Session, student_ids: list[int]) -> set[int]:
+    """[F004][S002] Proof receipts already shown on an installment row — never repeat as paid receipts."""
+    from .course_payment_state import course_payment_state
+    from .models import (
+        CategoryEnrollment,
+        CourseEnrollment,
+        InstallmentPayment,
+        InstallmentPlan,
+    )
+
+    ids: set[int] = set()
+    for enr in (
+        db.query(CourseEnrollment).filter(CourseEnrollment.student_id.in_(student_ids)).all()
+    ):
+        state = course_payment_state(enr)
+        for bucket in (state.get("payments") or {}, state.get("pending_payments") or {}):
+            if not isinstance(bucket, dict):
+                continue
+            for entry in bucket.values():
+                rid = entry.get("receipt_id") if isinstance(entry, dict) else None
+                if rid:
+                    try:
+                        ids.add(int(rid))
+                    except (TypeError, ValueError):
+                        continue
+    for pay in (
+        db.query(InstallmentPayment)
+        .join(InstallmentPlan, InstallmentPayment.installment_plan_id == InstallmentPlan.id)
+        .join(CategoryEnrollment, InstallmentPlan.enrollment_id == CategoryEnrollment.id)
+        .filter(CategoryEnrollment.student_id.in_(student_ids))
+        .all()
+    ):
+        if pay.proof_receipt_id:
+            ids.add(int(pay.proof_receipt_id))
+    return ids
+
+
 def payment_created_at_iso(dt: datetime | None) -> str:
     """[F004][S002] Serialize naive UTC ``created_at`` as Asia/Hong_Kong ISO (+08:00)."""
     if dt is None:
         return ""
+    if not isinstance(dt, datetime):
+        dt = datetime(dt.year, dt.month, dt.day)
     return utc_to_hk(dt).isoformat()
 
 _ONBOARDING_COACH_RE = re.compile(r"Onboarding coach=([^\s,]+)", re.I)
@@ -449,8 +488,9 @@ def build_payment_records(
         .all()
     )
     linked_receipt_ids = {r.receipt_id for r in renewals if r.receipt_id}
+    linked_proof_receipt_ids = _linked_installment_receipt_ids(db, student_ids)
     for rec in standalone_receipts:
-        if rec.id in linked_receipt_ids:
+        if rec.id in linked_receipt_ids or rec.id in linked_proof_receipt_ids:
             continue
         st = students.get(rec.student_id)
         if not st:
@@ -488,6 +528,22 @@ def build_payment_records(
         .filter(CategoryEnrollment.student_id.in_(student_ids))
         .all()
     )
+    cat_proof_ids = {
+        int(pay.proof_receipt_id)
+        for ce in cat_rows
+        for plan in ce.installment_plans or []
+        for pay in plan.payments or []
+        if pay.proof_receipt_id
+    }
+    proof_receipt_map = {}
+    if cat_proof_ids:
+        for rec in (
+            db.query(Receipt)
+            .filter(Receipt.id.in_(cat_proof_ids))
+            .filter(~Receipt.id.in_(deleted_receipt_ids))
+            .all()
+        ):
+            proof_receipt_map[rec.id] = rec
     for ce in cat_rows:
         st = students.get(ce.student_id)
         if not st:
@@ -496,7 +552,13 @@ def build_payment_records(
             if plan.status != "active":
                 continue
             for pay in sorted(plan.payments or [], key=lambda p: p.installment_no):
-                pay_status: PaymentRecordStatus = "paid" if pay.paid_at else "outstanding"
+                if pay.paid_at:
+                    pay_status: PaymentRecordStatus = "paid"
+                elif pay.proof_receipt_id:
+                    pay_status = "pending_confirmation"
+                else:
+                    pay_status = "outstanding"
+                proof = proof_receipt_map.get(pay.proof_receipt_id) if pay.proof_receipt_id else None
                 rows.append(
                     {
                         "id": f"installment-{pay.id}",
@@ -516,11 +578,12 @@ def build_payment_records(
                         "category_enrollment_id": ce.id,
                         "due_date": pay.due_date.isoformat() if pay.due_date else None,
                         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
-                        "receipt_id": None,
-                        "receipt_url": None,
-                        "receipt_file_path": None,
+                        "receipt_id": proof.id if proof else None,
+                        "receipt_url": file_url_fn(proof.file_path) if proof and file_url_fn else None,
+                        "receipt_file_path": proof.file_path if proof else None,
+                        "download_url": f"/api/receipts/{proof.id}/download" if proof else None,
                         "created_at": payment_created_at_iso(
-                            pay.paid_at or pay.due_date or ce.started_at
+                            pay.paid_at or pay.proof_uploaded_at or pay.due_date or ce.started_at
                         ),
                         **_branch_fields(st.branch_id),
                     }
@@ -573,7 +636,15 @@ def build_sales_report_rows(db: Session) -> list[dict]:
         else:
             pay = status.upper() if status else "—"
         if r.get("record_type") == "installment":
-            inst = "進行中" if status == "outstanding" else ("已付" if status == "paid" else "—")
+            inst = (
+                "進行中"
+                if status == "outstanding"
+                else "已付"
+                if status == "paid"
+                else "待確認"
+                if status == "pending_confirmation"
+                else "—"
+            )
         elif r.get("installment_no"):
             inst = f"第{r['installment_no']}期"
         else:

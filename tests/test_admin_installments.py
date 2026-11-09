@@ -6,6 +6,7 @@ from datetime import date, datetime
 from app import main
 from app.installments import build_installment_ledger, summarize_installments
 from app.models import (
+    AppUser,
     Branch,
     CategoryEnrollment,
     CheckinLog,
@@ -18,6 +19,8 @@ from app.models import (
     Receipt,
     Student,
 )
+from app.payment_notifications import mark_category_installment_pending
+from app.payment_records import build_payment_records
 
 
 def _seed(db):
@@ -216,3 +219,141 @@ def test_checkin_counts_use_hk_day_and_month_boundaries(db_session):
         {"date": "2026-03-14", "count": 1},
         {"date": "2026-03-15", "count": 1},
     ]
+
+
+def _seed_alice_category_plan(db_session, alice):
+    """[F004][S002] Coach's student has a 3-period category plan; period 1 is already paid."""
+    category = db_session.query(CourseCategory).first()
+    enrollment = CategoryEnrollment(
+        student_id=alice.id,
+        course_category_id=category.id,
+        started_at=date(2026, 10, 1),
+        total_lessons=30,
+    )
+    db_session.add(enrollment)
+    db_session.flush()
+    plan = InstallmentPlan(enrollment_id=enrollment.id, total_installments=3, status="active")
+    db_session.add(plan)
+    db_session.flush()
+    for no in (1, 2, 3):
+        db_session.add(
+            InstallmentPayment(
+                installment_plan_id=plan.id,
+                installment_no=no,
+                amount=1000,
+                due_date=date(2026, 10, 1),
+                paid_at=datetime(2026, 10, 2) if no == 1 else None,
+                status="paid" if no == 1 else "pending",
+            )
+        )
+    db_session.commit()
+    return plan
+
+
+def test_coach_payments_include_category_installments_awaiting_admin(db_session):
+    """[F004][S002] Coach sees 第2／第3期 category upload buttons; proof alone never marks paid."""
+    alice, _bob = _seed(db_session)
+    plan = _seed_alice_category_plan(db_session, alice)
+    coach = db_session.query(Coach).first()
+    admin = AppUser(username="ops", role="ADMIN", password_salt="", password_hash="")
+
+    rows = main.coach_student_payments(coach_id=coach.id, db=db_session, user=admin)
+    category = next(r for r in rows if r.installment_plan_id == plan.id)
+    assert category.course_id == 0
+    assert category.unpaid_installment_nos == [2, 3]
+    assert category.pending_installment_nos == []
+
+    proof = Receipt(
+        student_id=alice.id,
+        member_hkid="A7654321",
+        file_path="receipts/A7654321/installment-2.png",
+        amount=1000,
+        source="RENEWAL",
+    )
+    db_session.add(proof)
+    db_session.flush()
+    mark_category_installment_pending(
+        db_session,
+        student_id=alice.id,
+        plan_id=plan.id,
+        installment_no=2,
+        receipt_id=proof.id,
+        amount=1000,
+    )
+    db_session.commit()
+
+    rows = main.coach_student_payments(coach_id=coach.id, db=db_session, user=admin)
+    category = next(r for r in rows if r.installment_plan_id == plan.id)
+    assert category.pending_installment_nos == [2]
+    period = next(
+        r
+        for r in build_installment_ledger(db_session)
+        if r["installment_plan_id"] == plan.id
+    )["periods"][1]
+    assert period["pending_confirmation"] is True
+    assert period["paid"] is False
+
+    records = build_payment_records(db_session, student_id=alice.id)
+    installment = next(
+        r
+        for r in records
+        if r["record_type"] == "installment" and r["installment_plan_id"] == plan.id and r["installment_no"] == 2
+    )
+    assert installment["status"] == "pending_confirmation"
+    assert installment["receipt_id"] == proof.id
+    assert all(r["id"] != f"receipt-{proof.id}" for r in records)
+
+
+def test_admin_confirm_category_installment_marks_paid(db_session, monkeypatch):
+    """[F004][S002] Admin 確認付款 turns a pending category proof into a paid period."""
+    alice, _bob = _seed(db_session)
+    plan = _seed_alice_category_plan(db_session, alice)
+    proof = Receipt(
+        student_id=alice.id,
+        member_hkid="A7654321",
+        file_path="receipts/A7654321/installment-2.png",
+        amount=1000,
+        source="RENEWAL",
+    )
+    db_session.add(proof)
+    db_session.flush()
+    mark_category_installment_pending(
+        db_session,
+        student_id=alice.id,
+        plan_id=plan.id,
+        installment_no=2,
+        receipt_id=proof.id,
+        amount=1200,
+    )
+    db_session.commit()
+    monkeypatch.setattr(main, "send_payment_whatsapp_notifications", lambda *args, **kwargs: {})
+    admin = AppUser(username="ops", role="ADMIN", password_salt="", password_hash="")
+
+    result = main.admin_confirm_category_installment(
+        plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
+    )
+    assert result["ok"] is True
+    pay = (
+        db_session.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan.id,
+            InstallmentPayment.installment_no == 2,
+        )
+        .first()
+    )
+    assert pay.status == "paid"
+    assert pay.paid_at is not None
+    assert float(pay.amount) == 1200
+
+    again = main.admin_confirm_category_installment(
+        plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
+    )
+    assert again["already_paid"] is True
+
+    period = next(
+        r
+        for r in build_installment_ledger(db_session)
+        if r["installment_plan_id"] == plan.id
+    )["periods"][1]
+    assert period["paid"] is True
+    assert period["pending_confirmation"] is False

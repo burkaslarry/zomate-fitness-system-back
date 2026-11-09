@@ -46,6 +46,7 @@ def _course_periods(enr, paid_at_by_receipt: dict[int, str]) -> list[dict]:
     if not isinstance(segments, list):
         return []
     payments = course_payment_state(enr).get("payments") or {}
+    pending = course_payment_state(enr).get("pending_payments") or {}
     periods: list[dict] = []
     for segment in sorted(
         (s for s in segments if isinstance(s, dict)), key=lambda s: int(s.get("installment_no") or 0)
@@ -58,6 +59,7 @@ def _course_periods(enr, paid_at_by_receipt: dict[int, str]) -> list[dict]:
             continue
         paid = _segment_paid(segment)
         receipt_id = (payments.get(f"installment:{no}") or {}).get("receipt_id")
+        pending_entry = pending.get(str(no)) or (pending.get("full") if no == 1 else None)
         periods.append(
             {
                 "installment_no": no,
@@ -67,6 +69,9 @@ def _course_periods(enr, paid_at_by_receipt: dict[int, str]) -> list[dict]:
                 "due_date": None,
                 "lesson_from": segment.get("lesson_from"),
                 "lesson_to": segment.get("lesson_to"),
+                # [F004][S002] Proof uploaded by coach — Admin 確認付款 still pending.
+                "proof_receipt_id": (pending_entry or {}).get("receipt_id"),
+                "pending_confirmation": (not paid) and bool(pending_entry),
             }
         )
     return periods
@@ -83,6 +88,9 @@ def _category_periods(plan) -> list[dict]:
             "due_date": pay.due_date.isoformat() if pay.due_date else None,
             "lesson_from": None,
             "lesson_to": None,
+            # [F004][S002] Coach-uploaded proof waits for the Admin confirmation button.
+            "proof_receipt_id": pay.proof_receipt_id,
+            "pending_confirmation": pay.paid_at is None and pay.proof_receipt_id is not None,
         }
         for pay in sorted(plan.payments or [], key=lambda p: p.installment_no)
     ]

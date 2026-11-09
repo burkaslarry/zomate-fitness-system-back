@@ -119,6 +119,43 @@ def _mark_category_installment_paid(
     return pay
 
 
+def mark_category_installment_pending(
+    db: Session,
+    *,
+    student_id: int,
+    plan_id: int,
+    installment_no: int,
+    receipt_id: int | None,
+    amount: float | None = None,
+) -> InstallmentPayment:
+    """[F004][S002] Attach proof to a category installment without confirming the money."""
+    plan = (
+        db.query(InstallmentPlan)
+        .options(joinedload(InstallmentPlan.enrollment))
+        .filter(InstallmentPlan.id == plan_id)
+        .first()
+    )
+    if plan is None or plan.enrollment is None or plan.enrollment.student_id != student_id:
+        raise HTTPException(status_code=404, detail="Installment plan not found for this student.")
+    pay = (
+        db.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan_id,
+            InstallmentPayment.installment_no == installment_no,
+        )
+        .first()
+    )
+    if pay is None:
+        raise HTTPException(status_code=404, detail="Installment payment row not found.")
+    if pay.paid_at is not None:
+        return pay
+    pay.proof_receipt_id = receipt_id
+    pay.proof_uploaded_at = datetime.utcnow()
+    if amount is not None and amount > 0:
+        pay.amount = amount
+    return pay
+
+
 def apply_receipt_payment_match(
     db: Session,
     *,

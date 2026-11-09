@@ -534,6 +534,10 @@ class CoachStudentPaymentOut(BaseModel):
     next_reminder_lesson: int | None = None
     # [F004][S002] All unpaid tranche numbers so coach UI can offer 第2／第3期 upload buttons.
     unpaid_installment_nos: list[int] = Field(default_factory=list)
+    # [F004][S002] Category installment plan row (course_id=0) — proof uploads await Admin confirm.
+    installment_plan_id: int | None = None
+    installment_source: str = "course"
+    pending_installment_nos: list[int] = Field(default_factory=list)
     signature_image_url: str | None = None
     receipt_available: bool = False
 
@@ -687,6 +691,12 @@ class CourseInstallmentReminderUpdate(BaseModel):
     student_id: int = Field(ge=1)
     installment_no: int = Field(ge=1, le=3)
     reminder_lesson: int = Field(ge=1, le=999)
+
+
+class CategoryInstallmentConfirm(BaseModel):
+    """[F004][S002] Admin confirms a coach-uploaded category installment proof."""
+
+    amount: float | None = Field(default=None, ge=0)
 
 
 class CourseEnrollmentOut(BaseModel):
