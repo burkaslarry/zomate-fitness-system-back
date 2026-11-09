@@ -7154,42 +7154,81 @@ _STUDENT_CSV_HEADERS = [
 ]
 
 
+def _students_for_admin_export(db: Session, coach_id: int | None = None) -> list[Student]:
+    """[F001][S003] Active roster for CSV/Excel export; optional coach roster filter."""
+    deleted_s = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")
+    q = db.query(Student).filter(~Student.id.in_(deleted_s)).order_by(Student.id)
+    if coach_id is not None:
+        roster = (
+            select(CourseEnrollment.student_id)
+            .where(
+                CourseEnrollment.coach_id == coach_id,
+                ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+            )
+            .distinct()
+        )
+        q = q.filter(Student.id.in_(roster))
+    return q.all()
+
+
+def _student_system_row(db: Session, s: Student) -> list:
+    return [
+        s.full_name,
+        s.phone,
+        s.hkid or "",
+        s.gender or "",
+        s.date_of_birth.isoformat() if s.date_of_birth else "",
+        s.email or "",
+        s.health_notes or "",
+        "1" if s.disclaimer_accepted else "0",
+        _lesson_balance_sum(db, s.id),
+        s.emergency_contact_name or "",
+        s.emergency_contact_relationship or "",
+        s.emergency_contact_phone or "",
+        s.face_id_external or "",
+        s.created_at.isoformat(),
+    ]
+
+
 @app.get("/api/admin/students/export.csv")
 def export_students_csv(
+    coach_id: int | None = Query(default=None),
     db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
 ) -> PlainTextResponse:
     """[F001][S003] System-format student CSV (includes gender + emergency contacts)."""
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(_STUDENT_CSV_HEADERS)
-    for s in (
-        db.query(Student)
-        .filter(~Student.id.in_(select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "students")))
-        .order_by(Student.id)
-        .all()
-    ):
-        w.writerow(
-            [
-                s.full_name,
-                s.phone,
-                s.hkid or "",
-                s.gender or "",
-                s.date_of_birth.isoformat() if s.date_of_birth else "",
-                s.email or "",
-                s.health_notes or "",
-                "1" if s.disclaimer_accepted else "0",
-                _lesson_balance_sum(db, s.id),
-                s.emergency_contact_name or "",
-                s.emergency_contact_relationship or "",
-                s.emergency_contact_phone or "",
-                s.face_id_external or "",
-                s.created_at.isoformat(),
-            ]
-        )
+    for s in _students_for_admin_export(db, coach_id):
+        w.writerow(_student_system_row(db, s))
     return PlainTextResponse(
         buf.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="students.csv"'},
+    )
+
+
+@app.get("/api/admin/students/export.xlsx")
+def export_students_xlsx(
+    coach_id: int | None = Query(default=None),
+    db: Session = Depends(get_db), user: AppUser = Depends(require_admin_or_clerk)
+) -> Response:
+    """[F001][S003] Student roster as a real Excel workbook (same columns as the CSV)."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "學生資料"
+    ws.append(_STUDENT_CSV_HEADERS)
+    for s in _students_for_admin_export(db, coach_id):
+        ws.append(_student_system_row(db, s))
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="students.xlsx"'},
     )
 
 
