@@ -859,7 +859,15 @@ class CourseCategoryCreate(BaseModel):
 class StudentCategoryEnrollmentCreate(BaseModel):
     course_category_id: int
     total_lessons: int = Field(ge=1, le=999)
-    total_installments: int = Field(default=3, ge=1, le=3)
+    total_installments: int = Field(default=3, ge=1, le=5)
+    # [F002][S003] Lessons already taken before the paper package was entered here.
+    lessons_already_taken: int = Field(default=0, ge=0, le=998)
+
+    @model_validator(mode="after")
+    def validate_prior_lessons(self) -> "StudentCategoryEnrollmentCreate":
+        if self.lessons_already_taken > self.total_lessons:
+            raise ValueError("lessons_already_taken cannot exceed total_lessons.")
+        return self
 
 
 class CoachTrialGrantBody(BaseModel):

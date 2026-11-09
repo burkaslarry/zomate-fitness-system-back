@@ -6041,6 +6041,54 @@ def admin_patch_course_category(
     }
 
 
+def _category_prior_lessons_imported(db: Session, student_id: int, enrollment_id: int) -> int:
+    """[F002][S003] Sum of「以上堂數」already imported for one category enrollment."""
+    total = 0
+    rows = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.action == "category_prior_lessons_import",
+            AuditLog.student_id == student_id,
+        )
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, ValueError):
+            continue
+        if int(detail.get("enrollment_id") or 0) == enrollment_id:
+            total += int(detail.get("delta") or 0)
+    return max(0, total)
+
+
+def _apply_category_prior_lessons(
+    db: Session, student: Student, enrollment: CategoryEnrollment, prior: int, role: str
+) -> None:
+    """[F002][S003] Deduct imported「以上堂數」once; re-saves only apply the difference."""
+    diff = int(prior) - _category_prior_lessons_imported(db, student.id, enrollment.id)
+    if diff == 0:
+        return
+    apply_lesson_ledger_delta(
+        db,
+        student,
+        -diff,
+        "admin_category_prior_lessons_import",
+        enrollment_id=enrollment.id,
+        created_by_role=role,
+    )
+    db.add(
+        AuditLog(
+            action="category_prior_lessons_import",
+            student_id=student.id,
+            detail=json.dumps(
+                {"enrollment_id": enrollment.id, "delta": diff, "total_prior": int(prior)},
+                ensure_ascii=False,
+            ),
+        )
+    )
+
+
 @app.post("/api/admin/students/{student_id}/category-enrollment")
 def admin_upsert_category_enrollment(
     student_id: int,
@@ -6075,10 +6123,12 @@ def admin_upsert_category_enrollment(
                 enrollment_id=existing.id,
                 created_by_role=role,
             )
+        _apply_category_prior_lessons(db, student, existing, payload.lessons_already_taken, role)
         db.commit()
         return {
             "enrollment_id": existing.id,
             "total_lessons": existing.total_lessons,
+            "lessons_already_taken": _category_prior_lessons_imported(db, student.id, existing.id),
             "lesson_balance": _lesson_balance_sum(db, student.id),
         }
 
@@ -6101,12 +6151,18 @@ def admin_upsert_category_enrollment(
         enrollment_id=enr.id,
         created_by_role=role,
     )
+    _apply_category_prior_lessons(db, student, enr, payload.lessons_already_taken, role)
     db.add(
         AuditLog(
             action="category_enrollment_create",
             student_id=student.id,
             detail=json.dumps(
-                {"enrollment_id": enr.id, "category_id": payload.course_category_id, "lessons": payload.total_lessons},
+                {
+                    "enrollment_id": enr.id,
+                    "category_id": payload.course_category_id,
+                    "lessons": payload.total_lessons,
+                    "lessons_already_taken": payload.lessons_already_taken,
+                },
                 ensure_ascii=False,
             ),
         )
@@ -6116,6 +6172,7 @@ def admin_upsert_category_enrollment(
     return {
         "enrollment_id": enr.id,
         "total_lessons": enr.total_lessons,
+        "lessons_already_taken": _category_prior_lessons_imported(db, student.id, enr.id),
         "lesson_balance": _lesson_balance_sum(db, student.id),
     }
 
