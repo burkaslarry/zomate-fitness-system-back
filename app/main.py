@@ -1441,7 +1441,7 @@ def allocate_enrollment_pin(
 def _lesson_segment_ranges(total_lessons: int, n_segments: int) -> list[tuple[int, int]]:
     """Inclusive 1-based lesson indices per installment (split remainder across first tranches)."""
     tl = max(10, total_lessons)
-    n = max(1, min(3, n_segments))
+    n = max(1, min(5, n_segments))
     if n == 1:
         return [(1, tl)]
     remainder = tl % n
@@ -6012,6 +6012,9 @@ def admin_confirm_category_installment(
             "installment_no": installment_no,
             "paid_at": pay.paid_at.isoformat(),
         }
+    # [F004][S002] Every installment needs its own uploaded payment record before Admin confirms.
+    if pay.proof_receipt_id is None:
+        raise HTTPException(status_code=400, detail="請先上載此期付款記錄，Admin 才可確認。")
     amount = payload.amount if payload is not None and payload.amount is not None else None
     if amount is None and pay.amount:
         amount = float(pay.amount)
@@ -7947,7 +7950,7 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
 
     branch = db.query(Branch).filter(Branch.id == payload.branch_id).first()
     assert branch is not None
-    n_inst = max(1, min(3, getattr(payload, "total_installments", 1)))
+    n_inst = max(1, min(5, getattr(payload, "total_installments", 1)))
     segment_ranges = _lesson_segment_ranges(payload.total_lessons, n_inst)
     inst_amounts = getattr(payload, "installment_amounts", None)
     if inst_amounts is not None and len(inst_amounts) != n_inst:
@@ -8199,6 +8202,9 @@ def admin_course_mark_installment_paid(
                or state["pending_payments"].get("full") or state["pending_payments"].get("unassigned", {}))
     if (existing or (state.get("fully_paid") and row.get("paid"))) and not pending:
         return enrollment_to_out(enr)
+    # [F004][S002] Every installment needs its own uploaded payment record before Admin confirms.
+    if not pending:
+        raise HTTPException(status_code=400, detail="請先上載此期付款記錄，Admin 才可確認。")
     amount = pending.get("amount")
     if amount is None:
         amount = row.get("amount_hkd")
@@ -9212,8 +9218,8 @@ def coach_upload_student_receipt(
             raise HTTPException(status_code=400, detail="installment_no is outside this installment plan.")
     if installment_no is not None and installment_no < 1:
         raise HTTPException(status_code=400, detail="installment_no must be 1 or above.")
-    if installment_no is not None and installment_plan_id is None and installment_no > 3:
-        raise HTTPException(status_code=400, detail="installment_no must be 1, 2, or 3.")
+    if installment_no is not None and installment_plan_id is None and installment_no > 5:
+        raise HTTPException(status_code=400, detail="installment_no must be between 1 and 5.")
     result = _save_member_receipt_row(
         db,
         student=student,

@@ -422,8 +422,8 @@ class CourseCreate(BaseModel):
     total_lessons: int = Field(default=10, ge=1, le=999)
     # [F002][S003] Lessons already taken before this package was entered into the system.
     lessons_already_taken: int = Field(default=0, ge=0, le=998)
-    # >1 → one PIN per installment tranche (serialized on enrollment.segment_pins_json).
-    total_installments: int = Field(default=1, ge=1, le=3)
+    # >1 → one PIN per installment tranche (3 or 5 periods in the UI).
+    total_installments: int = Field(default=1, ge=1, le=5)
     # Optional HKD split per installment (length must match total_installments when set).
     installment_amounts: list[float] | None = None
     # Optional: staff records a verbally agreed first session time — logged to coach WhatsApp.
@@ -682,14 +682,14 @@ class CourseInstallmentMarkPaid(BaseModel):
     """Staff marks one scheduled-package installment segment as collected — unlocks that tranche PIN for check-in."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=3)
+    installment_no: int = Field(ge=1, le=5)
 
 
 class CourseInstallmentReminderUpdate(BaseModel):
     """[F003][S003] Staff adjusts the lesson number that triggers a WhatsApp installment reminder."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=3)
+    installment_no: int = Field(ge=1, le=5)
     reminder_lesson: int = Field(ge=1, le=999)
 
 
@@ -909,7 +909,7 @@ class PaymentNotificationSendBody(BaseModel):
     """[F005][S003] Staff triggers payment reminder WhatsApp logs for student + coach."""
 
     course_enrollment_id: int | None = Field(default=None, ge=1)
-    installment_no: int | None = Field(default=None, ge=1, le=3)
+    installment_no: int | None = Field(default=None, ge=1, le=5)
     installment_plan_id: int | None = Field(default=None, ge=1)
     receipt_confirmed: bool = True
     notify_coach: bool = True
