@@ -869,7 +869,8 @@ class CourseCategoryCreate(BaseModel):
 class StudentCategoryEnrollmentCreate(BaseModel):
     course_category_id: int
     total_lessons: int = Field(ge=1, le=999)
-    total_installments: int = Field(default=3, ge=1, le=5)
+    # Admin may split a paper package into any number of periods (bounded by total lessons).
+    total_installments: int = Field(default=3, ge=1, le=999)
     # [F002][S003] Lessons already taken before the paper package was entered here.
     lessons_already_taken: int = Field(default=0, ge=0, le=998)
 
@@ -877,6 +878,8 @@ class StudentCategoryEnrollmentCreate(BaseModel):
     def validate_prior_lessons(self) -> "StudentCategoryEnrollmentCreate":
         if self.lessons_already_taken > self.total_lessons:
             raise ValueError("lessons_already_taken cannot exceed total_lessons.")
+        if self.total_installments > self.total_lessons:
+            raise ValueError("total_installments cannot exceed total_lessons.")
         return self
 
 
@@ -909,7 +912,8 @@ class PaymentNotificationSendBody(BaseModel):
     """[F005][S003] Staff triggers payment reminder WhatsApp logs for student + coach."""
 
     course_enrollment_id: int | None = Field(default=None, ge=1)
-    installment_no: int | None = Field(default=None, ge=1, le=5)
+    # Category plans can have any period count, so this is not capped at the course max of 5.
+    installment_no: int | None = Field(default=None, ge=1, le=999)
     installment_plan_id: int | None = Field(default=None, ge=1)
     receipt_confirmed: bool = True
     notify_coach: bool = True

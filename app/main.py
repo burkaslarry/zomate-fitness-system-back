@@ -2237,7 +2237,7 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
 
 
 def _installment_plan_seed_rows(db: Session, enrollment_id: int, n: int) -> None:
-    n = max(1, min(5, n))
+    n = max(1, int(n))
     plan = InstallmentPlan(enrollment_id=enrollment_id, total_installments=n, status="active")
     db.add(plan)
     db.flush()
@@ -2253,6 +2253,49 @@ def _installment_plan_seed_rows(db: Session, enrollment_id: int, n: int) -> None
                 status="pending",
             )
         )
+
+
+def _resize_category_installment_plan(db: Session, enrollment_id: int, n: int) -> None:
+    """[F002][S003] Admin may change the period count until a proof or payment exists."""
+    n = max(1, int(n))
+    plan = (
+        db.query(InstallmentPlan)
+        .filter(InstallmentPlan.enrollment_id == enrollment_id)
+        .order_by(InstallmentPlan.id.desc())
+        .first()
+    )
+    if plan is None:
+        _installment_plan_seed_rows(db, enrollment_id, n)
+        return
+    if plan.status != "active":
+        raise HTTPException(status_code=400, detail="已關閉的分期計劃不可更改期數。")
+    if plan.total_installments == n:
+        return
+    rows = (
+        db.query(InstallmentPayment)
+        .filter(InstallmentPayment.installment_plan_id == plan.id)
+        .all()
+    )
+    if any(r.paid_at is not None or r.proof_receipt_id is not None for r in rows):
+        raise HTTPException(status_code=400, detail="此分期計劃已有付款或收據紀錄，不可更改期數。")
+    for row in rows:
+        if row.installment_no > n:
+            db.delete(row)
+    existing_nos = {r.installment_no for r in rows}
+    base_due = min((r.due_date for r in rows), default=datetime.utcnow().date())
+    for i in range(1, n + 1):
+        if i in existing_nos:
+            continue
+        db.add(
+            InstallmentPayment(
+                installment_plan_id=plan.id,
+                installment_no=i,
+                amount=0,
+                due_date=base_due + timedelta(days=30 * (i - 1)),
+                status="pending",
+            )
+        )
+    plan.total_installments = n
 
 
 def record_activity(db: Session, student: Student, activity_type: str, ref_id: int | None = None) -> None:
@@ -6245,10 +6288,12 @@ def admin_upsert_category_enrollment(
                 created_by_role=role,
             )
         _apply_category_prior_lessons(db, student, existing, payload.lessons_already_taken, role)
+        _resize_category_installment_plan(db, existing.id, payload.total_installments)
         db.commit()
         return {
             "enrollment_id": existing.id,
             "total_lessons": existing.total_lessons,
+            "total_installments": payload.total_installments,
             "lessons_already_taken": _category_prior_lessons_imported(db, student.id, existing.id),
             "lesson_balance": _lesson_balance_sum(db, student.id),
         }
