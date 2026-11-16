@@ -693,6 +693,20 @@ class CourseInstallmentReminderUpdate(BaseModel):
     reminder_lesson: int = Field(ge=1, le=999)
 
 
+class CourseInstallmentNoUpload(BaseModel):
+    """[F004][S002] Admin ticks 「唔需要上傳文件」 for one course installment period."""
+
+    student_id: int = Field(ge=1)
+    installment_no: int = Field(ge=1, le=5)
+    no_upload: bool = True
+
+
+class CategoryInstallmentNoDocument(BaseModel):
+    """[F004][S002] Admin ticks 「唔需要上傳文件」 for one category installment period."""
+
+    no_document_required: bool = True
+
+
 class CategoryInstallmentConfirm(BaseModel):
     """[F004][S002] Admin confirms a coach-uploaded category installment proof."""
 

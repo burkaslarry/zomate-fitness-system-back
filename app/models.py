@@ -89,6 +89,8 @@ class CourseEnrollment(Base):
     segment_pins_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # [F005][S003] Course-specific payment snapshot; never aggregate unrelated student receipts.
     payment_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # [F004][S002] JSON array of installment_no the Admin ticked 「唔需要上傳文件」 for.
+    no_upload_installment_nos_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: False until coach assigns this student a calendar slot on the coach dashboard.
     coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -237,6 +239,8 @@ class InstallmentPayment(Base):
         ForeignKey("zomate_fs_receipts.id", ondelete="SET NULL"), nullable=True
     )
     proof_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # [F004][S002] Admin ticked 「唔需要上傳文件」 — confirm allowed without an uploaded proof.
+    no_document_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     plan: Mapped["InstallmentPlan"] = relationship(back_populates="payments")

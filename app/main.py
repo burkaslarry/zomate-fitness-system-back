@@ -130,12 +130,14 @@ from .schemas import (
     CoachTrialGrantBody,
     CoachUpdate,
     CategoryInstallmentConfirm,
+    CategoryInstallmentNoDocument,
     CourseCategoryCreate,
     CourseCategoryAdminUpdate,
     CourseAssignCoach,
     CourseCreate,
     CourseInstallmentReminderUpdate,
     CourseInstallmentMarkPaid,
+    CourseInstallmentNoUpload,
     CourseOut,
     CourseReschedule,
     FaceIdCheckinInput,
@@ -1472,6 +1474,30 @@ def _issue_confirmed_course_pins(db: Session, enrollment: CourseEnrollment) -> N
         enrollment.segment_pins_json = json.dumps(rows, ensure_ascii=False)
 
 
+def _course_no_upload_nos(enr: CourseEnrollment) -> set[int]:
+    """[F004][S002] Installment periods the Admin ticked 「唔需要上傳文件」 for (JSON column)."""
+    raw = getattr(enr, "no_upload_installment_nos_json", None)
+    if not raw:
+        return set()
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(rows, list):
+        return set()
+    out: set[int] = set()
+    for item in rows:
+        try:
+            out.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _set_course_no_upload_nos(enr: CourseEnrollment, nos: set[int]) -> None:
+    enr.no_upload_installment_nos_json = json.dumps(sorted(nos), ensure_ascii=False)
+
+
 def _default_installment_reminder_lesson(lesson_from: int, lesson_to: int) -> int:
     """[F003][S003] Reminder fires one lesson before each tranche boundary by default."""
     if lesson_to <= lesson_from:
@@ -2219,21 +2245,38 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
         .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
         .all()
     )
-    return [
-        {
-            "course_id": enr.id,
-            "course_title": enr.title,
-            "branch_name": enr.branch.name,
-            "coach_name": (enr.coach.full_name if enr.coach else None) or "—",
-            "coach_id": enr.coach_id,
-            "scheduled_start": enr.scheduled_start.isoformat(),
-            "series_end_date": enr.series_end_date.isoformat() if enr.series_end_date else None,
-            "total_lessons": enr.total_lessons,
-            "checkin_pin": enr.checkin_pin,
-            "installment_segments": [s.model_dump() for s in parse_segment_pins_json(enr.segment_pins_json)],
-        }
-        for enr in rows
-    ]
+    # [F004][S002] Lessons already taken gate the 「唔需要上傳文件」 tick per installment period.
+    lessons_attended = db.query(func.count(CheckinLog.id)).filter(CheckinLog.student_id == student.id).scalar() or 0
+    out: list[dict] = []
+    for enr in rows:
+        segs = parse_segment_pins_json(enr.segment_pins_json)
+        pending_keys = set((course_payment_state(enr).get("pending_payments") or {}).keys())
+        seg_dicts = []
+        for s in segs:
+            d = s.model_dump()
+            d["has_pending_payment"] = (
+                str(s.installment_no) in pending_keys
+                or "full" in pending_keys
+                or "unassigned" in pending_keys
+            )
+            seg_dicts.append(d)
+        out.append(
+            {
+                "course_id": enr.id,
+                "course_title": enr.title,
+                "branch_name": enr.branch.name,
+                "coach_name": (enr.coach.full_name if enr.coach else None) or "—",
+                "coach_id": enr.coach_id,
+                "scheduled_start": enr.scheduled_start.isoformat(),
+                "series_end_date": enr.series_end_date.isoformat() if enr.series_end_date else None,
+                "total_lessons": enr.total_lessons,
+                "checkin_pin": enr.checkin_pin,
+                "installment_segments": seg_dicts,
+                "no_upload_installment_nos": sorted(_course_no_upload_nos(enr)),
+                "lessons_attended": int(lessons_attended),
+            }
+        )
+    return out
 
 
 def _installment_plan_seed_rows(db: Session, enrollment_id: int, n: int) -> None:
@@ -2562,6 +2605,20 @@ def _migrate_installment_proof_columns(db: Session) -> None:
     stmts = [
         "ALTER TABLE zomate_fs_installment_payments ADD COLUMN IF NOT EXISTS proof_receipt_id INTEGER NULL",
         "ALTER TABLE zomate_fs_installment_payments ADD COLUMN IF NOT EXISTS proof_uploaded_at TIMESTAMP NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _migrate_no_document_columns(db: Session) -> None:
+    """[F004][S002] Admin 「唔需要上傳文件」 tick per installment period (course + category)."""
+    stmts = [
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS no_upload_installment_nos_json TEXT NULL",
+        "ALTER TABLE zomate_fs_installment_payments ADD COLUMN IF NOT EXISTS no_document_required BOOLEAN NOT NULL DEFAULT FALSE",
     ]
     try:
         for s in stmts:
@@ -3101,6 +3158,7 @@ def _sync_startup() -> None:
         _migrate_management_columns(db)
         _migrate_medical_clearance_columns(db)
         _migrate_installment_proof_columns(db)
+        _migrate_no_document_columns(db)
         _migrate_member_profile_columns(db)
         _migrate_attendance_ledger_columns(db)
         _backfill_medical_clearance_columns(db)
@@ -3911,6 +3969,7 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
                                 "proof_uploaded_at": (
                                     pay.proof_uploaded_at.isoformat() if pay.proof_uploaded_at else None
                                 ),
+                                "no_document_required": bool(pay.no_document_required),
                             }
                             for pay in sorted(plan.payments, key=lambda p: p.installment_no)
                         ],
@@ -6055,8 +6114,9 @@ def admin_confirm_category_installment(
             "installment_no": installment_no,
             "paid_at": pay.paid_at.isoformat(),
         }
-    # [F004][S002] Every installment needs its own uploaded payment record before Admin confirms.
-    if pay.proof_receipt_id is None:
+    # [F004][S002] Every installment needs its own uploaded payment record before Admin confirms,
+    # unless the Admin ticked 「唔需要上傳文件」 for this period.
+    if pay.proof_receipt_id is None and not pay.no_document_required:
         raise HTTPException(status_code=400, detail="請先上載此期付款記錄，Admin 才可確認。")
     amount = payload.amount if payload is not None and payload.amount is not None else None
     if amount is None and pay.amount:
@@ -6099,6 +6159,42 @@ def admin_confirm_category_installment(
         "whatsapp": whatsapp,
     }
 
+
+@app.patch("/api/admin/installment-plans/{plan_id}/payments/{installment_no}/no-document")
+def admin_set_category_installment_no_document(
+    plan_id: int,
+    installment_no: int,
+    payload: CategoryInstallmentNoDocument,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Admin ticks 「唔需要上傳文件」 for one category installment period
+    Logic: Persist the boolean so Admin 確認付款 no longer demands an uploaded proof.
+    """
+    pay = (
+        db.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan_id,
+            InstallmentPayment.installment_no == installment_no,
+        )
+        .with_for_update()
+        .first()
+    )
+    if pay is None:
+        raise HTTPException(status_code=404, detail="Installment payment row not found.")
+    if pay.paid_at is not None:
+        raise HTTPException(status_code=400, detail="此期已確認付款，毋須再更改。")
+    pay.no_document_required = bool(payload.no_document_required)
+    db.commit()
+    return {
+        "ok": True,
+        "payment_id": pay.id,
+        "installment_plan_id": plan_id,
+        "installment_no": installment_no,
+        "no_document_required": pay.no_document_required,
+    }
 
 
 @app.get("/api/admin/course-categories")
@@ -8247,14 +8343,17 @@ def admin_course_mark_installment_paid(
                or state["pending_payments"].get("full") or state["pending_payments"].get("unassigned", {}))
     if (existing or (state.get("fully_paid") and row.get("paid"))) and not pending:
         return enrollment_to_out(enr)
-    # [F004][S002] Every installment needs its own uploaded payment record before Admin confirms.
-    if not pending:
+    # [F004][S002] Admin 「唔需要上傳文件」 tick also authorizes confirmation without an uploaded proof.
+    no_document_required = payload.installment_no in _course_no_upload_nos(enr)
+    if not pending and not no_document_required:
         raise HTTPException(status_code=400, detail="請先上載此期付款記錄，Admin 才可確認。")
-    amount = pending.get("amount")
+    amount = (pending or {}).get("amount")
     if amount is None:
         amount = row.get("amount_hkd")
-    if amount is None or float(amount) <= 0:
+    if (amount is None or float(amount) <= 0) and not no_document_required:
         raise HTTPException(status_code=400, detail="請先上傳有金額的付款收據或設定本期金額。")
+    if amount is None:
+        amount = 0
     state["pending_payments"].pop(str(payload.installment_no), None)
     if pending is state["pending_payments"].get("unassigned"):
         state["pending_payments"].pop("unassigned", None)
@@ -8276,6 +8375,55 @@ def admin_course_mark_installment_paid(
         db, log_whatsapp, student=enr.student, course_enrollment_id=enr.id,
         installment_no=payload.installment_no, receipt_confirmed=None, notify_coach=True,
     )
+    db.commit()
+    full = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
+        .first()
+    )
+    if full is None or _is_deleted(db, "course_enrollments", full.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    return enrollment_to_out(full)
+
+
+@app.patch("/api/admin/courses/{course_id}/installment-no-upload", response_model=CourseOut)
+def admin_course_set_installment_no_upload(
+    course_id: int,
+    payload: CourseInstallmentNoUpload,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> CourseOut:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Admin ticks 「唔需要上傳文件」 for one installment period
+    Logic: Persist the per-period flag (JSON column) so Admin 確認付款 no longer demands an uploaded receipt.
+    """
+    if _is_deleted(db, "course_enrollments", course_id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    enr = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.id == course_id,
+            CourseEnrollment.student_id == payload.student_id,
+        )
+        .with_for_update()
+        .first()
+    )
+    if not enr:
+        raise HTTPException(status_code=404, detail="Enrollment not found.")
+    rows = parse_segment_pins_json(enr.segment_pins_json)
+    segment = next((s for s in rows if s.installment_no == payload.installment_no), None)
+    if segment is None:
+        raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")
+    if segment.paid:
+        raise HTTPException(status_code=400, detail="此期已確認付款，毋須再更改。")
+    nos = _course_no_upload_nos(enr)
+    if payload.no_upload:
+        nos.add(payload.installment_no)
+    else:
+        nos.discard(payload.installment_no)
+    _set_course_no_upload_nos(enr, nos)
     db.commit()
     full = (
         db.query(CourseEnrollment)
