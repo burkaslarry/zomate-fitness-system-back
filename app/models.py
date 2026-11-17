@@ -323,6 +323,10 @@ class StudentPhoto(Base):
     student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
     member_hkid: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    # [F007][S004] Render disk is ephemeral; keep bytes in Postgres so photos survive redeploys.
+    # Deferred so listing photos never loads the blobs unless accessed.
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
+    content_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     student: Mapped["Student"] = relationship(back_populates="photos")
@@ -339,6 +343,10 @@ class Receipt(Base):
     payment_method: Mapped[str | None] = mapped_column(String(80), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="REGISTER")
+    # [F007][S004] Durable copy of the uploaded receipt image/PDF (disk is ephemeral on Render).
+    # Deferred so receipt lists never load multi-MB blobs unless accessed.
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
+    content_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     student: Mapped["Student"] = relationship(back_populates="receipts")

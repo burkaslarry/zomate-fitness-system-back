@@ -27,6 +27,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy import distinct, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -98,6 +100,7 @@ from .schemas import (
     CheckinInput,
     CoachCreate,
     CoachEnrolledStudentOut,
+    CoachInstallmentPeriodOut,
     CoachMeOut,
     CoachOut,
     CoachSkillsUpdate,
@@ -110,6 +113,7 @@ from .schemas import (
     CoachStudentRecordOut,
     CoachStudentEnrollmentOut,
     CoachStudentCheckinOut,
+    CoachStudentReceiptOut,
     CoachStudentAttendanceOut,
     CoachStudentFollowUpOut,
     CoachRemindPaymentBody,
@@ -336,7 +340,64 @@ async def reject_oversized_body(request: Request, call_next):
 UPLOADS_DIR = settings.uploads_dir.resolve()
 ACTIVE_MEMBER_DAYS = settings.active_member_days
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
+
+
+def _upload_media_type(path: str) -> str:
+    """[F007][S004] Content type for a stored upload path."""
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".pdf": "application/pdf",
+    }.get(Path(path).suffix.lower(), "application/octet-stream")
+
+
+class UploadBlobStaticFiles(StaticFiles):
+    """[F007][S004] Q4.2 — serve /uploads from disk, then from the Postgres blob copy.
+
+    Render's container disk is ephemeral, so receipt/photo files disappear on every
+    redeploy while rows survive in Postgres. New uploads store a durable copy.
+    """
+
+    def _blob_response(self, path: str) -> Response:
+        rel = _signature_relative_path(path)
+        if not rel:
+            raise StarletteHTTPException(status_code=404)
+        with db_session() as db:
+            receipt = (
+                db.query(Receipt)
+                .filter(Receipt.file_path == rel, Receipt.file_data.isnot(None))
+                .first()
+            )
+            if receipt is not None:
+                return Response(
+                    content=receipt.file_data,
+                    media_type=receipt.content_type or _upload_media_type(rel),
+                )
+            photo = (
+                db.query(StudentPhoto)
+                .filter(StudentPhoto.file_path == rel, StudentPhoto.file_data.isnot(None))
+                .first()
+            )
+            if photo is not None:
+                return Response(
+                    content=photo.file_data,
+                    media_type=photo.content_type or _upload_media_type(rel),
+                )
+        raise StarletteHTTPException(status_code=404)
+
+    async def get_response(self, path: str, scope) -> Response:
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return await run_in_threadpool(self._blob_response, path)
+
+
+app.mount("/uploads", UploadBlobStaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 storage_service = FileStorageService(UPLOADS_DIR)
 app.include_router(register_public_router)
 
@@ -1279,6 +1340,7 @@ def _save_member_receipt_row(
         elif len(courses) > 1 and send_whatsapp and needs_course_scope:
             raise HTTPException(status_code=400, detail="請選擇對應 Course，避免通知錯誤課程。")
     path = _save_upload_file(file, "receipts", member_key, 5 * 1024 * 1024)
+    blob_data, blob_media = _read_upload_blob(path)
     note_text = (note or "").strip()
     context_text = (context or "").strip()
     if context_text:
@@ -1291,6 +1353,8 @@ def _save_member_receipt_row(
         payment_method=(payment_method or "").strip() or None,
         note=note_text or None,
         source=source if source in {"REGISTER", "RENEWAL"} else "RENEWAL",
+        file_data=blob_data,
+        content_type=blob_media,
     )
     db.add(receipt)
     db.flush()
@@ -2036,6 +2100,18 @@ def _signature_relative_path(stored: str | None) -> str | None:
     return value or None
 
 
+def _read_upload_blob(relative_path: str | None) -> tuple[bytes | None, str | None]:
+    """[F007][S004] Q4.2 — read a just-saved upload so it can be mirrored into Postgres."""
+    rel = _signature_relative_path(relative_path)
+    if not rel:
+        return None, None
+    try:
+        data = (UPLOADS_DIR / rel).read_bytes()
+    except OSError:
+        return None, None
+    return data, _upload_media_type(rel)
+
+
 def _signature_image_for_member(student: Student) -> str | None:
     """[F001][S004] Stable API URL for canvas signature (blob or disk)."""
     blob = getattr(student, "signature_image_blob", None)
@@ -2628,6 +2704,53 @@ def _migrate_no_document_columns(db: Session) -> None:
         db.rollback()
 
 
+def _migrate_upload_blob_columns(db: Session) -> None:
+    """[F007][S004] Q4.2 — durable blob copies for receipts and student photos."""
+    stmts = [
+        "ALTER TABLE zomate_fs_receipts ADD COLUMN IF NOT EXISTS file_data BYTEA NULL",
+        "ALTER TABLE zomate_fs_receipts ADD COLUMN IF NOT EXISTS content_type VARCHAR(80) NULL",
+        "ALTER TABLE zomate_fs_student_photos ADD COLUMN IF NOT EXISTS file_data BYTEA NULL",
+        "ALTER TABLE zomate_fs_student_photos ADD COLUMN IF NOT EXISTS content_type VARCHAR(80) NULL",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _backfill_upload_blobs(db: Session) -> None:
+    """[F007][S004] Copy files still present on disk into Postgres (idempotent, capped)."""
+    touched = False
+    for row in (
+        db.query(Receipt)
+        .filter(Receipt.file_data.is_(None))
+        .order_by(Receipt.id.desc())
+        .limit(500)
+        .all()
+    ):
+        data, media = _read_upload_blob(row.file_path)
+        if data is not None:
+            row.file_data = data
+            row.content_type = media
+            touched = True
+    for photo in (
+        db.query(StudentPhoto)
+        .filter(StudentPhoto.file_data.is_(None))
+        .order_by(StudentPhoto.id.desc())
+        .limit(500)
+        .all()
+    ):
+        data, media = _read_upload_blob(photo.file_path)
+        if data is not None:
+            photo.file_data = data
+            photo.content_type = media
+            touched = True
+    if touched:
+        db.commit()
+
+
 def _migrate_medical_clearance_columns(db: Session) -> None:
     """[F001][S002] PAR-Q JSON + medical clearance status/path on students."""
     stmts = [
@@ -3159,9 +3282,15 @@ def _sync_startup() -> None:
         _migrate_medical_clearance_columns(db)
         _migrate_installment_proof_columns(db)
         _migrate_no_document_columns(db)
+        _migrate_upload_blob_columns(db)
         _migrate_member_profile_columns(db)
         _migrate_attendance_ledger_columns(db)
         _backfill_medical_clearance_columns(db)
+        try:
+            _backfill_upload_blobs(db)
+        except Exception as exc:  # noqa: BLE001 — boot must continue
+            db.rollback()
+            log_event("upload_blob_backfill_error", error=str(exc)[:240])
         _migrate_coach_hire_date(db)
         _migrate_coach_user_links(db)
         _migrate_user_custom_permissions(db)
@@ -4097,8 +4226,15 @@ def get_member_full(hkid: str, db: Session = Depends(get_db)) -> dict:
 def upload_member_photo(hkid: str, file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
     student = get_student_by_hkid_or_404(db, hkid)
     path = _save_upload_file(file, "photos", student.hkid or hkid, 2 * 1024 * 1024)
+    blob_data, blob_media = _read_upload_blob(path)
     student.photo_path = path
-    photo = StudentPhoto(student_id=student.id, member_hkid=student.hkid or normalize_hkid(hkid), file_path=path)
+    photo = StudentPhoto(
+        student_id=student.id,
+        member_hkid=student.hkid or normalize_hkid(hkid),
+        file_path=path,
+        file_data=blob_data,
+        content_type=blob_media,
+    )
     db.add(photo)
     db.add(AuditLog(action="member_photo_upload", student_id=student.id, detail=path))
     record_activity(db, student, "member_photo_upload", photo.id)
@@ -4232,6 +4368,14 @@ def download_receipt(
     rel = _signature_relative_path(receipt.file_path) or str(receipt.file_path).lstrip("/")
     path = (UPLOADS_DIR / rel).resolve()
     if not str(path).startswith(str(UPLOADS_DIR)) or not path.is_file():
+        # [F007][S004] Q4.2 — disk lost on redeploy: serve the durable Postgres copy.
+        if receipt.file_data:
+            filename = Path(rel).name or f"receipt-{receipt.id}"
+            return Response(
+                content=receipt.file_data,
+                media_type=receipt.content_type or _upload_media_type(rel),
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
         raise HTTPException(status_code=404, detail="Receipt file missing on disk.")
     suffix = path.suffix.lower()
     media = {
@@ -4350,6 +4494,7 @@ def create_renewal_multipart(
     receipt_row = None
     if receipt is not None and receipt.filename:
         path = _save_upload_file(receipt, "receipts", receipt_tag, 5 * 1024 * 1024)
+        blob_data, blob_media = _read_upload_blob(path)
         receipt_row = Receipt(
             student_id=student.id,
             member_hkid=(student.hkid or "").strip() or (student.phone or str(student.id)),
@@ -4358,6 +4503,8 @@ def create_renewal_multipart(
             payment_method=payment_method,
             note=note,
             source="RENEWAL",
+            file_data=blob_data,
+            content_type=blob_media,
         )
         db.add(receipt_row)
         db.flush()
@@ -5630,6 +5777,8 @@ async def import_payment_records(
                     payment_method=payment_method,
                     note=label,
                     source="RENEWAL",
+                    file_data=blob,
+                    content_type=_upload_media_type(str(rel_path)),
                 )
                 db.add(rec)
                 db.flush()
@@ -9054,6 +9203,20 @@ def _unpaid_installment_nos(enr: CourseEnrollment) -> list[int]:
     return [seg.installment_no for seg in parse_segment_pins_json(enr.segment_pins_json) if not seg.paid]
 
 
+def _coach_installment_periods(enr: CourseEnrollment) -> list[CoachInstallmentPeriodOut]:
+    """[F003][S005] Lesson range per installment period — when each tranche of lessons is due."""
+    return [
+        CoachInstallmentPeriodOut(
+            installment_no=seg.installment_no,
+            lesson_from=seg.lesson_from,
+            lesson_to=seg.lesson_to,
+            paid=seg.paid,
+            reminder_lesson=seg.reminder_lesson,
+        )
+        for seg in parse_segment_pins_json(enr.segment_pins_json)
+    ]
+
+
 def _enrollment_receipt_source(db: Session, enr: CourseEnrollment) -> RenewalRecord | None:
     """[F004][S002] Paid renewal backing a fully paid enrollment — the official receipt money source."""
     rid = course_payment_state(enr).get("renewal_id")
@@ -9476,6 +9639,7 @@ def coach_list_students(
         total = int(enr.total_lessons or 0)
         used = used_by_course.get(enr.id, 0)
         pay_status, inst_status, _, _ = _coach_payment_summary(db, enr, st)
+        next_no, next_reminder = _next_unpaid_installment_meta(enr)
         package = CoachStudentPackageOut(
             enrollment_id=enr.id,
             course_title=enr.title or "Course",
@@ -9487,6 +9651,9 @@ def coach_list_students(
             coach_time_confirmed=bool(enr.coach_time_confirmed),
             payment_status=pay_status,
             installment_status=inst_status,
+            installment_periods=_coach_installment_periods(enr),
+            next_installment_no=next_no,
+            next_reminder_lesson=next_reminder,
         )
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
@@ -9560,12 +9727,25 @@ def coach_student_records(
     else:
         att_q = att_q.filter(Attendance.coach_id == cid)
     attendances = att_q.order_by(Attendance.attended_at.desc()).limit(50).all()
+    # [F003][S005] Q4.2 — coaches can re-open every receipt/proof they or the student uploaded.
+    deleted_receipt_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "receipts")
+    receipts = (
+        db.query(Receipt)
+        .filter(Receipt.student_id == student_id, ~Receipt.id.in_(deleted_receipt_ids))
+        .order_by(Receipt.created_at.desc())
+        .limit(50)
+        .all()
+    )
     title_by_id = {e.id: e.title for e in enrollments}
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
         phone=student.phone,
         lesson_balance=_lesson_balance_sum(db, student.id),
+        date_of_birth=student.date_of_birth,
+        emergency_contact_name=student.emergency_contact_name,
+        emergency_contact_relationship=student.emergency_contact_relationship,
+        emergency_contact_phone=student.emergency_contact_phone,
         enrollments=[
             CoachStudentEnrollmentOut(
                 enrollment_id=e.id,
@@ -9581,6 +9761,7 @@ def coach_student_records(
                 installment_status=_coach_payment_summary(db, e, student)[1],
                 next_installment_no=_next_unpaid_installment_meta(e)[0],
                 next_reminder_lesson=_next_unpaid_installment_meta(e)[1],
+                installment_periods=_coach_installment_periods(e),
             )
             for e in enrollments
         ],
@@ -9599,6 +9780,18 @@ def coach_student_records(
                 attended_at=a.attended_at,
             )
             for a in attendances
+        ],
+        receipts=[
+            CoachStudentReceiptOut(
+                id=r.id,
+                source=r.source,
+                amount=float(r.amount) if r.amount is not None else None,
+                payment_method=r.payment_method,
+                note=r.note,
+                file_url=_file_url(r.file_path),
+                created_at=r.created_at,
+            )
+            for r in receipts
         ],
     )
 
@@ -9780,13 +9973,11 @@ def coach_cancel_enrollment(
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_staff_for_coach_routes),
 ) -> dict:
-    """[F003][S009] Soft-cancel whole course — Admin/Clerk only; reverses unused lesson credit."""
-    # [F003][S009] Coaches may cancel one session; whole-course cancel is Master/Admin only.
-    if user.role == "COACH":
-        raise HTTPException(
-            status_code=403,
-            detail="教練不可取消整個課程；請改期或取消單一課堂，或聯絡 Admin。",
-        )
+    """[F003][S009] Soft-cancel whole course/package; reverses unused lesson credit.
+
+    Q4/Q4.1: coaches may cancel 待排期 chips and delete their own packages;
+    Admin/Clerk keep full access.
+    """
     cid = _resolve_coach_id_param(db, user, payload.coach_id)
     enr = (
         db.query(CourseEnrollment)

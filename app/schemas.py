@@ -542,6 +542,16 @@ class CoachStudentPaymentOut(BaseModel):
     receipt_available: bool = False
 
 
+class CoachInstallmentPeriodOut(BaseModel):
+    """[F003][S005] One installment period's lesson range — when that tranche of lessons is due."""
+
+    installment_no: int
+    lesson_from: int
+    lesson_to: int
+    paid: bool
+    reminder_lesson: int | None = None
+
+
 class CoachStudentPackageOut(BaseModel):
     """[F003][S005] One course package (= one enrollment) on the coach roster row."""
 
@@ -555,6 +565,9 @@ class CoachStudentPackageOut(BaseModel):
     coach_time_confirmed: bool
     payment_status: str
     installment_status: str
+    installment_periods: list[CoachInstallmentPeriodOut] = []
+    next_installment_no: int | None = None
+    next_reminder_lesson: int | None = None
 
 
 class CoachStudentBriefOut(BaseModel):
@@ -583,12 +596,25 @@ class CoachStudentEnrollmentOut(BaseModel):
     installment_status: str
     next_installment_no: int | None = None
     next_reminder_lesson: int | None = None
+    installment_periods: list[CoachInstallmentPeriodOut] = []
 
 
 class CoachStudentCheckinOut(BaseModel):
     id: int
     channel: str
     remarks: str | None
+    created_at: datetime
+
+
+class CoachStudentReceiptOut(BaseModel):
+    """[F003][S005] Uploaded receipt/proof file — Q4.2 lets coaches view what they uploaded."""
+
+    id: int
+    source: str
+    amount: float | None = None
+    payment_method: str | None = None
+    note: str | None = None
+    file_url: str
     created_at: datetime
 
 
@@ -607,9 +633,14 @@ class CoachStudentRecordOut(BaseModel):
     full_name: str
     phone: str
     lesson_balance: int
+    date_of_birth: date | None = None
+    emergency_contact_name: str | None = None
+    emergency_contact_relationship: str | None = None
+    emergency_contact_phone: str | None = None
     enrollments: list[CoachStudentEnrollmentOut]
     checkins: list[CoachStudentCheckinOut]
     attendance: list[CoachStudentAttendanceOut]
+    receipts: list[CoachStudentReceiptOut] = []
 
 
 class CoachRemindPaymentBody(BaseModel):
