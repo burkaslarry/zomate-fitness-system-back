@@ -386,6 +386,19 @@ class UploadBlobStaticFiles(StaticFiles):
                     content=photo.file_data,
                     media_type=photo.content_type or _upload_media_type(rel),
                 )
+            student = (
+                db.query(Student)
+                .filter(
+                    Student.medical_clearance_path == rel,
+                    Student.medical_clearance_blob.isnot(None),
+                )
+                .first()
+            )
+            if student is not None:
+                return Response(
+                    content=student.medical_clearance_blob,
+                    media_type=student.medical_clearance_content_type or _upload_media_type(rel),
+                )
         raise StarletteHTTPException(status_code=404)
 
     async def get_response(self, path: str, scope) -> Response:
@@ -2705,12 +2718,14 @@ def _migrate_no_document_columns(db: Session) -> None:
 
 
 def _migrate_upload_blob_columns(db: Session) -> None:
-    """[F007][S004] Q4.2 — durable blob copies for receipts and student photos."""
+    """[F007][S004] Q4.2 — durable blob copies for receipts, student photos and medical notes."""
     stmts = [
         "ALTER TABLE zomate_fs_receipts ADD COLUMN IF NOT EXISTS file_data BYTEA NULL",
         "ALTER TABLE zomate_fs_receipts ADD COLUMN IF NOT EXISTS content_type VARCHAR(80) NULL",
         "ALTER TABLE zomate_fs_student_photos ADD COLUMN IF NOT EXISTS file_data BYTEA NULL",
         "ALTER TABLE zomate_fs_student_photos ADD COLUMN IF NOT EXISTS content_type VARCHAR(80) NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS medical_clearance_blob BYTEA NULL",
+        "ALTER TABLE zomate_fs_students ADD COLUMN IF NOT EXISTS medical_clearance_content_type VARCHAR(80) NULL",
     ]
     try:
         for s in stmts:
@@ -2746,6 +2761,18 @@ def _backfill_upload_blobs(db: Session) -> None:
         if data is not None:
             photo.file_data = data
             photo.content_type = media
+            touched = True
+    for student in (
+        db.query(Student)
+        .filter(Student.medical_clearance_path.isnot(None), Student.medical_clearance_blob.is_(None))
+        .order_by(Student.id.desc())
+        .limit(500)
+        .all()
+    ):
+        data, media = _read_upload_blob(student.medical_clearance_path)
+        if data is not None:
+            student.medical_clearance_blob = data
+            student.medical_clearance_content_type = media
             touched = True
     if touched:
         db.commit()
@@ -3773,10 +3800,13 @@ def _create_member_impl(
     parq_data = payload.parq.model_dump()
     any_yes = payload.parq.any_yes()
     medical_path: str | None = None
+    medical_blob: bytes | None = None
+    medical_media: str | None = None
     medical_label = (payload.medical_clearance_file_name or "").strip()
     if medical_file is not None and medical_file.filename:
         validate_medical_upload(medical_file)
         medical_path = _save_upload_file(medical_file, "medical_clearance", hkid, 3 * 1024 * 1024)
+        medical_blob, medical_media = _read_upload_blob(medical_path)
         medical_label = medical_file.filename or medical_label
 
     clearance_status = compute_medical_clearance_status(
@@ -3824,6 +3854,8 @@ def _create_member_impl(
         parq_json=json.dumps(parq_data, ensure_ascii=False),
         medical_clearance_status=clearance_status,
         medical_clearance_path=medical_path,
+        medical_clearance_blob=medical_blob,
+        medical_clearance_content_type=medical_media,
         disclaimer_accepted=True,
         whatsapp_reminder_opt_in=bool(payload.whatsapp_reminder_opt_in),
         whatsapp_reminder_opt_in_at=datetime.utcnow() if payload.whatsapp_reminder_opt_in else None,
@@ -4411,6 +4443,7 @@ def upload_medical_clearance_by_id(
     key = student.hkid or f"student-{student.id}"
     path = _save_upload_file(file, "medical_clearance", key, 3 * 1024 * 1024)
     student.medical_clearance_path = path
+    student.medical_clearance_blob, student.medical_clearance_content_type = _read_upload_blob(path)
     student.medical_clearance_status = compute_medical_clearance_status(parq_any_yes=True, has_file=True)
     db.add(
         AuditLog(

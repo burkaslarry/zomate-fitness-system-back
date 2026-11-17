@@ -145,6 +145,9 @@ class Student(Base):
     #: not_required | pending (PAR-Q yes, no file) | received
     medical_clearance_status: Mapped[str] = mapped_column(String(32), nullable=False, default="not_required")
     medical_clearance_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # [F007][S004] Durable copy of the PAR-Q doctor note (disk is ephemeral on Render).
+    medical_clearance_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
+    medical_clearance_content_type: Mapped[str | None] = mapped_column(String(80), nullable=True)
     disclaimer_accepted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     #: [F005][S003] WhatsApp Business opt-in for booking confirmations & class reminders.
     whatsapp_reminder_opt_in: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

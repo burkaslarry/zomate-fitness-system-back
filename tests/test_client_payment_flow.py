@@ -163,7 +163,7 @@ def test_course_registration_requires_explicit_consent():
 def test_registration_consent_failure_is_422_not_serialization_error():
     """[F001][S001] Unchecked consent must produce a usable API error, without reflecting private input."""
     response = TestClient(main.app).post("/api/v1/students/register", json={
-        "full_name": "Drill", "hkid": "DRILL001", "phone": "93103031", "date_of_birth": "1990-01-01",
+        "full_name": "Drill", "hkid": "D123", "phone": "93103031", "date_of_birth": "1990-01-01",
         "emergency_contact_name": "Drill", "emergency_contact_phone": "93103031", "form_type": "new",
         "parq": {}, "digital_signature": "x" * 20, "package_sessions": 30,
         "whatsapp_reminder_opt_in": False,

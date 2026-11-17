@@ -98,3 +98,51 @@ def test_backfill_upload_blobs_copies_files_still_on_disk(db_session, tmp_path, 
     assert receipt.file_data == PNG_BYTES
     assert receipt.content_type == "image/png"
 
+
+def test_uploads_static_falls_back_to_medical_blob(db_session, monkeypatch, tmp_path):
+    """PAR-Q doctor notes follow the same durable path as receipts."""
+    branch = Branch(name="TST", code="TST", address="Test")
+    student = Student(
+        full_name="Bob Chan",
+        phone="91110002",
+        branch=branch,
+        hkid="B234",
+        medical_clearance_path="medical_clearance/B234/doctor-note.pdf",
+        medical_clearance_blob=PNG_BYTES,
+        medical_clearance_content_type="application/pdf",
+    )
+    db_session.add_all([branch, student])
+    db_session.commit()
+
+    @contextmanager
+    def _test_session():
+        yield db_session
+
+    monkeypatch.setattr(main, "db_session", _test_session)
+    uploads = main.UploadBlobStaticFiles(directory=str(tmp_path))
+    res = uploads._blob_response(student.medical_clearance_path)
+    assert res.status_code == 200
+    assert res.body == PNG_BYTES
+    assert res.media_type == "application/pdf"
+
+
+def test_backfill_upload_blobs_copies_medical_file(db_session, tmp_path, monkeypatch):
+    branch = Branch(name="TST", code="TST", address="Test")
+    student = Student(
+        full_name="Cara Lee",
+        phone="91110003",
+        branch=branch,
+        hkid="C345",
+        medical_clearance_path="medical_clearance/C345/doctor-note.pdf",
+    )
+    db_session.add_all([branch, student])
+    db_session.commit()
+    (tmp_path / "medical_clearance" / "C345").mkdir(parents=True)
+    (tmp_path / student.medical_clearance_path).write_bytes(PNG_BYTES)
+    monkeypatch.setattr(main, "UPLOADS_DIR", tmp_path)
+
+    main._backfill_upload_blobs(db_session)
+    db_session.refresh(student)
+    assert student.medical_clearance_blob == PNG_BYTES
+    assert student.medical_clearance_content_type == "application/pdf"
+

@@ -6,9 +6,23 @@ Logic: Pydantic request and response models for HTTP routes.
 
 from datetime import date, datetime
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# [F001][S001] New students only ever supply the HKID prefix (≤4 chars); full numbers are rejected.
+HKID_PREFIX_RE = re.compile(r"^[A-Z]{1,2}[0-9]{2,3}$")
+
+
+def _normalize_hkid_prefix(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    raw = "".join(value.split()).upper()
+    if not HKID_PREFIX_RE.fullmatch(raw):
+        raise ValueError("HKID 只填頭 4 個字元（例：A123），唔可以填完整身份證號碼。")
+    return raw
 
 
 class StudentOnboardCreate(BaseModel):
@@ -44,7 +58,7 @@ class StudentRegisterV1(BaseModel):
     """``POST /api/v1/students/register`` — F01 wizard body (Zod mirror)."""
 
     full_name: str = Field(min_length=1, max_length=120)
-    hkid: str = Field(min_length=4, max_length=32)
+    hkid: str = Field(min_length=4, max_length=4)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
     date_of_birth: date
@@ -59,6 +73,11 @@ class StudentRegisterV1(BaseModel):
     package_sessions: Literal[10, 30]
     renewal_notes: str | None = None
     whatsapp_reminder_opt_in: bool = False
+
+    @field_validator("hkid", mode="before")
+    @classmethod
+    def normalize_hkid(cls, v: object) -> object:
+        return _normalize_hkid_prefix(v)
 
     @field_validator("email", mode="before")
     @classmethod
@@ -106,7 +125,7 @@ class MemberCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=120)
     nickname: str | None = Field(default=None, max_length=80)
     gender: Literal["male", "female"]
-    hkid: str = Field(min_length=4, max_length=32)
+    hkid: str = Field(min_length=4, max_length=4)
     phone: str = Field(min_length=8, max_length=30)
     email: str | None = None
     date_of_birth: date
@@ -126,6 +145,11 @@ class MemberCreate(BaseModel):
     coach_id: int | None = Field(default=None, ge=1)
     coach_username: str | None = Field(default=None, min_length=1, max_length=120)
     course_category_id: int | None = Field(default=None, ge=1)
+
+    @field_validator("hkid", mode="before")
+    @classmethod
+    def normalize_hkid(cls, v: object) -> object:
+        return _normalize_hkid_prefix(v)
 
     @field_validator("email", mode="before")
     @classmethod
