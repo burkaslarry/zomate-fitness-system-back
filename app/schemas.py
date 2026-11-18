@@ -623,6 +623,16 @@ class CoachStudentEnrollmentOut(BaseModel):
     installment_periods: list[CoachInstallmentPeriodOut] = []
 
 
+class CoachStudentCategoryOut(BaseModel):
+    """[F003][S005] Category ledger import, distinct from schedulable courses."""
+
+    id: int
+    category_name: str
+    total_lessons: int
+    lessons_already_taken: int
+    remaining_from_paper: int
+
+
 class CoachStudentCheckinOut(BaseModel):
     id: int
     channel: str
@@ -662,6 +672,7 @@ class CoachStudentRecordOut(BaseModel):
     emergency_contact_relationship: str | None = None
     emergency_contact_phone: str | None = None
     enrollments: list[CoachStudentEnrollmentOut]
+    category_enrollments: list[CoachStudentCategoryOut] = []
     checkins: list[CoachStudentCheckinOut]
     attendance: list[CoachStudentAttendanceOut]
     receipts: list[CoachStudentReceiptOut] = []

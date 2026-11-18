@@ -8,6 +8,7 @@ from app import main
 from app.models import (
     AppUser,
     CategoryEnrollment,
+    Coach,
     CourseCategory,
     InstallmentPayment,
     InstallmentPlan,
@@ -89,3 +90,51 @@ def test_installments_cannot_exceed_total_lessons():
             total_lessons=10,
             total_installments=11,
         )
+
+
+def test_imported_category_progress_is_scoped_and_not_a_course(db_session):
+    """[F002][S003] Paper counts remain separate from unallocated debits and PIN courses."""
+    student, category = _seed(db_session)
+    other_category = CourseCategory(name="Other Category")
+    coach = Coach(full_name="Fixture Coach", phone="91110010", active=True)
+    db_session.add_all([other_category, coach])
+    db_session.flush()
+    admin = _admin()
+
+    def save(category_id, total, prior):
+        return main.admin_upsert_category_enrollment(
+            student.id,
+            StudentCategoryEnrollmentCreate(
+                course_category_id=category_id, total_lessons=total,
+                total_installments=3, lessons_already_taken=prior,
+            ),
+            db_session, admin,
+        )
+
+    saved = save(category.id, 30, 15)
+    save(category.id, 30, 17)
+    save(other_category.id, 12, 4)
+    main.apply_lesson_ledger_delta(db_session, student, -1, "manual_unallocated")
+    db_session.commit()
+
+    full = main._member_full_payload(db_session, student)
+    rows = {r["category_name"]: r for r in full["category_enrollments"]}
+    assert rows[category.name]["id"] == saved["enrollment_id"]
+    assert rows[category.name]["lessons_already_taken"] == 17
+    assert rows[category.name]["remaining_from_paper"] == 13
+    assert rows[other_category.name]["lessons_already_taken"] == 4
+    assert rows[other_category.name]["remaining_from_paper"] == 8
+    assert full["profile"]["lesson_balance"] == 20
+    assert full["course_checkin_pins"] == []
+
+    record = main.coach_student_records(student.id, coach.id, db_session, admin)
+    by_name = {r.category_name: r for r in record.category_enrollments}
+    assert by_name[category.name].lessons_already_taken == 17
+    assert by_name[category.name].remaining_from_paper == 13
+    assert by_name[other_category.name].lessons_already_taken == 4
+    assert record.enrollments == []
+
+    other_coach = AppUser(username="other", role="COACH", password_salt="", password_hash="", coach_id=coach.id)
+    with pytest.raises(HTTPException) as exc:
+        main.coach_student_records(student.id, coach.id, db_session, other_coach)
+    assert exc.value.status_code == 403

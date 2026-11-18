@@ -112,6 +112,7 @@ from .schemas import (
     CoachStudentPackageOut,
     CoachStudentRecordOut,
     CoachStudentEnrollmentOut,
+    CoachStudentCategoryOut,
     CoachStudentCheckinOut,
     CoachStudentReceiptOut,
     CoachStudentAttendanceOut,
@@ -4258,6 +4259,7 @@ def _member_full_payload(
     trial_coaches = {c.id: c.full_name for c in db.query(Coach).filter(Coach.id.in_(trial_coach_ids)).all()} if trial_coach_ids else {}
     trial_branches = {b.id: b.name for b in db.query(Branch).filter(Branch.id.in_(trial_branch_ids)).all()} if trial_branch_ids else {}
     logs = _activity_logs_for_student(db, student, limit=100)
+    category_prior = _category_prior_lessons_by_enrollment(db, student.id)
     return {
         "profile": student_to_member_dict(db, student),
         "health": medical_clearance_payload(student, _file_url),
@@ -4332,6 +4334,8 @@ def _member_full_payload(
                 "category_name": ce.course_category.name,
                 "status": ce.status,
                 "total_lessons": ce.total_lessons,
+                "lessons_already_taken": category_prior.get(ce.id, 0),
+                "remaining_from_paper": max(0, ce.total_lessons - category_prior.get(ce.id, 0)),
                 "started_at": ce.started_at.isoformat(),
                 "installment_plans": [
                     {
@@ -6706,9 +6710,9 @@ def admin_patch_course_category(
     }
 
 
-def _category_prior_lessons_imported(db: Session, student_id: int, enrollment_id: int) -> int:
-    """[F002][S003] Sum of「以上堂數」already imported for one category enrollment."""
-    total = 0
+def _category_prior_lessons_by_enrollment(db: Session, student_id: int) -> dict[int, int]:
+    """[F002][S003] Sum paper-record imports independently for each category ledger."""
+    totals: dict[int, int] = {}
     rows = (
         db.query(AuditLog)
         .filter(
@@ -6720,11 +6724,17 @@ def _category_prior_lessons_imported(db: Session, student_id: int, enrollment_id
     for row in rows:
         try:
             detail = json.loads(row.detail or "{}")
-        except (TypeError, ValueError):
+            enrollment_id = int(detail.get("enrollment_id") or 0)
+            delta = int(detail.get("delta") or 0)
+        except (TypeError, ValueError, AttributeError):
             continue
-        if int(detail.get("enrollment_id") or 0) == enrollment_id:
-            total += int(detail.get("delta") or 0)
-    return max(0, total)
+        totals[enrollment_id] = totals.get(enrollment_id, 0) + delta
+    return {enrollment_id: max(0, total) for enrollment_id, total in totals.items()}
+
+
+def _category_prior_lessons_imported(db: Session, student_id: int, enrollment_id: int) -> int:
+    """[F002][S003] Read the imported paper count for one category enrollment."""
+    return _category_prior_lessons_by_enrollment(db, student_id).get(enrollment_id, 0)
 
 
 def _apply_category_prior_lessons(
@@ -9993,6 +10003,13 @@ def coach_student_records(
         .all()
     )
     title_by_id = {e.id: e.title for e in enrollments}
+    category_prior = _category_prior_lessons_by_enrollment(db, student.id)
+    categories = (
+        db.query(CategoryEnrollment)
+        .options(joinedload(CategoryEnrollment.course_category))
+        .filter(CategoryEnrollment.student_id == student.id, CategoryEnrollment.total_lessons > 0)
+        .all()
+    )
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
@@ -10020,6 +10037,16 @@ def coach_student_records(
                 installment_periods=_coach_installment_periods(e),
             )
             for e in enrollments
+        ],
+        category_enrollments=[
+            CoachStudentCategoryOut(
+                id=e.id,
+                category_name=e.course_category.name,
+                total_lessons=e.total_lessons,
+                lessons_already_taken=category_prior.get(e.id, 0),
+                remaining_from_paper=max(0, e.total_lessons - category_prior.get(e.id, 0)),
+            )
+            for e in categories
         ],
         checkins=[
             CoachStudentCheckinOut(
