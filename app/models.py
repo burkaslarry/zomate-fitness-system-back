@@ -154,7 +154,8 @@ class Student(Base):
     whatsapp_reminder_opt_in_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     photo_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
     signature_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    signature_image_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    #: [F007][S004] Deferred so roster queries never drag every signature PNG across the wire.
+    signature_image_blob: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True, deferred=True)
     face_id_external: Mapped[str | None] = mapped_column(String(80), nullable=True, unique=True)
     coach_trial_quota_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     #: [F001][S001] Home branch from registration — SW / TST for display prefixes.

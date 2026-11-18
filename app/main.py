@@ -2125,9 +2125,9 @@ def _read_upload_blob(relative_path: str | None) -> tuple[bytes | None, str | No
     return data, _upload_media_type(rel)
 
 
-def _signature_image_for_member(student: Student) -> str | None:
+def _signature_image_for_member(student: Student, blob_present: bool | None = None) -> str | None:
     """[F001][S004] Stable API URL for canvas signature (blob or disk)."""
-    blob = getattr(student, "signature_image_blob", None)
+    blob = getattr(student, "signature_image_blob", None) if blob_present is None else blob_present
     relative_path = _signature_relative_path(student.signature_image_url)
     has_file = bool(relative_path and (UPLOADS_DIR / relative_path).is_file())
     if not blob and not has_file:
@@ -2200,6 +2200,16 @@ def _is_active_member(db: Session, student_id: int) -> bool:
     )
 
 
+def _package_status_from_counts(active_category_count: int, scheduled_course_count: int) -> str:
+    if active_category_count and scheduled_course_count:
+        return f"Active package + {scheduled_course_count} scheduled course(s)"
+    if active_category_count:
+        return "Active package"
+    if scheduled_course_count:
+        return f"{scheduled_course_count} scheduled course(s)"
+    return "No active package"
+
+
 def _member_package_status(db: Session, student_id: int) -> str:
     """[F001][S003]
     Feature: Student Onboarding
@@ -2218,13 +2228,7 @@ def _member_package_status(db: Session, student_id: int) -> str:
         .scalar()
         or 0
     )
-    if active_category_count and scheduled_course_count:
-        return f"Active package + {scheduled_course_count} scheduled course(s)"
-    if active_category_count:
-        return "Active package"
-    if scheduled_course_count:
-        return f"{scheduled_course_count} scheduled course(s)"
-    return "No active package"
+    return _package_status_from_counts(int(active_category_count), int(scheduled_course_count))
 
 
 def _student_last_checkin_iso(db: Session, student_id: int) -> str | None:
@@ -2246,16 +2250,188 @@ def _student_home_branch_code(db: Session, student: Student) -> str | None:
     return branch.code if branch else None
 
 
-def student_to_member_dict(db: Session, student: Student) -> dict:
-    """[F001][S003]
-    Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
-    """
+def _batch_onboarding_labels(db: Session, students: list[Student]) -> dict[int, tuple]:
+    """[F002][S001] Resolve onboarding coach/category for a whole page with ~5 queries (no per-row lookups)."""
+    from .payment_records import _ONBOARDING_COACH_RE, _coach_label_from_health_notes, _coach_slug
+
+    ids = [s.id for s in students]
+    if not ids:
+        return {}
+    enrollments = (
+        db.query(CategoryEnrollment)
+        .filter(CategoryEnrollment.student_id.in_(ids), CategoryEnrollment.notes.isnot(None))
+        .order_by(CategoryEnrollment.id.desc())
+        .all()
+    )
+    by_student: dict[int, list[CategoryEnrollment]] = {}
+    for enr in enrollments:
+        by_student.setdefault(enr.student_id, []).append(enr)
+
+    cat_ids = {enr.course_category_id for enr in enrollments if enr.course_category_id}
+    categories = (
+        {c.id: c for c in db.query(CourseCategory).filter(CourseCategory.id.in_(cat_ids)).all()}
+        if cat_ids
+        else {}
+    )
+    coaches = db.query(Coach).all()
+    coach_by_id = {c.id: c for c in coaches}
+    coach_by_slug: dict[str, Coach] = {}
+    for coach in coaches:
+        if not coach.active:
+            continue
+        coach_by_slug.setdefault(_coach_slug(coach.full_name), coach)
+        uname = "".join(ch for ch in coach.full_name.lower() if ch.isalnum())
+        if uname:
+            coach_by_slug.setdefault(uname, coach)
+    users = {u.username: u for u in db.query(AppUser).filter(AppUser.coach_id.isnot(None)).all()}
+
+    latest_renewal: dict[int, RenewalRecord] = {}
+    for rr in (
+        db.query(RenewalRecord)
+        .filter(RenewalRecord.student_id.in_(ids), RenewalRecord.coach_id.isnot(None))
+        .order_by(RenewalRecord.id.desc())
+        .all()
+    ):
+        latest_renewal.setdefault(rr.student_id, rr)
+
+    def resolve(raw: str | None) -> tuple[int | None, str | None]:
+        token = (raw or "").strip()
+        if not token:
+            return None, None
+        if token.isdigit():
+            coach = coach_by_id.get(int(token))
+            if coach:
+                return coach.id, coach.full_name
+        slug = token.lower()
+        user = users.get(slug)
+        if user and user.coach_id and int(user.coach_id) in coach_by_id:
+            coach = coach_by_id[int(user.coach_id)]
+            return coach.id, coach.full_name
+        coach = coach_by_slug.get(slug)
+        if coach:
+            return coach.id, coach.full_name
+        return None, None
+
+    out: dict[int, tuple] = {}
+    for student in students:
+        coach_id: int | None = None
+        coach_name: str | None = None
+        for enr in by_student.get(student.id, []):
+            match = _ONBOARDING_COACH_RE.search(enr.notes or "")
+            if not match:
+                continue
+            resolved_id, resolved_name = resolve(match.group(1))
+            if resolved_id is not None:
+                coach_id, coach_name = resolved_id, resolved_name
+                break
+        if coach_id is None:
+            label = _coach_label_from_health_notes(student.health_notes)
+            if label:
+                resolved_id, resolved_name = resolve(label)
+                if resolved_id is not None:
+                    coach_id, coach_name = resolved_id, resolved_name
+        if coach_id is None:
+            rr = latest_renewal.get(student.id)
+            if rr and rr.coach_id:
+                coach = coach_by_id.get(rr.coach_id)
+                coach_id = rr.coach_id
+                coach_name = coach.full_name if coach else rr.coach_name
+
+        cat_id: int | None = None
+        cat_name: str | None = None
+        for enr in by_student.get(student.id, []):
+            if not _ONBOARDING_COACH_RE.search(enr.notes or ""):
+                continue
+            cat = categories.get(enr.course_category_id) if enr.course_category_id else None
+            cat_id = enr.course_category_id
+            cat_name = cat.name if cat else None
+            break
+        out[student.id] = (coach_id, coach_name, cat_id, cat_name)
+    return out
+
+
+def _roster_context(db: Session, students: list[Student]) -> dict:
+    """[F001][S003] Page-level roster facts in ~10 queries; avoids the 10-per-student N+1 hang."""
+    ids = [s.id for s in students]
+    if not ids:
+        return {
+            "balances": {},
+            "last_checkins": {},
+            "active": set(),
+            "categories": {},
+            "courses": {},
+            "branches": {},
+            "signatures": {},
+            "onboarding": {},
+        }
+    balances = {
+        sid: int(total or 0)
+        for sid, total in db.query(
+            LessonLedgerEntry.student_id,
+            func.coalesce(func.sum(LessonLedgerEntry.delta_lessons), 0),
+        )
+        .filter(LessonLedgerEntry.student_id.in_(ids))
+        .group_by(LessonLedgerEntry.student_id)
+        .all()
+    }
+    last_checkins = dict(
+        db.query(CheckinLog.student_id, func.max(CheckinLog.created_at))
+        .filter(CheckinLog.student_id.in_(ids))
+        .group_by(CheckinLog.student_id)
+        .all()
+    )
+    cutoff = datetime.utcnow() - timedelta(days=ACTIVE_MEMBER_DAYS)
+    active_ids = {
+        sid
+        for (sid,) in db.query(CheckinLog.student_id)
+        .filter(CheckinLog.student_id.in_(ids), CheckinLog.created_at >= cutoff)
+        .distinct()
+        .all()
+    }
+    category_counts = dict(
+        db.query(CategoryEnrollment.student_id, func.count(CategoryEnrollment.id))
+        .filter(CategoryEnrollment.student_id.in_(ids), CategoryEnrollment.status == "active")
+        .group_by(CategoryEnrollment.student_id)
+        .all()
+    )
+    course_counts = dict(
+        db.query(CourseEnrollment.student_id, func.count(CourseEnrollment.id))
+        .filter(CourseEnrollment.student_id.in_(ids))
+        .group_by(CourseEnrollment.student_id)
+        .all()
+    )
+    branch_ids = sorted({s.branch_id for s in students if s.branch_id})
+    branches = (
+        {b.id: b for b in db.query(Branch).filter(Branch.id.in_(branch_ids)).all()} if branch_ids else {}
+    )
+    signatures = dict(
+        db.query(Student.id, Student.signature_image_blob.isnot(None)).filter(Student.id.in_(ids)).all()
+    )
+    return {
+        "balances": balances,
+        "last_checkins": last_checkins,
+        "active": active_ids,
+        "categories": category_counts,
+        "courses": course_counts,
+        "branches": branches,
+        "signatures": signatures,
+        "onboarding": _batch_onboarding_labels(db, students),
+    }
+
+
+def _member_dict(
+    student: Student,
+    *,
+    branch: Branch | None,
+    lesson_balance: int,
+    is_active: bool,
+    package_status: str,
+    last_checkin_iso: str | None,
+    signature_url: str | None,
+    onboarding: tuple[int | None, str | None, int | None, str | None],
+) -> dict:
+    ob_coach_id, ob_coach_name, ob_cat_id, ob_cat_name = onboarding
     trial_q = getattr(student, "coach_trial_quota_remaining", 1)
-    ob_coach_id, ob_coach_name = student_onboarding_coach(db, student.id)
-    ob_cat_id, ob_cat_name = student_onboarding_category(db, student.id)
-    branch = None
-    if getattr(student, "branch_id", None):
-        branch = db.get(Branch, student.branch_id)
     return {
         "id": student.id,
         "hkid": student.hkid,
@@ -2267,15 +2443,15 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "emergency_contact_name": student.emergency_contact_name,
         "emergency_contact_relationship": student.emergency_contact_relationship,
         "emergency_contact_phone": student.emergency_contact_phone,
-        "lesson_balance": _lesson_balance_sum(db, student.id),
+        "lesson_balance": lesson_balance,
         "coach_trial_quota_remaining": int(trial_q),
         "photo_path": student.photo_path,
         "photo_url": _file_url(student.photo_path),
-        "signature_image_url": _signature_image_for_member(student),
+        "signature_image_url": signature_url,
         "used_mobile_number": student.used_mobile_number,
-        "is_active": _is_active_member(db, student.id),
-        "current_course_package_status": _member_package_status(db, student.id),
-        "last_checkin_at": _student_last_checkin_iso(db, student.id),
+        "is_active": is_active,
+        "current_course_package_status": package_status,
+        "last_checkin_at": last_checkin_iso,
         "created_at": student.created_at.isoformat(),
         "medical_clearance_status": getattr(student, "medical_clearance_status", None) or "not_required",
         "parq_any_yes": _student_parq_any_yes(student),
@@ -2289,6 +2465,39 @@ def student_to_member_dict(db: Session, student: Student) -> dict:
         "branch_name": branch.name if branch else None,
         "display_name": format_student_display_name(student, branch.code if branch else None),
     }
+
+
+def student_to_member_dicts(db: Session, students: list[Student]) -> list[dict]:
+    """[F001][S003] Batched member dicts for roster pages — one query set per page."""
+    ctx = _roster_context(db, students)
+    out: list[dict] = []
+    for student in students:
+        last_checkin = ctx["last_checkins"].get(student.id)
+        out.append(
+            _member_dict(
+                student,
+                branch=ctx["branches"].get(student.branch_id) if student.branch_id else None,
+                lesson_balance=ctx["balances"].get(student.id, 0),
+                is_active=student.id in ctx["active"],
+                package_status=_package_status_from_counts(
+                    int(ctx["categories"].get(student.id, 0)),
+                    int(ctx["courses"].get(student.id, 0)),
+                ),
+                last_checkin_iso=last_checkin.isoformat() if last_checkin else None,
+                signature_url=_signature_image_for_member(
+                    student, ctx["signatures"].get(student.id, False)
+                ),
+                onboarding=ctx["onboarding"].get(student.id, (None, None, None, None)),
+            )
+        )
+    return out
+
+
+def student_to_member_dict(db: Session, student: Student) -> dict:
+    """[F001][S003]
+    Member dict for admin / public profile. Sign-in PINs are **per course enrollment** only.
+    """
+    return student_to_member_dicts(db, [student])[0]
 
 
 def _student_parq_any_yes(student: Student) -> bool:
@@ -3996,7 +4205,7 @@ def search_members(q: str = "", db: Session = Depends(get_db)) -> list[dict]:
         .limit(20)
         .all()
     )
-    return [student_to_member_dict(db, row) for row in rows]
+    return student_to_member_dicts(db, rows)
 
 
 @app.get("/api/members/lookup-phone")
@@ -4756,7 +4965,7 @@ def list_students(
         )
     total = int(base.count() or 0)
     rows = base.order_by(Student.id.desc()).offset(offset).limit(limit).all()
-    items = [student_to_member_dict(db, row) for row in rows]
+    items = student_to_member_dicts(db, rows)
 
     # Global summary cards (ignore current search so totals stay stable while paging).
     total_all = int(
