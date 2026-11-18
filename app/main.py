@@ -2326,14 +2326,19 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
     )
 
 
-def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict]:
-    rows = (
+def _course_checkin_pins_for_student(
+    db: Session, student: Student, *, include_deleted: bool = False
+) -> list[dict]:
+    query = (
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.branch), joinedload(CourseEnrollment.coach))
         .filter(CourseEnrollment.student_id == student.id)
-        .filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
-        .all()
     )
+    # [F004][S002] Removed packages stay readable (visible N by default) so their payment records survive.
+    if not include_deleted:
+        query = query.filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
+    rows = query.all()
+    deleted_ids = set(db.scalars(_deleted_course_enrollment_ids()).all())
     # [F004][S002] Lessons already taken gate the 「唔需要上傳文件」 tick per installment period.
     lessons_attended = db.query(func.count(CheckinLog.id)).filter(CheckinLog.student_id == student.id).scalar() or 0
     out: list[dict] = []
@@ -2363,6 +2368,7 @@ def _course_checkin_pins_for_student(db: Session, student: Student) -> list[dict
                 "installment_segments": seg_dicts,
                 "no_upload_installment_nos": sorted(_course_no_upload_nos(enr)),
                 "lessons_attended": int(lessons_attended),
+                "deleted": enr.id in deleted_ids,
             }
         )
     return out
@@ -4015,7 +4021,13 @@ def get_member(hkid: str, db: Session = Depends(get_db)) -> dict:
     return student_to_member_dict(db, get_student_by_hkid_or_404(db, hkid))
 
 
-def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | None = None) -> dict:
+def _member_full_payload(
+    db: Session,
+    student: Student,
+    *,
+    fallback_hkid: str | None = None,
+    include_deleted: bool = False,
+) -> dict:
     """[F001][S002] Build student detail payload; route may lookup by id or HKID."""
     deleted_receipt_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "receipts")
     deleted_renewal_ids = select(DeletedRecord.entity_id).where(DeletedRecord.entity_type == "renewal_records")
@@ -4102,7 +4114,7 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
             }
             for a in logs
         ],
-        "course_checkin_pins": _course_checkin_pins_for_student(db, student),
+        "course_checkin_pins": _course_checkin_pins_for_student(db, student, include_deleted=include_deleted),
         "payment_records": build_payment_records(db, student_id=student.id, file_url_fn=_file_url),
         "category_enrollments": [
             {
@@ -4152,11 +4164,13 @@ def _member_full_payload(db: Session, student: Student, *, fallback_hkid: str | 
 
 
 @app.get("/api/members/by-id/{student_id}/full")
-def get_member_full_by_id(student_id: int, db: Session = Depends(get_db)) -> dict:
+def get_member_full_by_id(
+    student_id: int, include_deleted: bool = False, db: Session = Depends(get_db)
+) -> dict:
     student = db.get(Student, student_id)
     if student is None or _is_deleted(db, "students", student.id):
         raise HTTPException(status_code=404, detail="Student not found.")
-    return _member_full_payload(db, student)
+    return _member_full_payload(db, student, include_deleted=include_deleted)
 
 
 @app.get("/api/members/by-id/{student_id}/signature")

@@ -148,6 +148,33 @@ def test_coach_can_cancel_own_pending_package(db_session):
     assert main._is_deleted(db_session, "course_enrollments", enr2.id)
 
 
+def test_deleted_package_stays_readable_so_payment_records_do_not_disappear(db_session):
+    """[F004][S002] Removed package is hidden by default; Visible Y exposes it read-only for audits."""
+    coach, alice, _enr1, enr2 = _seed(db_session)
+    coach_user = AppUser(
+        username="fung",
+        role="COACH",
+        password_salt="",
+        password_hash="",
+        coach_id=coach.id,
+    )
+    main.coach_cancel_enrollment(
+        enrollment_id=enr2.id,
+        payload=main.CoachEnrollmentCancelBody(coach_id=coach.id),
+        db=db_session,
+        user=coach_user,
+    )
+
+    hidden = main._member_full_payload(db_session, alice)
+    assert all(row["course_id"] != enr2.id for row in hidden["course_checkin_pins"])
+
+    shown = main._member_full_payload(db_session, alice, include_deleted=True)
+    removed = next(row for row in shown["course_checkin_pins"] if row["course_id"] == enr2.id)
+    assert removed["deleted"] is True
+    assert removed["checkin_pin"] == "22222"
+    assert removed["total_lessons"] == 10
+
+
 def test_coach_cannot_cancel_other_coachs_package(db_session):
     """[F003][S009] A coach may only cancel packages assigned to their own profile."""
     coach, _alice, enr1, _enr2 = _seed(db_session)
