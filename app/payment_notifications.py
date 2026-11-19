@@ -550,7 +550,7 @@ def send_schedule_booking_whatsapp(
     payment_state = course_payment_state(enrollment)
     if getattr(enrollment, "legacy_category_enrollment_id", None):
         # [F003][S007] Converted paper ledger was paid offline; not a new course sale.
-        payment_status = "舊系統紀錄"
+        payment_status = "已付款"
     else:
         payment_status = "已付款" if payment_state.get("confirmed") or payment_state.get("fully_paid") else "未付款"
     lesson_when = format_lesson_datetime(enrollment) if enrollment.coach_time_confirmed else "待教練安排"

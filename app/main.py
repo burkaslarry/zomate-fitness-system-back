@@ -9487,7 +9487,7 @@ def _coach_payment_summary(
     """[F003][S003] Derive payment + installment labels for coach finance tab."""
     # [F003][S007] Paper ledger converted for scheduling was paid offline, not a new course sale.
     if getattr(enr, "legacy_category_enrollment_id", None):
-        return "Paid", "舊系統紀錄", None, None
+        return "Paid", "全數已付", None, None
     segments = parse_segment_pins_json(enr.segment_pins_json)
     if len(segments) <= 1:
         if len(segments) == 1 and not segments[0].paid:
