@@ -127,6 +127,7 @@ from .schemas import (
     CoachAttendanceLedgerSummaryOut,
     CoachAttendanceReportRowOut,
     CoachBookSession,
+    CoachCategoryBooking,
     CoachEnrollmentCancelBody,
     CoachPersonalBlockCreate,
     CoachPersonalBlockOut,
@@ -2691,6 +2692,7 @@ def _migrate_enrollment_merged_columns(db: Session) -> None:
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_start_date DATE NULL",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS series_end_date DATE NULL",
         "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS coach_time_confirmed BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE zomate_fs_course_enrollments ADD COLUMN IF NOT EXISTS legacy_category_enrollment_id INTEGER NULL",
         """
         DO $$
         BEGIN
@@ -6737,6 +6739,33 @@ def _category_prior_lessons_imported(db: Session, student_id: int, enrollment_id
     return _category_prior_lessons_by_enrollment(db, student_id).get(enrollment_id, 0)
 
 
+def _category_prior_totals_for_students(
+    db: Session, student_ids: list[int]
+) -> dict[tuple[int, int], int]:
+    """[F003][S005] Batch paper-count lookup so the coach roster stays single-query."""
+    if not student_ids:
+        return {}
+    totals: dict[tuple[int, int], int] = {}
+    rows = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.action == "category_prior_lessons_import",
+            AuditLog.student_id.in_(student_ids),
+        )
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+            enrollment_id = int(detail.get("enrollment_id") or 0)
+            delta = int(detail.get("delta") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        key = (row.student_id, enrollment_id)
+        totals[key] = totals.get(key, 0) + delta
+    return {key: max(0, total) for key, total in totals.items()}
+
+
 def _apply_category_prior_lessons(
     db: Session, student: Student, enrollment: CategoryEnrollment, prior: int, role: str
 ) -> None:
@@ -9438,6 +9467,9 @@ def _coach_payment_summary(
     db: Session, enr: CourseEnrollment, student: Student
 ) -> tuple[str, str, float | None, float | None]:
     """[F003][S003] Derive payment + installment labels for coach finance tab."""
+    # [F003][S007] Paper ledger converted for scheduling was paid offline, not a new course sale.
+    if getattr(enr, "legacy_category_enrollment_id", None):
+        return "Paid", "紙本舊帳", None, None
     segments = parse_segment_pins_json(enr.segment_pins_json)
     if len(segments) <= 1:
         if len(segments) == 1 and not segments[0].paid:
@@ -9898,6 +9930,18 @@ def coach_list_students(
             .all()
             if course_id is not None
         }
+    # [F003][S007] Legacy packages expose the paper 已上 count alongside the schedulable lessons.
+    legacy_prior_by_course: dict[int, int] = {}
+    legacy_by_student: dict[int, list[CourseEnrollment]] = {}
+    for enr in rows:
+        if enr.legacy_category_enrollment_id:
+            legacy_by_student.setdefault(enr.student_id, []).append(enr)
+    for sid, legacy_rows in legacy_by_student.items():
+        prior_map = _category_prior_lessons_by_enrollment(db, sid)
+        for legacy_enr in legacy_rows:
+            legacy_prior_by_course[legacy_enr.id] = prior_map.get(
+                int(legacy_enr.legacy_category_enrollment_id or 0), 0
+            )
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
@@ -9920,6 +9964,7 @@ def coach_list_students(
             installment_periods=_coach_installment_periods(enr),
             next_installment_no=next_no,
             next_reminder_lesson=next_reminder,
+            legacy_prior_lessons=legacy_prior_by_course.get(enr.id, 0),
         )
         if st.id not in by_student:
             by_student[st.id] = CoachStudentBriefOut(
@@ -9954,6 +9999,31 @@ def coach_list_students(
             enrollment_count=0,
             pending_schedule=False,
         )
+    # [F003][S005] Roster rows also show imported paper ledgers; packages stay course-only.
+    roster_ids = list(by_student)
+    if roster_ids:
+        prior_map = _category_prior_totals_for_students(db, roster_ids)
+        cat_rows = (
+            db.query(CategoryEnrollment)
+            .options(joinedload(CategoryEnrollment.course_category))
+            .filter(
+                CategoryEnrollment.student_id.in_(roster_ids),
+                CategoryEnrollment.total_lessons > 0,
+            )
+            .order_by(CategoryEnrollment.student_id.asc(), CategoryEnrollment.id.asc())
+            .all()
+        )
+        for cat in cat_rows:
+            prior = prior_map.get((cat.student_id, cat.id), 0)
+            by_student[cat.student_id].category_packages.append(
+                CoachStudentCategoryOut(
+                    id=cat.id,
+                    category_name=cat.course_category.name,
+                    total_lessons=cat.total_lessons,
+                    lessons_already_taken=prior,
+                    remaining_from_paper=max(0, cat.total_lessons - prior),
+                )
+            )
     return sorted(by_student.values(), key=lambda r: (r.full_name.lower(), r.student_id))
 
 
@@ -10010,6 +10080,21 @@ def coach_student_records(
         .filter(CategoryEnrollment.student_id == student.id, CategoryEnrollment.total_lessons > 0)
         .all()
     )
+    # [F003][S007] Tell the coach whether a paper ledger was already converted for scheduling.
+    scheduled_active: dict[int, int] = {}
+    scheduled_once: set[int] = set()
+    category_ids = [c.id for c in categories]
+    if category_ids:
+        legacy_rows = (
+            db.query(CourseEnrollment)
+            .filter(CourseEnrollment.legacy_category_enrollment_id.in_(category_ids))
+            .all()
+        )
+        for row in legacy_rows:
+            cat_id = int(row.legacy_category_enrollment_id or 0)
+            scheduled_once.add(cat_id)
+            if not _is_deleted(db, "course_enrollments", row.id):
+                scheduled_active[cat_id] = row.id
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
@@ -10035,6 +10120,11 @@ def coach_student_records(
                 next_installment_no=_next_unpaid_installment_meta(e)[0],
                 next_reminder_lesson=_next_unpaid_installment_meta(e)[1],
                 installment_periods=_coach_installment_periods(e),
+                legacy_prior_lessons=(
+                    category_prior.get(int(e.legacy_category_enrollment_id or 0), 0)
+                    if e.legacy_category_enrollment_id
+                    else 0
+                ),
             )
             for e in enrollments
         ],
@@ -10045,6 +10135,8 @@ def coach_student_records(
                 total_lessons=e.total_lessons,
                 lessons_already_taken=category_prior.get(e.id, 0),
                 remaining_from_paper=max(0, e.total_lessons - category_prior.get(e.id, 0)),
+                scheduled_enrollment_id=scheduled_active.get(e.id),
+                scheduled_once=e.id in scheduled_once,
             )
             for e in categories
         ],
@@ -10188,6 +10280,128 @@ def coach_book_session(
     )
 
 
+@app.post("/api/coach/category-bookings", response_model=CourseOut)
+def coach_book_category_session(
+    payload: CoachCategoryBooking,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_staff_for_coach_routes),
+) -> CourseOut:
+    """[F003][S007] Convert one imported paper ledger into a schedulable course.
+
+    The category import already credited the ledger, so this endpoint posts no lesson
+    credit. The course holds only the remaining paper lessons; the paper 已上 count stays
+    on the category ledger and both the roster and dossier show the combined 已上／剩.
+    """
+    cid = _resolve_coach_id_param(db, user, payload.coach_id)
+    # [F003][S007] Lock the ledger only — joinedload + FOR UPDATE breaks Postgres (outer join).
+    cat = (
+        db.query(CategoryEnrollment)
+        .filter(CategoryEnrollment.id == payload.category_enrollment_id)
+        .with_for_update(of=CategoryEnrollment)
+        .populate_existing()
+        .first()
+    )
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category enrollment not found.")
+    student = db.get(Student, cat.student_id)
+    if not student or _is_deleted(db, "students", student.id):
+        raise HTTPException(status_code=404, detail="Student not found.")
+    if not _coach_teaches_student(db, cid, student.id):
+        raise HTTPException(status_code=403, detail="This student is not assigned to this coach.")
+    existing = (
+        db.query(CourseEnrollment)
+        .filter(CourseEnrollment.legacy_category_enrollment_id == cat.id)
+        .first()
+    )
+    if existing:
+        detail = (
+            "此舊 package 已排程過而課程已刪除；如需重排，請聯絡 Admin。"
+            if _is_deleted(db, "course_enrollments", existing.id)
+            else "此舊 package 已排程。"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+    prior = _category_prior_lessons_imported(db, student.id, cat.id)
+    total = int(cat.total_lessons or 0)
+    remaining = max(0, total - prior)
+    if remaining <= 0:
+        raise HTTPException(status_code=400, detail="此舊 package 紙本剩餘 0 堂，無需排程。")
+    coach = db.get(Coach, cid)
+    if coach is None or coach.branch_id is None:
+        raise HTTPException(status_code=400, detail="教練未設定分校，請先由 Admin 設定。")
+    start = datetime.combine(payload.day, time(payload.start_hour, payload.start_minute))
+    end = start + timedelta(hours=payload.duration_hours)
+    _assert_initial_staff_booking(start, end)
+    _assert_coach_slot_available(
+        db, cid, payload.day, start, end, allow_lesson_overlap=True
+    )
+    lesson_dates = enumerate_lesson_dates(payload.day, [payload.day.weekday()], remaining)
+    if not lesson_dates:
+        raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
+    title = f"{cat.course_category.name}（舊 package）"
+    pin = allocate_enrollment_pin(
+        db,
+        None,
+        student.id,
+        peer_branch_id=coach.branch_id,
+        peer_coach_id=cid,
+        peer_title=title,
+        peer_series_start=lesson_dates[0],
+    )
+    enr = CourseEnrollment(
+        title=title,
+        branch_id=coach.branch_id,
+        coach_id=cid,
+        scheduled_start=start,
+        scheduled_end=end,
+        # [F003][S007] Only the remaining paper lessons are schedulable; the category ledger
+        # keeps the full total and paper 已上 count so check-in windows stay exact.
+        total_lessons=remaining,
+        lesson_weekdays=str(payload.day.weekday()),
+        series_start_date=payload.day,
+        series_end_date=lesson_dates[-1],
+        student_id=student.id,
+        checkin_pin=pin,
+        segment_pins_json=None,
+        payment_state_json=json.dumps({"legacy_category": True}, ensure_ascii=False),
+        coach_time_confirmed=True,
+        legacy_category_enrollment_id=cat.id,
+    )
+    db.add(enr)
+    db.flush()
+    _set_whatsapp_reminder_opt_in(student, True)
+    db.add(
+        AuditLog(
+            action="coach_category_booking",
+            student_id=student.id,
+            course_id=enr.id,
+            coach_id=cid,
+            detail=json.dumps(
+                {
+                    "category_enrollment_id": cat.id,
+                    "total_lessons": total,
+                    "prior_lessons": prior,
+                    "scheduled_lessons": remaining,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    record_activity(db, student, "coach_category_booking", enr.id)
+    db.commit()
+    send_schedule_booking_whatsapp(
+        db, log_whatsapp, student=student, enrollment=enr, notify_coach=True
+    )
+    db.commit()
+    full = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == enr.id)
+        .first()
+    )
+    assert full is not None
+    return enrollment_to_out(full)
+
+
 @app.post("/api/coach/enrollments/{enrollment_id}/confirm-schedule", response_model=CourseOut)
 def coach_confirm_enrollment_schedule(
     enrollment_id: int,
@@ -10277,7 +10491,8 @@ def coach_cancel_enrollment(
         _assert_change_notice(next_session_start)
     attended = count_course_checkins(db, enr.student_id, enr.id) if enr.student else 0
     unused = max(0, int(enr.total_lessons or 0) - int(attended))
-    if enr.student and unused > 0:
+    is_legacy = getattr(enr, "legacy_category_enrollment_id", None) is not None
+    if enr.student and unused > 0 and not is_legacy:
         # [F007][S002] Reverse remaining package credit so 餘下堂數 updates after cancel.
         apply_lesson_ledger_delta(
             db,
@@ -10287,12 +10502,19 @@ def coach_cancel_enrollment(
             enrollment_id=enr.id,
             created_by_role=user.role.lower(),
         )
+    # [F003][S007] Legacy conversion never posted a lesson credit, so nothing to reverse.
+    # The category ledger keeps its paper count and blocks re-scheduling after cancel.
     _record_soft_delete(db, "course_enrollments", enr.id, user)
     if enr.student:
         record_activity(db, enr.student, "coach_cancel_enrollment", enr.id)
     db.commit()
     bal = _lesson_balance_sum(db, enr.student_id) if enr.student_id else 0
-    return {"ok": True, "enrollment_id": enr.id, "lessons_reversed": unused, "lesson_balance": bal}
+    return {
+        "ok": True,
+        "enrollment_id": enr.id,
+        "lessons_reversed": 0 if is_legacy else unused,
+        "lesson_balance": bal,
+    }
 
 
 def _require_enrollment_session(

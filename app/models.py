@@ -93,6 +93,10 @@ class CourseEnrollment(Base):
     no_upload_installment_nos_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     #: False until coach assigns this student a calendar slot on the coach dashboard.
     coach_time_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # [F003][S007] Set when a coach turns one imported paper ledger into this schedulable course.
+    legacy_category_enrollment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_category_enrollments.id"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     branch: Mapped["Branch"] = relationship(back_populates="course_enrollments")

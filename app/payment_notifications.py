@@ -537,9 +537,22 @@ def send_schedule_booking_whatsapp(
         phone_display = phone_display[3:]
     attended = count_course_checkins(db, student.id, enrollment.id)
     total_lessons = int(enrollment.total_lessons or 0)
+    legacy_prior = 0
+    if getattr(enrollment, "legacy_category_enrollment_id", None):
+        # [F003][S007] Legacy package stores only schedulable lessons; paper 已上 lives in the ledger.
+        from .main import _category_prior_lessons_imported
+
+        legacy_prior = _category_prior_lessons_imported(
+            db, student.id, int(enrollment.legacy_category_enrollment_id)
+        )
+    attended_display = attended + legacy_prior
     remaining = max(0, total_lessons - attended) if total_lessons else 0
     payment_state = course_payment_state(enrollment)
-    payment_status = "已付款" if payment_state.get("confirmed") or payment_state.get("fully_paid") else "未付款"
+    if getattr(enrollment, "legacy_category_enrollment_id", None):
+        # [F003][S007] Converted paper ledger was paid offline; not a new course sale.
+        payment_status = "紙本舊帳"
+    else:
+        payment_status = "已付款" if payment_state.get("confirmed") or payment_state.get("fully_paid") else "未付款"
     lesson_when = format_lesson_datetime(enrollment) if enrollment.coach_time_confirmed else "待教練安排"
     if enrollment.scheduled_start and enrollment.coach_time_confirmed:
         lesson_when = enrollment.scheduled_start.strftime("%Y-%m-%d %H:%M")
@@ -551,7 +564,7 @@ def send_schedule_booking_whatsapp(
         f"課堂 PIN：{pin}\n"
         f"上堂時間 : {lesson_when}\n"
         f"教練 : {coach_name}\n"
-        f"已上堂數: {attended}\n"
+        f"已上堂數: {attended_display}\n"
         f"餘下堂數: {remaining}\n"
         f"付款狀態: {payment_status}\n"
         "如需要改期，請於24小時前通知教練"

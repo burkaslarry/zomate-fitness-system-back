@@ -576,6 +576,19 @@ class CoachInstallmentPeriodOut(BaseModel):
     reminder_lesson: int | None = None
 
 
+class CoachStudentCategoryOut(BaseModel):
+    """[F003][S005] Category ledger import, distinct from schedulable courses."""
+
+    id: int
+    category_name: str
+    total_lessons: int
+    lessons_already_taken: int
+    remaining_from_paper: int
+    # [F003][S007] Set once the paper ledger has been converted to a schedulable course.
+    scheduled_enrollment_id: int | None = None
+    scheduled_once: bool = False
+
+
 class CoachStudentPackageOut(BaseModel):
     """[F003][S005] One course package (= one enrollment) on the coach roster row."""
 
@@ -592,6 +605,8 @@ class CoachStudentPackageOut(BaseModel):
     installment_periods: list[CoachInstallmentPeriodOut] = []
     next_installment_no: int | None = None
     next_reminder_lesson: int | None = None
+    # [F003][S007] Paper lessons imported into this schedulable legacy package.
+    legacy_prior_lessons: int = 0
 
 
 class CoachStudentBriefOut(BaseModel):
@@ -604,6 +619,8 @@ class CoachStudentBriefOut(BaseModel):
     enrollment_count: int
     pending_schedule: bool
     packages: list[CoachStudentPackageOut] = []
+    # [F003][S005] Imported paper ledgers are shown on the roster too, not only in the dossier.
+    category_packages: list[CoachStudentCategoryOut] = []
 
 
 class CoachStudentEnrollmentOut(BaseModel):
@@ -621,16 +638,8 @@ class CoachStudentEnrollmentOut(BaseModel):
     next_installment_no: int | None = None
     next_reminder_lesson: int | None = None
     installment_periods: list[CoachInstallmentPeriodOut] = []
-
-
-class CoachStudentCategoryOut(BaseModel):
-    """[F003][S005] Category ledger import, distinct from schedulable courses."""
-
-    id: int
-    category_name: str
-    total_lessons: int
-    lessons_already_taken: int
-    remaining_from_paper: int
+    # [F003][S007] Paper lessons already taken before this legacy package was scheduled.
+    legacy_prior_lessons: int = 0
 
 
 class CoachStudentCheckinOut(BaseModel):
@@ -717,6 +726,28 @@ class CoachBookSession(BaseModel):
 
     @model_validator(mode="after")
     def validate_slot_within_business_hours(self) -> "CoachBookSession":
+        allowed = {0.5, 1.0, 1.5, 2.0}
+        if self.duration_hours not in allowed:
+            raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
+        if self.start_minute not in {0, 15, 30, 45}:
+            raise ValueError("start_minute must be 0, 15, 30, or 45.")
+        if self.start_hour + self.start_minute / 60.0 + self.duration_hours > 24:
+            raise ValueError("Time slot must end by midnight (24:00).")
+        return self
+
+
+class CoachCategoryBooking(BaseModel):
+    """[F003][S007] Schedule the remaining paper lessons of one imported category ledger."""
+
+    coach_id: int | None = None
+    category_enrollment_id: int = Field(ge=1)
+    day: date
+    start_hour: int = Field(ge=0, le=23)
+    start_minute: int = Field(default=0, ge=0, le=45)
+    duration_hours: float = Field(ge=0.5, le=2)
+
+    @model_validator(mode="after")
+    def validate_slot_within_business_hours(self) -> "CoachCategoryBooking":
         allowed = {0.5, 1.0, 1.5, 2.0}
         if self.duration_hours not in allowed:
             raise ValueError("duration_hours must be 0.5, 1, 1.5, or 2.")
