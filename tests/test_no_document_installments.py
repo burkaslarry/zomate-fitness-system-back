@@ -8,9 +8,9 @@ import pytest
 from app import main
 from app.models import (
     AppUser,
+    Attendance,
     Branch,
     CategoryEnrollment,
-    CheckinLog,
     Coach,
     CourseCategory,
     CourseEnrollment,
@@ -202,8 +202,24 @@ def test_category_no_document_allows_confirm_without_proof(db_session, monkeypat
 def test_member_full_payload_exposes_no_document_flags(db_session):
     """[F004][S002] Student page renders ticks from these payload fields."""
     alice, enrollment, plan = _seed(db_session)
-    db_session.add(CheckinLog(student_id=alice.id, channel="qr_pin", created_at=datetime(2026, 10, 7, 10)))
-    db_session.add(CheckinLog(student_id=alice.id, channel="qr_pin", created_at=datetime(2026, 10, 8, 10)))
+    db_session.add_all([
+        Attendance(
+            student_id=alice.id,
+            course_id=enrollment.id,
+            coach_id=enrollment.coach_id,
+            branch_id=enrollment.branch_id,
+            attended_at=datetime(2026, 10, 7, 10),
+            session_calendar_date=date(2026, 10, 7),
+        ),
+        Attendance(
+            student_id=alice.id,
+            course_id=enrollment.id,
+            coach_id=enrollment.coach_id,
+            branch_id=enrollment.branch_id,
+            attended_at=datetime(2026, 10, 8, 10),
+            session_calendar_date=date(2026, 10, 8),
+        ),
+    ])
     from app.schemas import CourseInstallmentNoUpload
 
     main.admin_course_set_installment_no_upload(

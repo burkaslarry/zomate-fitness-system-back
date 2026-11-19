@@ -2550,8 +2550,21 @@ def _course_checkin_pins_for_student(
         query = query.filter(~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()))
     rows = query.all()
     deleted_ids = set(db.scalars(_deleted_course_enrollment_ids()).all())
-    # [F004][S002] Lessons already taken gate the 「唔需要上傳文件」 tick per installment period.
-    lessons_attended = db.query(func.count(CheckinLog.id)).filter(CheckinLog.student_id == student.id).scalar() or 0
+    # [F004][S002] Attendance is per course: a student may hold concurrent packages, so a
+    # student-wide check-in count would repeat the same「已上」value on every course card.
+    enr_ids = [enr.id for enr in rows]
+    used_by_course: dict[int, int] = {}
+    if enr_ids:
+        used_by_course = {
+            course_id: int(count)
+            for course_id, count in db.query(Attendance.course_id, func.count(Attendance.id))
+            .filter(Attendance.course_id.in_(enr_ids))
+            .group_by(Attendance.course_id)
+            .all()
+            if course_id is not None
+        }
+    # [F003][S007] Converted paper ledgers keep their 已上 on the category ledger.
+    legacy_prior = _category_prior_lessons_by_enrollment(db, student.id)
     out: list[dict] = []
     for enr in rows:
         segs = parse_segment_pins_json(enr.segment_pins_json)
@@ -2578,7 +2591,12 @@ def _course_checkin_pins_for_student(
                 "checkin_pin": enr.checkin_pin,
                 "installment_segments": seg_dicts,
                 "no_upload_installment_nos": sorted(_course_no_upload_nos(enr)),
-                "lessons_attended": int(lessons_attended),
+                "lessons_attended": used_by_course.get(enr.id, 0),
+                "legacy_prior_lessons": (
+                    legacy_prior.get(int(enr.legacy_category_enrollment_id), 0)
+                    if enr.legacy_category_enrollment_id
+                    else 0
+                ),
                 "deleted": enr.id in deleted_ids,
             }
         )
