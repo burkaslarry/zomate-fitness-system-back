@@ -9487,7 +9487,7 @@ def _coach_payment_summary(
     """[F003][S003] Derive payment + installment labels for coach finance tab."""
     # [F003][S007] Paper ledger converted for scheduling was paid offline, not a new course sale.
     if getattr(enr, "legacy_category_enrollment_id", None):
-        return "Paid", "紙本舊帳", None, None
+        return "Paid", "舊系統紀錄", None, None
     segments = parse_segment_pins_json(enr.segment_pins_json)
     if len(segments) <= 1:
         if len(segments) == 1 and not segments[0].paid:
@@ -10342,7 +10342,7 @@ def coach_book_category_session(
     total = int(cat.total_lessons or 0)
     remaining = max(0, total - prior)
     if remaining <= 0:
-        raise HTTPException(status_code=400, detail="此舊 package 紙本剩餘 0 堂，無需排程。")
+        raise HTTPException(status_code=400, detail="此舊 package 已無剩餘堂數，無需排程。")
     coach = db.get(Coach, cid)
     if coach is None or coach.branch_id is None:
         raise HTTPException(status_code=400, detail="教練未設定分校，請先由 Admin 設定。")
