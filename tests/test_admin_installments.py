@@ -305,7 +305,7 @@ def test_coach_payments_include_category_installments_awaiting_admin(db_session)
 
 
 def test_admin_confirm_category_installment_marks_paid(db_session, monkeypatch):
-    """[F004][S002] Admin 確認付款 turns a pending category proof into a paid period."""
+    """[F004][S002] Admin 確認付款 turns a pending category proof into a paid period with a real PIN."""
     alice, _bob = _seed(db_session)
     plan = _seed_alice_category_plan(db_session, alice)
     proof = Receipt(
@@ -326,7 +326,7 @@ def test_admin_confirm_category_installment_marks_paid(db_session, monkeypatch):
         amount=1200,
     )
     db_session.commit()
-    monkeypatch.setattr(main, "send_payment_whatsapp_notifications", lambda *args, **kwargs: {})
+    monkeypatch.setattr(main, "log_whatsapp", lambda *args, **kwargs: None)
     admin = AppUser(username="ops", role="ADMIN", password_salt="", password_hash="")
 
     result = main.admin_confirm_category_installment(
@@ -345,10 +345,29 @@ def test_admin_confirm_category_installment_marks_paid(db_session, monkeypatch):
     assert pay.paid_at is not None
     assert float(pay.amount) == 1200
 
+    wa = result["whatsapp"]
+    pin = wa["pin_unlocked"]
+    assert pin and pin.isdigit() and len(pin) == 5
+    assert pin != "—"
+    assert pin in wa["student"]["message"]
+    assert "課堂 PIN：" in wa["student"]["message"]
+    assert wa["student"]["wa_me_url"]
+    assert result["course_enrollment_id"]
+
+    linked = (
+        db_session.query(CourseEnrollment)
+        .filter(CourseEnrollment.legacy_category_enrollment_id == plan.enrollment_id)
+        .first()
+    )
+    assert linked is not None
+    assert linked.checkin_pin == pin
+    assert linked.coach_time_confirmed is False
+
     again = main.admin_confirm_category_installment(
         plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
     )
     assert again["already_paid"] is True
+    assert "whatsapp" not in again
 
     period = next(
         r
@@ -357,3 +376,26 @@ def test_admin_confirm_category_installment_marks_paid(db_session, monkeypatch):
     )["periods"][1]
     assert period["paid"] is True
     assert period["pending_confirmation"] is False
+
+
+def test_admin_confirm_category_installment_no_document_unlocks_pin(db_session, monkeypatch):
+    """[F004][S002] 「唔需要上傳文件」 confirm also issues a real 5-digit PIN in WhatsApp."""
+    alice, _bob = _seed(db_session)
+    plan = _seed_alice_category_plan(db_session, alice)
+    admin = AppUser(username="ops", role="ADMIN", password_salt="", password_hash="")
+    monkeypatch.setattr(main, "log_whatsapp", lambda *args, **kwargs: None)
+
+    main.admin_set_category_installment_no_document(
+        plan_id=plan.id,
+        installment_no=2,
+        payload=main.CategoryInstallmentNoDocument(no_document_required=True),
+        db=db_session,
+        user=admin,
+    )
+    confirmed = main.admin_confirm_category_installment(
+        plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
+    )
+    pin = confirmed["whatsapp"]["pin_unlocked"]
+    assert pin and pin.isdigit() and len(pin) == 5
+    assert pin in confirmed["whatsapp"]["student"]["message"]
+    assert confirmed["whatsapp"]["student"]["wa_me_url"]

@@ -195,6 +195,7 @@ from .medical_clearance import (
 )
 from .payment_notifications import (
     _mark_category_installment_paid,
+    _mark_course_installment_paid,
     apply_receipt_payment_match,
     format_student_display_name,
     mark_category_installment_pending,
@@ -6501,6 +6502,136 @@ def admin_installments(
     return {"rows": rows, "summary": summary}
 
 
+def _resolve_legacy_shell_coach_branch(db: Session, student: Student) -> tuple[int, int]:
+    """[F004][S002] Pick coach_id + branch_id for a PIN shell when no schedule exists yet."""
+    deleted_e = _deleted_course_enrollment_ids()
+    existing = (
+        db.query(CourseEnrollment)
+        .filter(
+            CourseEnrollment.student_id == student.id,
+            ~CourseEnrollment.id.in_(deleted_e),
+        )
+        .order_by(CourseEnrollment.id.desc())
+        .first()
+    )
+    if existing is not None:
+        coach = db.get(Coach, existing.coach_id)
+        if coach is not None and not _is_deleted(db, "coaches", coach.id) and coach.branch_id:
+            return int(coach.id), int(existing.branch_id)
+
+    ob_id, _ = student_onboarding_coach(db, student.id)
+    if ob_id:
+        coach = db.get(Coach, ob_id)
+        if (
+            coach is not None
+            and coach.active
+            and not _is_deleted(db, "coaches", coach.id)
+            and coach.branch_id
+        ):
+            return int(coach.id), int(student.branch_id or coach.branch_id)
+
+    branch_id = student.branch_id
+    q = db.query(Coach).filter(Coach.active.is_(True), Coach.branch_id.isnot(None))
+    if branch_id:
+        coach = q.filter(Coach.branch_id == branch_id).order_by(Coach.id.asc()).first()
+        if coach is not None and not _is_deleted(db, "coaches", coach.id):
+            return int(coach.id), int(branch_id)
+    coach = q.order_by(Coach.id.asc()).first()
+    if coach is None or _is_deleted(db, "coaches", coach.id) or not coach.branch_id:
+        raise HTTPException(status_code=400, detail="找不到可用教練以發出課堂 PIN。")
+    return int(coach.id), int(coach.branch_id)
+
+
+def _ensure_legacy_category_course_enrollment(
+    db: Session, category: CategoryEnrollment, student: Student
+) -> CourseEnrollment:
+    """[F004][S002] Reuse or create a shell CourseEnrollment so confirm WhatsApp can unlock a PIN."""
+    existing_rows = (
+        db.query(CourseEnrollment)
+        .filter(CourseEnrollment.legacy_category_enrollment_id == category.id)
+        .order_by(CourseEnrollment.id.asc())
+        .all()
+    )
+    for row in existing_rows:
+        if not _is_deleted(db, "course_enrollments", row.id):
+            return row
+
+    cat = (
+        db.query(CategoryEnrollment)
+        .options(joinedload(CategoryEnrollment.course_category))
+        .filter(CategoryEnrollment.id == category.id)
+        .first()
+    ) or category
+    cat_name = cat.course_category.name if getattr(cat, "course_category", None) else "課程"
+    title = f"{cat_name}（舊 package）"
+    prior = _category_prior_lessons_imported(db, student.id, category.id)
+    total = int(category.total_lessons or 0)
+    remaining = max(0, total - prior)
+    if remaining <= 0:
+        remaining = max(1, total) if total > 0 else 1
+    coach_id, branch_id = _resolve_legacy_shell_coach_branch(db, student)
+    placeholder_day = date.today() + timedelta(days=7)
+    start = datetime.combine(placeholder_day, time(10, 0))
+    end = start + timedelta(hours=1)
+    pin = allocate_enrollment_pin(
+        db,
+        None,
+        student.id,
+        peer_branch_id=branch_id,
+        peer_coach_id=coach_id,
+        peer_title=title,
+        peer_series_start=placeholder_day,
+    )
+    enr = CourseEnrollment(
+        title=title,
+        branch_id=branch_id,
+        coach_id=coach_id,
+        scheduled_start=start,
+        scheduled_end=end,
+        total_lessons=remaining,
+        lesson_weekdays=str(placeholder_day.weekday()),
+        series_start_date=placeholder_day,
+        series_end_date=placeholder_day,
+        student_id=student.id,
+        checkin_pin=pin,
+        segment_pins_json=None,
+        payment_state_json=json.dumps({"legacy_category": True}, ensure_ascii=False),
+        coach_time_confirmed=False,
+        legacy_category_enrollment_id=category.id,
+    )
+    db.add(enr)
+    db.flush()
+    return enr
+
+
+def _unlock_pin_for_category_confirm(
+    db: Session, course: CourseEnrollment, installment_no: int
+) -> None:
+    """[F004][S002] Issue/rotate a usable check-in PIN for this Admin category confirm."""
+    raw = getattr(course, "segment_pins_json", None)
+    if raw:
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError:
+            rows = None
+        if isinstance(rows, list) and any(
+            isinstance(r, dict) and int(r.get("installment_no") or 0) == installment_no
+            for r in rows
+        ):
+            _mark_course_installment_paid(course, installment_no)
+            _issue_confirmed_course_pins(db, course)
+            return
+    course.checkin_pin = allocate_enrollment_pin(
+        db,
+        course.id,
+        course.student_id,
+        peer_branch_id=course.branch_id,
+        peer_coach_id=course.coach_id,
+        peer_title=course.title,
+        peer_series_start=course.series_start_date,
+    )
+
+
 @app.patch("/api/admin/installment-plans/{plan_id}/payments/{installment_no}/confirm")
 def admin_confirm_category_installment(
     plan_id: int,
@@ -6512,7 +6643,7 @@ def admin_confirm_category_installment(
     """[F004][S002]
     Feature: Admin Reports & Financials
     Step: Admin 確認付款 for a coach-uploaded category installment proof
-    Logic: Mark that period paid once, then notify student/coach with the confirmed status.
+    Logic: Mark that period paid once, ensure a linked course PIN, then notify with 開課 WhatsApp.
     """
     plan = db.query(InstallmentPlan).filter(InstallmentPlan.id == plan_id).first()
     if plan is None:
@@ -6551,16 +6682,22 @@ def admin_confirm_category_installment(
     if amount is None and pay.amount:
         amount = float(pay.amount)
     _mark_category_installment_paid(db, plan_id, installment_no, amount)
+    # [F004][S002] Imported category packages often have no CourseEnrollment yet — create a PIN shell.
+    course = _ensure_legacy_category_course_enrollment(db, enrollment, student)
+    _unlock_pin_for_category_confirm(db, course, installment_no)
     db.add(
         AuditLog(
             action="category_installment_confirmed",
             student_id=student.id,
+            course_id=course.id,
             detail=json.dumps(
                 {
                     "installment_plan_id": plan_id,
                     "installment_no": installment_no,
                     "proof_receipt_id": pay.proof_receipt_id,
                     "amount": amount,
+                    "course_enrollment_id": course.id,
+                    "checkin_pin": course.checkin_pin,
                 },
                 ensure_ascii=False,
             ),
@@ -6574,6 +6711,7 @@ def admin_confirm_category_installment(
         student=student,
         receipt_confirmed=True,
         notify_coach=True,
+        course_enrollment_id=course.id,
         installment_plan_id=plan_id,
         installment_no=installment_no,
         amount=amount,
@@ -6585,6 +6723,7 @@ def admin_confirm_category_installment(
         "installment_plan_id": plan_id,
         "installment_no": installment_no,
         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
+        "course_enrollment_id": course.id,
         "whatsapp": whatsapp,
     }
 
@@ -10099,6 +10238,8 @@ def coach_student_records(
         .all()
     )
     # [F003][S007] Tell the coach whether a paper ledger was already converted for scheduling.
+    # PIN shells from Admin confirm (coach_time_confirmed=False) are not "scheduled" yet —
+    # coach booking must still attach a real slot to that shell.
     scheduled_active: dict[int, int] = {}
     scheduled_once: set[int] = set()
     category_ids = [c.id for c in categories]
@@ -10110,9 +10251,12 @@ def coach_student_records(
         )
         for row in legacy_rows:
             cat_id = int(row.legacy_category_enrollment_id or 0)
-            scheduled_once.add(cat_id)
-            if not _is_deleted(db, "course_enrollments", row.id):
+            if _is_deleted(db, "course_enrollments", row.id):
+                scheduled_once.add(cat_id)
+                continue
+            if row.coach_time_confirmed:
                 scheduled_active[cat_id] = row.id
+                scheduled_once.add(cat_id)
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
@@ -10331,13 +10475,15 @@ def coach_book_category_session(
         .filter(CourseEnrollment.legacy_category_enrollment_id == cat.id)
         .first()
     )
-    if existing:
-        detail = (
-            "此舊 package 已排程過而課程已刪除；如需重排，請聯絡 Admin。"
-            if _is_deleted(db, "course_enrollments", existing.id)
-            else "此舊 package 已排程。"
+    if existing and _is_deleted(db, "course_enrollments", existing.id):
+        raise HTTPException(
+            status_code=409,
+            detail="此舊 package 已排程過而課程已刪除；如需重排，請聯絡 Admin。",
         )
-        raise HTTPException(status_code=409, detail=detail)
+    # [F004][S002] Admin confirm may have created a PIN shell (coach_time_confirmed=False).
+    # Attach the real schedule to that shell instead of 409-ing forever.
+    if existing and existing.coach_time_confirmed:
+        raise HTTPException(status_code=409, detail="此舊 package 已排程。")
     prior = _category_prior_lessons_imported(db, student.id, cat.id)
     total = int(cat.total_lessons or 0)
     remaining = max(0, total - prior)
@@ -10356,35 +10502,63 @@ def coach_book_category_session(
     if not lesson_dates:
         raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
     title = f"{cat.course_category.name}（舊 package）"
-    pin = allocate_enrollment_pin(
-        db,
-        None,
-        student.id,
-        peer_branch_id=coach.branch_id,
-        peer_coach_id=cid,
-        peer_title=title,
-        peer_series_start=lesson_dates[0],
-    )
-    enr = CourseEnrollment(
-        title=title,
-        branch_id=coach.branch_id,
-        coach_id=cid,
-        scheduled_start=start,
-        scheduled_end=end,
+    if existing is not None:
+        enr = existing
+        enr.title = title
+        enr.branch_id = coach.branch_id
+        enr.coach_id = cid
+        enr.scheduled_start = start
+        enr.scheduled_end = end
         # [F003][S007] Only the remaining paper lessons are schedulable; the category ledger
         # keeps the full total and paper 已上 count so check-in windows stay exact.
-        total_lessons=remaining,
-        lesson_weekdays=str(payload.day.weekday()),
-        series_start_date=payload.day,
-        series_end_date=lesson_dates[-1],
-        student_id=student.id,
-        checkin_pin=pin,
-        segment_pins_json=None,
-        payment_state_json=json.dumps({"legacy_category": True}, ensure_ascii=False),
-        coach_time_confirmed=True,
-        legacy_category_enrollment_id=cat.id,
-    )
-    db.add(enr)
+        enr.total_lessons = remaining
+        enr.lesson_weekdays = str(payload.day.weekday())
+        enr.series_start_date = payload.day
+        enr.series_end_date = lesson_dates[-1]
+        # Keep the WhatsApp PIN already issued at Admin confirm when present.
+        if not (enr.checkin_pin and str(enr.checkin_pin).isdigit() and len(str(enr.checkin_pin)) == 5):
+            enr.checkin_pin = allocate_enrollment_pin(
+                db,
+                enr.id,
+                student.id,
+                peer_branch_id=coach.branch_id,
+                peer_coach_id=cid,
+                peer_title=title,
+                peer_series_start=lesson_dates[0],
+            )
+        if not enr.payment_state_json:
+            enr.payment_state_json = json.dumps({"legacy_category": True}, ensure_ascii=False)
+        enr.coach_time_confirmed = True
+    else:
+        pin = allocate_enrollment_pin(
+            db,
+            None,
+            student.id,
+            peer_branch_id=coach.branch_id,
+            peer_coach_id=cid,
+            peer_title=title,
+            peer_series_start=lesson_dates[0],
+        )
+        enr = CourseEnrollment(
+            title=title,
+            branch_id=coach.branch_id,
+            coach_id=cid,
+            scheduled_start=start,
+            scheduled_end=end,
+            # [F003][S007] Only the remaining paper lessons are schedulable; the category ledger
+            # keeps the full total and paper 已上 count so check-in windows stay exact.
+            total_lessons=remaining,
+            lesson_weekdays=str(payload.day.weekday()),
+            series_start_date=payload.day,
+            series_end_date=lesson_dates[-1],
+            student_id=student.id,
+            checkin_pin=pin,
+            segment_pins_json=None,
+            payment_state_json=json.dumps({"legacy_category": True}, ensure_ascii=False),
+            coach_time_confirmed=True,
+            legacy_category_enrollment_id=cat.id,
+        )
+        db.add(enr)
     db.flush()
     _set_whatsapp_reminder_opt_in(student, True)
     db.add(
@@ -10399,6 +10573,7 @@ def coach_book_category_session(
                     "total_lessons": total,
                     "prior_lessons": prior,
                     "scheduled_lessons": remaining,
+                    "attached_pin_shell": existing is not None,
                 },
                 ensure_ascii=False,
             ),
