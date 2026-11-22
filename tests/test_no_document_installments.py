@@ -167,7 +167,7 @@ def test_course_no_upload_rejects_paid_period(db_session, admin):
 def test_category_no_document_allows_confirm_without_proof(db_session, monkeypatch, admin):
     """[F004][S002] Category period confirms with the tick even when no receipt was uploaded."""
     alice, _enrollment, plan = _seed(db_session)
-    monkeypatch.setattr(main, "send_payment_whatsapp_notifications", lambda *args, **kwargs: {})
+    monkeypatch.setattr(main, "log_whatsapp", lambda *args, **kwargs: None)
 
     with pytest.raises(HTTPException) as exc:
         main.admin_confirm_category_installment(
@@ -197,6 +197,17 @@ def test_category_no_document_allows_confirm_without_proof(db_session, monkeypat
         .first()
     )
     assert pay.paid_at is not None
+    pin = confirmed["whatsapp"]["pin_unlocked"]
+    assert pin and pin.isdigit() and len(pin) == 5
+    assert pin in confirmed["whatsapp"]["student"]["message"]
+    assert confirmed["whatsapp"]["student"]["wa_me_url"]
+    linked = (
+        db_session.query(CourseEnrollment)
+        .filter(CourseEnrollment.legacy_category_enrollment_id == plan.enrollment_id)
+        .first()
+    )
+    assert linked is not None
+    assert linked.checkin_pin == pin
 
 
 def test_member_full_payload_exposes_no_document_flags(db_session):

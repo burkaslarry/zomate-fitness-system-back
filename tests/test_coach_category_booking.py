@@ -143,3 +143,39 @@ def test_cancel_legacy_package_does_not_reverse_paper_ledger(db_session, monkeyp
     assert category.remaining_from_paper == 15
     assert category.scheduled_enrollment_id is None
     assert category.scheduled_once is True
+
+
+def test_coach_booking_attaches_schedule_to_admin_confirm_pin_shell(db_session, monkeypatch):
+    """[F004][S002] Admin confirm PIN shell must not 409 forever; booking updates that shell."""
+    _branch, coach, student, ledger = _seed(db_session)
+    monkeypatch.setattr(main, "send_schedule_booking_whatsapp", lambda *a, **k: {"student": None, "coach": None})
+    shell = main._ensure_legacy_category_course_enrollment(db_session, ledger, student)
+    db_session.commit()
+    assert shell.coach_time_confirmed is False
+    pin_before = shell.checkin_pin
+
+    rec_before = main.coach_student_records(
+        student_id=student.id, coach_id=coach.id, db=db_session, user=_coach_user(coach)
+    )
+    category_before = next(c for c in rec_before.category_enrollments if c.id == ledger.id)
+    assert category_before.scheduled_enrollment_id is None
+    assert category_before.scheduled_once is False
+
+    payload = main.CoachCategoryBooking(
+        coach_id=coach.id,
+        category_enrollment_id=ledger.id,
+        day=date.today() + timedelta(days=3),
+        start_hour=10,
+        duration_hours=1,
+    )
+    out = main.coach_book_category_session(payload=payload, db=db_session, user=_coach_user(coach))
+
+    assert out.id == shell.id
+    updated = db_session.get(CourseEnrollment, shell.id)
+    assert updated.coach_time_confirmed is True
+    assert updated.checkin_pin == pin_before
+    assert updated.total_lessons == 15
+
+    with pytest.raises(main.HTTPException) as exc:
+        main.coach_book_category_session(payload=payload, db=db_session, user=_coach_user(coach))
+    assert exc.value.status_code == 409
