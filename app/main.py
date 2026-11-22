@@ -6950,6 +6950,26 @@ def _apply_category_prior_lessons(
     )
 
 
+def _category_enrollment_pin_shell_fields(
+    db: Session, enrollment: CategoryEnrollment, student: Student
+) -> dict:
+    """[F004][S002] Ensure a usable PIN shell after Admin saves an active package with remaining lessons.
+
+    Does not mark installments paid and does not send WhatsApp — Admin confirm owns notify/unlock.
+    """
+    if (enrollment.status or "active") != "active":
+        return {}
+    prior = _category_prior_lessons_imported(db, student.id, enrollment.id)
+    remaining = max(0, int(enrollment.total_lessons or 0) - prior)
+    if remaining <= 0:
+        return {}
+    course = _ensure_legacy_category_course_enrollment(db, enrollment, student)
+    return {
+        "course_enrollment_id": course.id,
+        "checkin_pin": course.checkin_pin,
+    }
+
+
 @app.post("/api/admin/students/{student_id}/category-enrollment")
 def admin_upsert_category_enrollment(
     student_id: int,
@@ -6986,6 +7006,7 @@ def admin_upsert_category_enrollment(
             )
         _apply_category_prior_lessons(db, student, existing, payload.lessons_already_taken, role)
         _resize_category_installment_plan(db, existing.id, payload.total_installments)
+        pin_fields = _category_enrollment_pin_shell_fields(db, existing, student)
         db.commit()
         return {
             "enrollment_id": existing.id,
@@ -6993,6 +7014,7 @@ def admin_upsert_category_enrollment(
             "total_installments": payload.total_installments,
             "lessons_already_taken": _category_prior_lessons_imported(db, student.id, existing.id),
             "lesson_balance": _lesson_balance_sum(db, student.id),
+            **pin_fields,
         }
 
     enr = CategoryEnrollment(
@@ -7030,6 +7052,7 @@ def admin_upsert_category_enrollment(
             ),
         )
     )
+    pin_fields = _category_enrollment_pin_shell_fields(db, enr, student)
     db.commit()
     db.refresh(enr)
     return {
@@ -7037,6 +7060,7 @@ def admin_upsert_category_enrollment(
         "total_lessons": enr.total_lessons,
         "lessons_already_taken": _category_prior_lessons_imported(db, student.id, enr.id),
         "lesson_balance": _lesson_balance_sum(db, student.id),
+        **pin_fields,
     }
 
 

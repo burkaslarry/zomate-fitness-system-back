@@ -301,6 +301,7 @@ def test_coach_payments_include_category_installments_awaiting_admin(db_session)
     )
     assert installment["status"] == "pending_confirmation"
     assert installment["receipt_id"] == proof.id
+    assert installment["no_document_required"] is False
     assert all(r["id"] != f"receipt-{proof.id}" for r in records)
 
 
@@ -392,6 +393,16 @@ def test_admin_confirm_category_installment_no_document_unlocks_pin(db_session, 
         db=db_session,
         user=admin,
     )
+    records = build_payment_records(db_session, student_id=alice.id)
+    tick_row = next(
+        r
+        for r in records
+        if r["record_type"] == "installment"
+        and r["installment_plan_id"] == plan.id
+        and r["installment_no"] == 2
+    )
+    assert tick_row["no_document_required"] is True
+
     confirmed = main.admin_confirm_category_installment(
         plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
     )

@@ -179,3 +179,45 @@ def test_coach_booking_attaches_schedule_to_admin_confirm_pin_shell(db_session, 
     with pytest.raises(main.HTTPException) as exc:
         main.coach_book_category_session(payload=payload, db=db_session, user=_coach_user(coach))
     assert exc.value.status_code == 409
+
+
+def test_coach_booking_attaches_to_upsert_pin_shell(db_session, monkeypatch):
+    """[F004][S002] Coach booking reuses the PIN shell created when Admin imports/saves the package."""
+    branch = Branch(name="SW", code="SW", address="Test")
+    coach = Coach(full_name="Coach Lee", phone="91230099", branch=branch, active=True)
+    student = Student(full_name="Upsert Shell Student", phone="91119999", branch=branch)
+    category = CourseCategory(name="Pilates Pack", created_by_role="admin")
+    db_session.add_all([branch, coach, student, category])
+    db_session.commit()
+    monkeypatch.setattr(main, "send_schedule_booking_whatsapp", lambda *a, **k: {"student": None, "coach": None})
+
+    saved = main.admin_upsert_category_enrollment(
+        student.id,
+        main.StudentCategoryEnrollmentCreate(
+            course_category_id=category.id,
+            total_lessons=20,
+            total_installments=2,
+            lessons_already_taken=5,
+        ),
+        db_session,
+        AppUser(username="ops", role="ADMIN", password_salt="", password_hash=""),
+    )
+    shell_id = saved["course_enrollment_id"]
+    pin_before = saved["checkin_pin"]
+    assert shell_id and pin_before and len(pin_before) == 5
+
+    payload = main.CoachCategoryBooking(
+        coach_id=coach.id,
+        category_enrollment_id=saved["enrollment_id"],
+        day=date.today() + timedelta(days=3),
+        start_hour=11,
+        duration_hours=1,
+    )
+    out = main.coach_book_category_session(payload=payload, db=db_session, user=_coach_user(coach))
+
+    assert out.id == shell_id
+    updated = db_session.get(CourseEnrollment, shell_id)
+    assert updated.coach_time_confirmed is True
+    assert updated.checkin_pin == pin_before
+    assert updated.total_lessons == 15
+    assert updated.legacy_category_enrollment_id == saved["enrollment_id"]

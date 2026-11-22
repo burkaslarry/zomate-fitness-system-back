@@ -578,6 +578,8 @@ def build_payment_records(
                         "category_enrollment_id": ce.id,
                         "due_date": pay.due_date.isoformat() if pay.due_date else None,
                         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
+                        # [F004][S002] Hydrate 「唔需要上傳文件」 after Admin reloads 付款紀錄.
+                        "no_document_required": bool(pay.no_document_required),
                         "receipt_id": proof.id if proof else None,
                         "receipt_url": file_url_fn(proof.file_path) if proof and file_url_fn else None,
                         "receipt_file_path": proof.file_path if proof else None,
