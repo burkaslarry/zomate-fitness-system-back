@@ -2538,6 +2538,70 @@ def student_to_student_out(db: Session, student: Student) -> StudentOut:
     )
 
 
+def _active_installment_plan_for_category(
+    db: Session, category_enrollment_id: int
+) -> InstallmentPlan | None:
+    """[F004][S002] Latest active category installment plan for an imported old package."""
+    return (
+        db.query(InstallmentPlan)
+        .options(joinedload(InstallmentPlan.payments))
+        .filter(
+            InstallmentPlan.enrollment_id == category_enrollment_id,
+            InstallmentPlan.status == "active",
+        )
+        .order_by(InstallmentPlan.id.desc())
+        .first()
+    )
+
+
+def _legacy_category_segments_for_pin_card(
+    db: Session, enr: CourseEnrollment
+) -> tuple[int | None, list[dict], list[int]]:
+    """[F004][S002] Mirror category installment periods onto the old-package course PIN card.
+
+    Old package shells often have no ``segment_pins_json``. Without this mirror the Admin UI
+    only shows a synthetic 第1期 and hides 「唔需要上傳文件」.
+    """
+    legacy_cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+    if not legacy_cat_id:
+        return None, [], []
+    plan = _active_installment_plan_for_category(db, int(legacy_cat_id))
+    if plan is None:
+        return None, [], []
+    pays = sorted(plan.payments or [], key=lambda p: int(p.installment_no or 0))
+    if not pays:
+        return int(plan.id), [], []
+    total_lessons = max(1, int(enr.total_lessons or 0) or len(pays))
+    n = len(pays)
+    seg_dicts: list[dict] = []
+    no_upload_nos: list[int] = []
+    for index, pay in enumerate(pays):
+        ino = int(pay.installment_no)
+        lesson_from = (index * total_lessons) // n + 1
+        lesson_to = ((index + 1) * total_lessons) // n
+        if lesson_to < lesson_from:
+            lesson_to = lesson_from
+        paid = pay.paid_at is not None
+        amount = float(pay.amount) if pay.amount is not None else None
+        if amount is not None and amount <= 0:
+            amount = None
+        seg_dicts.append(
+            {
+                "installment_no": ino,
+                "lesson_from": lesson_from,
+                "lesson_to": lesson_to,
+                "pin": str(enr.checkin_pin or "") if (ino == 1 or paid) else "",
+                "paid": paid,
+                "reminder_lesson": max(lesson_from, lesson_to - 1),
+                "amount_hkd": amount,
+                "has_pending_payment": (not paid) and pay.proof_receipt_id is not None,
+            }
+        )
+        if (not paid) and bool(pay.no_document_required):
+            no_upload_nos.append(ino)
+    return int(plan.id), seg_dicts, sorted(no_upload_nos)
+
+
 def _course_checkin_pins_for_student(
     db: Session, student: Student, *, include_deleted: bool = False
 ) -> list[dict]:
@@ -2579,6 +2643,13 @@ def _course_checkin_pins_for_student(
                 or "unassigned" in pending_keys
             )
             seg_dicts.append(d)
+        legacy_plan_id = None
+        no_upload_nos = sorted(_course_no_upload_nos(enr))
+        # [F004][S002] Old package PIN shells have no course segments — surface category periods.
+        if not seg_dicts and getattr(enr, "legacy_category_enrollment_id", None):
+            legacy_plan_id, seg_dicts, legacy_no_upload = _legacy_category_segments_for_pin_card(db, enr)
+            if legacy_no_upload:
+                no_upload_nos = legacy_no_upload
         out.append(
             {
                 "course_id": enr.id,
@@ -2591,13 +2662,19 @@ def _course_checkin_pins_for_student(
                 "total_lessons": enr.total_lessons,
                 "checkin_pin": enr.checkin_pin,
                 "installment_segments": seg_dicts,
-                "no_upload_installment_nos": sorted(_course_no_upload_nos(enr)),
+                "no_upload_installment_nos": no_upload_nos,
                 "lessons_attended": used_by_course.get(enr.id, 0),
                 "legacy_prior_lessons": (
                     legacy_prior.get(int(enr.legacy_category_enrollment_id), 0)
                     if enr.legacy_category_enrollment_id
                     else 0
                 ),
+                "legacy_category_enrollment_id": (
+                    int(enr.legacy_category_enrollment_id)
+                    if enr.legacy_category_enrollment_id
+                    else None
+                ),
+                "legacy_installment_plan_id": legacy_plan_id,
                 "deleted": enr.id in deleted_ids,
             }
         )
@@ -6765,6 +6842,70 @@ def admin_set_category_installment_no_document(
     }
 
 
+@app.patch("/api/admin/installment-plans/{plan_id}/payments/{installment_no}/unconfirm")
+def admin_unconfirm_category_installment(
+    plan_id: int,
+    installment_no: int,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Undo a mistaken Admin 確認付款 on one category / old-package period
+    Logic: Clear paid_at only for that period — never auto-mark sibling periods paid.
+    """
+    pay = (
+        db.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan_id,
+            InstallmentPayment.installment_no == installment_no,
+        )
+        .with_for_update()
+        .first()
+    )
+    if pay is None:
+        raise HTTPException(status_code=404, detail="Installment payment row not found.")
+    if pay.paid_at is None:
+        return {
+            "ok": True,
+            "already_unpaid": True,
+            "payment_id": pay.id,
+            "installment_plan_id": plan_id,
+            "installment_no": installment_no,
+        }
+    pay.paid_at = None
+    pay.status = "pending"
+    # Keep proof / no_document flags so Admin can re-confirm the same period.
+    plan = db.get(InstallmentPlan, plan_id)
+    enrollment = db.get(CategoryEnrollment, plan.enrollment_id) if plan else None
+    db.add(
+        AuditLog(
+            action="category_installment_unconfirmed",
+            student_id=enrollment.student_id if enrollment else None,
+            detail=json.dumps(
+                {
+                    "installment_plan_id": plan_id,
+                    "installment_no": installment_no,
+                    "payment_id": pay.id,
+                    "by": user.username,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "payment_id": pay.id,
+        "installment_plan_id": plan_id,
+        "installment_no": installment_no,
+        "paid_at": None,
+        "status": pay.status,
+        "no_document_required": bool(pay.no_document_required),
+        "proof_receipt_id": pay.proof_receipt_id,
+    }
+
+
 @app.get("/api/admin/course-categories")
 def admin_list_course_categories(
     include_deleted: bool = False,
@@ -8920,13 +9061,13 @@ def coach_register_course(
     return out
 
 
-@app.patch("/api/admin/courses/{course_id}/installment-paid", response_model=CourseOut)
+@app.patch("/api/admin/courses/{course_id}/installment-paid")
 def admin_course_mark_installment_paid(
     course_id: int,
     payload: CourseInstallmentMarkPaid,
     db: Session = Depends(get_db),
     user: AppUser = Depends(require_admin),
-) -> CourseOut:
+) -> dict:
     """[F002][S002]
     Feature: Course Entry & Automation
     Step: Unlock scheduled-package installment PIN after staff confirms payment
@@ -8945,6 +9086,32 @@ def admin_course_mark_installment_paid(
     )
     if not enr:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
+    # [F004][S002] Old package course card confirms the linked category period (WhatsApp + PIN).
+    legacy_cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+    if legacy_cat_id and not getattr(enr, "segment_pins_json", None):
+        plan = _active_installment_plan_for_category(db, int(legacy_cat_id))
+        if plan is None:
+            raise HTTPException(status_code=404, detail="舊 package 分期計劃不存在。")
+        confirmed = admin_confirm_category_installment(
+            plan_id=plan.id,
+            installment_no=payload.installment_no,
+            payload=None,
+            db=db,
+            user=user,
+        )
+        full = (
+            db.query(CourseEnrollment)
+            .options(*_enrollment_load_options())
+            .filter(CourseEnrollment.id == course_id)
+            .first()
+        )
+        if full is None or _is_deleted(db, "course_enrollments", full.id):
+            raise HTTPException(status_code=404, detail="Course not found.")
+        out = enrollment_to_out(full)
+        payload_out = out.model_dump() if hasattr(out, "model_dump") else out.dict()
+        if isinstance(confirmed, dict) and confirmed.get("whatsapp"):
+            payload_out["whatsapp"] = confirmed["whatsapp"]
+        return payload_out
     raw = getattr(enr, "segment_pins_json", None)
     if not raw:
         # [F004][S002] The same confirmation action also supports a one-payment course.
@@ -8967,7 +9134,8 @@ def admin_course_mark_installment_paid(
     pending = (state.setdefault("pending_payments", {}).get(str(payload.installment_no))
                or state["pending_payments"].get("full") or state["pending_payments"].get("unassigned", {}))
     if (existing or (state.get("fully_paid") and row.get("paid"))) and not pending:
-        return enrollment_to_out(enr)
+        out = enrollment_to_out(enr)
+        return out.model_dump() if hasattr(out, "model_dump") else out.dict()
     # [F004][S002] Admin 「唔需要上傳文件」 tick also authorizes confirmation without an uploaded proof.
     no_document_required = payload.installment_no in _course_no_upload_nos(enr)
     if not pending and not no_document_required:
@@ -8996,7 +9164,7 @@ def admin_course_mark_installment_paid(
     _issue_confirmed_course_pins(db, enr)
     record_activity(db, enr.student, "admin_confirm_installment_payment", enr.id)
     db.commit()
-    send_payment_whatsapp_notifications(
+    whatsapp = send_payment_whatsapp_notifications(
         db, log_whatsapp, student=enr.student, course_enrollment_id=enr.id,
         installment_no=payload.installment_no, receipt_confirmed=None, notify_coach=True,
     )
@@ -9009,7 +9177,10 @@ def admin_course_mark_installment_paid(
     )
     if full is None or _is_deleted(db, "course_enrollments", full.id):
         raise HTTPException(status_code=404, detail="Course not found.")
-    return enrollment_to_out(full)
+    out = enrollment_to_out(full)
+    payload_out = out.model_dump() if hasattr(out, "model_dump") else out.dict()
+    payload_out["whatsapp"] = whatsapp
+    return payload_out
 
 
 @app.patch("/api/admin/courses/{course_id}/installment-no-upload", response_model=CourseOut)
@@ -9037,7 +9208,47 @@ def admin_course_set_installment_no_upload(
     )
     if not enr:
         raise HTTPException(status_code=404, detail="Enrollment not found.")
+    # [F004][S002] Old package shells store the tick on the category installment row.
+    legacy_cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+    if legacy_cat_id and not getattr(enr, "segment_pins_json", None):
+        plan = _active_installment_plan_for_category(db, int(legacy_cat_id))
+        if plan is None:
+            raise HTTPException(status_code=404, detail="舊 package 分期計劃不存在。")
+        admin_set_category_installment_no_document(
+            plan_id=plan.id,
+            installment_no=payload.installment_no,
+            payload=CategoryInstallmentNoDocument(no_document_required=bool(payload.no_upload)),
+            db=db,
+            user=user,
+        )
+        full = (
+            db.query(CourseEnrollment)
+            .options(*_enrollment_load_options())
+            .filter(CourseEnrollment.id == course_id)
+            .first()
+        )
+        if full is None or _is_deleted(db, "course_enrollments", full.id):
+            raise HTTPException(status_code=404, detail="Course not found.")
+        return enrollment_to_out(full)
     rows = parse_segment_pins_json(enr.segment_pins_json)
+    # [F004][S002] Single-payment courses may have no segment JSON yet — allow period 1 tick.
+    if not rows and payload.installment_no == 1:
+        nos = _course_no_upload_nos(enr)
+        if payload.no_upload:
+            nos.add(1)
+        else:
+            nos.discard(1)
+        _set_course_no_upload_nos(enr, nos)
+        db.commit()
+        full = (
+            db.query(CourseEnrollment)
+            .options(*_enrollment_load_options())
+            .filter(CourseEnrollment.id == course_id)
+            .first()
+        )
+        if full is None or _is_deleted(db, "course_enrollments", full.id):
+            raise HTTPException(status_code=404, detail="Course not found.")
+        return enrollment_to_out(full)
     segment = next((s for s in rows if s.installment_no == payload.installment_no), None)
     if segment is None:
         raise HTTPException(status_code=404, detail="Installment segment not found for this enrollment.")

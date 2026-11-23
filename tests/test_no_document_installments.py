@@ -120,11 +120,16 @@ def test_course_confirm_without_upload_rejected_until_no_upload_ticked(db_sessio
         db=db_session,
         user=admin,
     )
-    segment = next(
-        s for s in out.enrollments[0].installment_segments if s.installment_no == 2
-    )
-    assert segment.paid is True
-    assert segment.pin != ""  # [F003][S002] PIN issued on confirmed payment
+    # [F004][S002] Confirm now returns a dict so WhatsApp links can ride along.
+    enrollments = out["enrollments"] if isinstance(out, dict) else out.enrollments
+    first = enrollments[0]
+    segs = first["installment_segments"] if isinstance(first, dict) else first.installment_segments
+    segment = next(s for s in segs if (s["installment_no"] if isinstance(s, dict) else s.installment_no) == 2)
+    paid = segment["paid"] if isinstance(segment, dict) else segment.paid
+    pin = segment["pin"] if isinstance(segment, dict) else segment.pin
+    assert paid is True
+    assert pin != ""  # [F003][S002] PIN issued on confirmed payment
+    assert isinstance(out, dict) and "whatsapp" in out
 
 
 def test_course_no_upload_toggle_off(db_session, admin):
@@ -251,3 +256,95 @@ def test_member_full_payload_exposes_no_document_flags(db_session):
 
     pay_row = payload["category_enrollments"][0]["installment_plans"][0]["payments"][1]
     assert pay_row["no_document_required"] is False
+
+
+def test_old_package_pin_card_mirrors_category_periods(db_session, monkeypatch, admin):
+    """[F004][S002] Old package course card shows every category period + no-upload confirm path."""
+    alice, _enrollment, plan = _seed(db_session)
+    monkeypatch.setattr(main, "log_whatsapp", lambda *args, **kwargs: None)
+    cat = db_session.get(CategoryEnrollment, plan.enrollment_id)
+    shell = main._ensure_legacy_category_course_enrollment(db_session, cat, alice)
+    db_session.commit()
+
+    payload = main._member_full_payload(db_session, alice)
+    pin_row = next(r for r in payload["course_checkin_pins"] if r["course_id"] == shell.id)
+    assert pin_row["legacy_installment_plan_id"] == plan.id
+    assert pin_row["legacy_category_enrollment_id"] == cat.id
+    assert [s["installment_no"] for s in pin_row["installment_segments"]] == [1, 2]
+    assert pin_row["installment_segments"][0]["paid"] is True
+    assert pin_row["installment_segments"][1]["paid"] is False
+
+    main.admin_course_set_installment_no_upload(
+        shell.id,
+        main.CourseInstallmentNoUpload(student_id=alice.id, installment_no=2, no_upload=True),
+        db=db_session,
+        user=admin,
+    )
+    confirmed = main.admin_course_mark_installment_paid(
+        shell.id,
+        main.CourseInstallmentMarkPaid(student_id=alice.id, installment_no=2),
+        db=db_session,
+        user=admin,
+    )
+    assert confirmed["whatsapp"]["pin_unlocked"]
+    assert confirmed["whatsapp"]["pin_unlocked"] in confirmed["whatsapp"]["student"]["message"]
+    coach_msg = (confirmed["whatsapp"].get("coach") or {}).get("message") or ""
+    assert "課堂 PIN" not in coach_msg
+    pin = confirmed["whatsapp"]["pin_unlocked"]
+    if pin and pin != "—":
+        assert pin not in coach_msg
+
+    pay2 = (
+        db_session.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan.id,
+            InstallmentPayment.installment_no == 2,
+        )
+        .first()
+    )
+    assert pay2.paid_at is not None
+
+    undone = main.admin_unconfirm_category_installment(
+        plan_id=plan.id, installment_no=2, db=db_session, user=admin
+    )
+    assert undone["ok"] is True
+    db_session.refresh(pay2)
+    assert pay2.paid_at is None
+    assert pay2.status == "pending"
+
+
+def test_confirming_one_category_period_does_not_mark_siblings(db_session, monkeypatch, admin):
+    """[F004][S002] Admin confirm of period 3 must leave unpaid siblings unpaid."""
+    alice, _enrollment, plan = _seed(db_session)
+    monkeypatch.setattr(main, "log_whatsapp", lambda *args, **kwargs: None)
+    db_session.add(
+        InstallmentPayment(
+            installment_plan_id=plan.id,
+            installment_no=3,
+            amount=1,
+            due_date=date(2027, 1, 21),
+            status="pending",
+        )
+    )
+    plan.total_installments = 3
+    db_session.commit()
+
+    main.admin_set_category_installment_no_document(
+        plan_id=plan.id,
+        installment_no=3,
+        payload=main.CategoryInstallmentNoDocument(no_document_required=True),
+        db=db_session,
+        user=admin,
+    )
+    main.admin_confirm_category_installment(
+        plan_id=plan.id, installment_no=3, payload=None, db=db_session, user=admin
+    )
+    pays = {
+        p.installment_no: p
+        for p in db_session.query(InstallmentPayment)
+        .filter(InstallmentPayment.installment_plan_id == plan.id)
+        .all()
+    }
+    assert pays[1].paid_at is not None  # seeded paid in _seed
+    assert pays[2].paid_at is None
+    assert pays[3].paid_at is not None

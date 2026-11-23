@@ -63,9 +63,13 @@ def test_successful_checkin_notifies_only_expected_recipients(db_session, monkey
         assert context["course_title"] == "Dynamic Pilates"
         assert context["student_name"] == "Student Example"
         if key == "checkin_student":
-            assert context["lesson_balance"] == "9"
-        else:
+            # Per-package text (not a single ledger total).
+            assert "Dynamic Pilates 剩9堂" in context["lesson_balance"]
             assert context["lessons_remaining"] == "9"
+        else:
+            # Coach sees remaining for the checked-in package only.
+            assert context["lessons_remaining"] == "9"
+            assert context["lesson_balance"] == "9"
             assert context["lessons_attended"] == "1"
     assert all(x.recipient != "coach-remind" for x in db_session.query(WhatsAppLog).all())
     with pytest.raises(HTTPException) as duplicate:
@@ -73,6 +77,54 @@ def test_successful_checkin_notifies_only_expected_recipients(db_session, monkey
     assert duplicate.value.status_code == 409
     assert len(captured) == len(expected_keys)
     assert main._lesson_balance_sum(db_session, student.id) == 9
+
+
+def test_checkin_whatsapp_lists_each_package_remaining(db_session, monkeypatch):
+    """[F003][S003] Student WA lists every package; coach WA uses the selected package only."""
+    student, coach, enrollment = _checkin_data(db_session)
+    other = CourseEnrollment(
+        title="新學生一對一",
+        student_id=student.id,
+        coach_id=coach.id,
+        branch_id=enrollment.branch_id,
+        scheduled_start=datetime(2026, 10, 28, 10),
+        scheduled_end=datetime(2026, 10, 28, 11),
+        total_lessons=30,
+        checkin_pin="20202",
+        coach_time_confirmed=True,
+    )
+    db_session.add(other)
+    main.apply_lesson_ledger_delta(db_session, student, 30, "test_credit_other")
+    db_session.commit()
+    monkeypatch.setattr(main, "now_hk", lambda: datetime(2026, 10, 13, 10))
+    captured = []
+
+    def capture(phone, message, *, template_key=None, template_context=None):
+        captured.append((phone, template_key, message, dict(template_context or {})))
+        return type("R", (), {"ok": True, "dry_run": False, "message_id": "wamid.test", "error": None})()
+
+    monkeypatch.setattr(main, "dispatch_reminder", capture)
+    main.perform_lesson_checkin(
+        db_session, student, "qr_pin", resolved_enrollment=enrollment, notified_coach=coach
+    )
+    student_msg = next(m for _p, key, m, _c in captured if key == "checkin_student")
+    coach_msg = next(m for _p, key, m, _c in captured if key == "checkin_coach")
+    student_ctx = next(c for _p, key, _m, c in captured if key == "checkin_student")
+    coach_ctx = next(c for _p, key, _m, c in captured if key == "checkin_coach")
+
+    assert "各 package 剩餘堂數" in student_msg
+    assert "Dynamic Pilates：剩 9 堂" in student_msg
+    assert "新學生一對一：剩 30 堂" in student_msg
+    assert "帳戶剩餘堂數" not in student_msg
+    assert "Dynamic Pilates 剩9堂" in student_ctx["lesson_balance"]
+    assert "新學生一對一 剩30堂" in student_ctx["lesson_balance"]
+
+    assert "本課程剩餘堂數：9" in coach_msg
+    assert "學生帳戶剩餘堂數" not in coach_msg
+    assert coach_ctx["lessons_remaining"] == "9"
+    assert coach_ctx["lesson_balance"] == "9"
+    # Must not inject the other package's 30 into the coach remaining field.
+    assert coach_ctx["lesson_balance"] != "39"
 
 
 def test_checkin_does_not_notify_when_commit_fails(db_session, monkeypatch):

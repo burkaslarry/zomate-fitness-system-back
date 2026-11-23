@@ -131,7 +131,6 @@ def test_linked_checkout_notifies_after_course_pin_and_payment_are_saved(db_sess
         """[F005][S003] Check committed course/payment ownership at the provider boundary."""
         enrollment = db_session.query(CourseEnrollment).filter(CourseEnrollment.title == "New Pilates").one()
         assert course_payment_state(enrollment)["renewal_id"] == renewal.id
-        assert kwargs["template_context"]["pin"] == enrollment.checkin_pin
         captured.append(kwargs)
         return _dry_run()
 
@@ -146,9 +145,12 @@ def test_linked_checkout_notifies_after_course_pin_and_payment_are_saved(db_sess
     assert len(captured) == 2
     assert captured[0]["template_key"] == "payment_student_pending"
     assert captured[1]["template_key"] == "payment_coach"
+    new_course = db_session.get(CourseEnrollment, result.id)
+    assert captured[0]["template_context"]["pin"] == new_course.checkin_pin
+    # [F005][S003] Coach notification never carries the student check-in PIN.
+    assert captured[1]["template_context"]["pin"] == "—"
     assert captured[0]["template_context"]["next_lesson_date"] == "待教練安排"
     assert result.payment_whatsapp["student"]["template_key"] == "payment_student_pending"
-    new_course = db_session.get(CourseEnrollment, result.id)
     assert course_payment_state(new_course)["paid_total"] == 0
     assert course_payment_state(new_course)["pending_payments"]["1"]["receipt_id"] == receipt.id
 
@@ -233,10 +235,12 @@ def test_public_receipt_waits_for_admin_then_issues_new_pin_and_notifies_once(db
     emitted.clear()
     body = CourseInstallmentMarkPaid(student_id=student.id, installment_no=2)
     confirmed = main.admin_course_mark_installment_paid(enrollment.id, body, db_session, SimpleNamespace(role="ADMIN"))
-    pin = confirmed.enrollments[0].installment_segments[1].pin
+    pin = confirmed["enrollments"][0]["installment_segments"][1]["pin"]
     assert len(pin) == 5 and pin != enrollment.checkin_pin
     assert [m["template_key"] for m in emitted] == ["payment_student_installment", "payment_coach"]
     assert emitted[0]["template_context"]["pin"] == pin
+    # Coach WhatsApp must not include the student PIN.
+    assert emitted[1]["template_context"]["pin"] == "—"
     main.admin_course_mark_installment_paid(enrollment.id, body, db_session, SimpleNamespace(role="ADMIN"))
     assert len(emitted) == 2
     assert parse_segment_pins_json(enrollment.segment_pins_json)[1].pin == pin
@@ -269,11 +273,11 @@ def test_admin_handles_partial_installment_and_final_balance(db_session, monkeyp
     result = main.admin_course_mark_installment_paid(enrollment.id,
         CourseInstallmentMarkPaid(student_id=student.id, installment_no=3), db_session, SimpleNamespace(role="ADMIN"))
     assert emitted[0]["template_key"] == expected_key
-    third = result.enrollments[0].installment_segments[2]
-    assert third.paid is issued
-    assert bool(third.pin) is issued
+    third = result["enrollments"][0]["installment_segments"][2]
+    assert third["paid"] is issued
+    assert bool(third["pin"]) is issued
     if issued:
-        assert third.pin not in {"10192","10193","10194"}
+        assert third["pin"] not in {"10192","10193","10194"}
         main.admin_course_mark_installment_paid(enrollment.id,
             CourseInstallmentMarkPaid(student_id=student.id, installment_no=3), db_session, SimpleNamespace(role="ADMIN"))
         assert course_payment_state(enrollment)["paid_total"] == 9000
@@ -291,9 +295,10 @@ def test_single_payment_course_pending_receipt_can_be_confirmed(db_session, monk
     monkeypatch.setattr(main, "dispatch_reminder", _dispatch_capture(emitted))
     result=main.admin_course_mark_installment_paid(enrollment.id,
         CourseInstallmentMarkPaid(student_id=student.id,installment_no=1),db_session,SimpleNamespace(role="ADMIN"))
-    assert result.enrollments[0].installment_segments[0].pin == enrollment.checkin_pin
+    assert result["enrollments"][0]["installment_segments"][0]["pin"] == enrollment.checkin_pin
     assert emitted[0]["template_key"] == "payment_student_full"
     assert emitted[1]["template_context"]["amount_owing"] == "HKD 0"
+    assert emitted[1]["template_context"]["pin"] == "—"
 
 
 def test_unassigned_receipt_is_linked_to_admin_selected_term_without_double_count(db_session, monkeypatch):

@@ -779,14 +779,15 @@ class CourseInstallmentMarkPaid(BaseModel):
     """Staff marks one scheduled-package installment segment as collected — unlocks that tranche PIN for check-in."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=5)
+    # [F002][S003] Category / old-package plans may have up to 12 periods.
+    installment_no: int = Field(ge=1, le=12)
 
 
 class CourseInstallmentReminderUpdate(BaseModel):
     """[F003][S003] Staff adjusts the lesson number that triggers a WhatsApp installment reminder."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=5)
+    installment_no: int = Field(ge=1, le=12)
     reminder_lesson: int = Field(ge=1, le=999)
 
 
@@ -794,7 +795,7 @@ class CourseInstallmentNoUpload(BaseModel):
     """[F004][S002] Admin ticks 「唔需要上傳文件」 for one course installment period."""
 
     student_id: int = Field(ge=1)
-    installment_no: int = Field(ge=1, le=5)
+    installment_no: int = Field(ge=1, le=12)
     no_upload: bool = True
 
 
