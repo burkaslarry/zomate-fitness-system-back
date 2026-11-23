@@ -651,6 +651,62 @@ def _student_phone_display(student: Student) -> str:
     return phone_display or (student.phone or "")
 
 
+def _package_remaining_for_enrollment(db: Session, enrollment: CourseEnrollment) -> int:
+    """[F003][S003] Remaining lessons on one course / old-package shell after check-ins."""
+    total = int(enrollment.total_lessons or 0)
+    attended = count_course_checkins(db, int(enrollment.student_id), enrollment.id)
+    return max(0, total - attended)
+
+
+def _student_package_remaining_rows(db: Session, student_id: int) -> list[dict[str, Any]]:
+    """[F003][S003] Active packages with remaining lessons — one row per course card."""
+    from .models import DeletedRecord
+
+    deleted_ids = {
+        int(row.entity_id)
+        for row in db.query(DeletedRecord)
+        .filter(DeletedRecord.entity_type == "course_enrollments")
+        .all()
+    }
+    rows = (
+        db.query(CourseEnrollment)
+        .filter(CourseEnrollment.student_id == student_id)
+        .order_by(CourseEnrollment.id.asc())
+        .all()
+    )
+    out: list[dict[str, Any]] = []
+    for enr in rows:
+        if enr.id in deleted_ids:
+            continue
+        remaining = _package_remaining_for_enrollment(db, enr)
+        # Skip empty shells that never had lessons allocated.
+        if int(enr.total_lessons or 0) <= 0 and remaining <= 0:
+            continue
+        out.append(
+            {
+                "course_id": enr.id,
+                "title": enr.title or "課程",
+                "remaining": remaining,
+                "attended": count_course_checkins(db, student_id, enr.id),
+            }
+        )
+    return out
+
+
+def _format_package_remaining_lines(rows: list[dict[str, Any]]) -> str:
+    """[F003][S003] Multiline breakdown for student WhatsApp (never a single account total)."""
+    if not rows:
+        return "（未有可扣堂 package）"
+    return "\n".join(f"· {row['title']}：剩 {row['remaining']} 堂" for row in rows)
+
+
+def _format_package_remaining_compact(rows: list[dict[str, Any]]) -> str:
+    """[F003][S003] Single Meta template parameter — keep package names distinct."""
+    if not rows:
+        return "—"
+    return "；".join(f"{row['title']} 剩{row['remaining']}堂" for row in rows)
+
+
 def send_checkin_student_whatsapp(
     db: Session,
     log_whatsapp_fn,
@@ -668,14 +724,18 @@ def send_checkin_student_whatsapp(
     if not (student.phone or "").strip():
         return None
     attended = count_course_checkins(db, student.id, enrollment.id)
-    remaining = max(0, int(lesson_balance_after))
+    package_rows = _student_package_remaining_rows(db, student.id)
+    selected_remaining = _package_remaining_for_enrollment(db, enrollment)
+    package_lines = _format_package_remaining_lines(package_rows)
+    package_compact = _format_package_remaining_compact(package_rows)
     when = _checkin_whatsapp_clock(checked_in_at)
     msg = (
         f"【Zomate 簽到確認】\n"
         f"{student.full_name}，你已成功簽到。\n"
         f"課程：{enrollment.title}\n"
         f"簽到時間（香港）：{when}\n"
-        f"帳戶剩餘堂數：{remaining}\n\n"
+        f"本課程剩餘堂數：{selected_remaining}\n"
+        f"各 package 剩餘堂數：\n{package_lines}\n\n"
         "查詢請 WhatsApp 6052 9291。此號碼用作系統通知。"
     )
     log_whatsapp_fn(
@@ -686,12 +746,14 @@ def send_checkin_student_whatsapp(
         template_key="checkin_student",
         template_context={
             # Keys match Meta zomate_checkin_student body_params.
+            # lesson_balance / lessons_remaining carry per-package text (not a ledger total).
             "student_name": student.full_name,
             "course_title": enrollment.title,
             "checkin_time": when,
-            "lesson_balance": str(remaining),
+            "lesson_balance": package_compact,
             "lessons_attended": str(attended),
-            "lessons_remaining": str(remaining),
+            "lessons_remaining": str(selected_remaining),
+            "package_remaining": package_compact,
             "checked_in_at": when,
         },
     )
@@ -721,16 +783,17 @@ def send_checkin_coach_whatsapp(
     if coach is None or not (coach.phone or "").strip():
         return None
     attended = count_course_checkins(db, student.id, enrollment.id)
-    remaining = max(0, int(lesson_balance_after))
+    # Coach must see remaining for the package the student just checked into — never account total.
+    selected_remaining = _package_remaining_for_enrollment(db, enrollment)
     when = _checkin_whatsapp_clock(checked_in_at)
     phone_display = _student_phone_display(student)
     msg = (
-        f"【Zomate 簽到通知】{enrollment.title}\n"
-        f"學生：{student.full_name}（{phone_display or student.phone}）\n"
-        f"已成功簽到並扣 1 堂\n"
-        f"簽到時間：{when}\n"
+        f"【Zomate 教練簽到通知】\n"
+        f"學生：{student.full_name}（{phone_display or student.phone}）已成功簽到。\n"
+        f"課程：{enrollment.title}\n"
+        f"簽到時間（香港）：{when}\n"
         f"本課程已上：{attended} 堂\n"
-        f"學生餘下堂數：{remaining}\n\n"
+        f"本課程剩餘堂數：{selected_remaining}\n\n"
         "如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。"
     )
     log_whatsapp_fn(
@@ -745,9 +808,9 @@ def send_checkin_coach_whatsapp(
             "student_phone": phone_display or (student.phone or ""),
             "course_title": enrollment.title,
             "checkin_time": when,
-            "lesson_balance": str(remaining),
+            "lesson_balance": str(selected_remaining),
             "lessons_attended": str(attended),
-            "lessons_remaining": str(remaining),
+            "lessons_remaining": str(selected_remaining),
             "checked_in_at": when,
         },
     )
