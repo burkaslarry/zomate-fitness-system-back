@@ -462,7 +462,9 @@ def send_payment_whatsapp_notifications(
             is_installment=is_installment,
             audience="coach",
         )
-        coach_msg = render_whatsapp_template(get_template_body(db, coach_key), ctx)
+        # [F005][S003] Coach must never receive the student check-in PIN.
+        coach_ctx = {**ctx, "pin": "—"}
+        coach_msg = render_whatsapp_template(get_template_body(db, coach_key), coach_ctx)
         if log_messages:
             log_whatsapp_fn(
                 db,
@@ -470,7 +472,7 @@ def send_payment_whatsapp_notifications(
                 coach.phone,
                 coach_msg,
                 template_key=coach_key,
-                template_context=ctx,
+                template_context=coach_ctx,
             )
         result["coach"] = {
             "recipient": coach.phone,
