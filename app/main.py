@@ -136,6 +136,7 @@ from .schemas import (
     CoachTrialGrantBody,
     CoachUpdate,
     CategoryInstallmentConfirm,
+    CategoryInstallmentAmountUpdate,
     CategoryInstallmentNoDocument,
     CourseCategoryCreate,
     CourseCategoryAdminUpdate,
@@ -6802,6 +6803,59 @@ def admin_confirm_category_installment(
         "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
         "course_enrollment_id": course.id,
         "whatsapp": whatsapp,
+    }
+
+
+@app.patch("/api/admin/installment-plans/{plan_id}/payments/{installment_no}/amount")
+def admin_set_category_installment_amount(
+    plan_id: int,
+    installment_no: int,
+    payload: CategoryInstallmentAmountUpdate,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> dict:
+    """[F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Fill「未設定金額」on one category / old-package installment period
+    Logic: Persist amount only — does not mark paid or send WhatsApp.
+    """
+    pay = (
+        db.query(InstallmentPayment)
+        .filter(
+            InstallmentPayment.installment_plan_id == plan_id,
+            InstallmentPayment.installment_no == installment_no,
+        )
+        .with_for_update()
+        .first()
+    )
+    if pay is None:
+        raise HTTPException(status_code=404, detail="Installment payment row not found.")
+    pay.amount = float(payload.amount)
+    plan = db.get(InstallmentPlan, plan_id)
+    enrollment = db.get(CategoryEnrollment, plan.enrollment_id) if plan is not None else None
+    student_id = enrollment.student_id if enrollment is not None else None
+    db.add(
+        AuditLog(
+            action="category_installment_amount_set",
+            student_id=student_id,
+            detail=json.dumps(
+                {
+                    "installment_plan_id": plan_id,
+                    "installment_no": installment_no,
+                    "amount": float(payload.amount),
+                    "by": user.username,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "payment_id": pay.id,
+        "installment_plan_id": plan_id,
+        "installment_no": installment_no,
+        "amount": float(pay.amount),
     }
 
 

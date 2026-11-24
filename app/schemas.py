@@ -811,6 +811,12 @@ class CategoryInstallmentConfirm(BaseModel):
     amount: float | None = Field(default=None, ge=0)
 
 
+class CategoryInstallmentAmountUpdate(BaseModel):
+    """[F004][S002] Admin sets / corrects the HKD amount on one category installment period."""
+
+    amount: float = Field(gt=0, le=9999999999, allow_inf_nan=False)
+
+
 class CourseEnrollmentOut(BaseModel):
     student_id: int
     student_name: str
