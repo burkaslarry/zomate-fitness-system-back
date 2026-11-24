@@ -764,6 +764,12 @@ class CourseAssignCoach(BaseModel):
     coach_id: int = Field(ge=1)
 
 
+class CourseAssignBranch(BaseModel):
+    """[F009][S004] Admin reassigns enrollment branch (分店)."""
+
+    branch_id: int = Field(ge=1)
+
+
 class InstallmentSegmentPinOut(BaseModel):
     installment_no: int = Field(ge=1)
     lesson_from: int = Field(ge=1)

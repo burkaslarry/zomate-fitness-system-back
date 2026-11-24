@@ -140,6 +140,7 @@ from .schemas import (
     CategoryInstallmentNoDocument,
     CourseCategoryCreate,
     CourseCategoryAdminUpdate,
+    CourseAssignBranch,
     CourseAssignCoach,
     CourseCreate,
     CourseInstallmentReminderUpdate,
@@ -2655,6 +2656,7 @@ def _course_checkin_pins_for_student(
             {
                 "course_id": enr.id,
                 "course_title": enr.title,
+                "branch_id": enr.branch_id,
                 "branch_name": enr.branch.name,
                 "coach_name": (enr.coach.full_name if enr.coach else None) or "—",
                 "coach_id": enr.coach_id,
@@ -9402,6 +9404,32 @@ def admin_assign_course_coach(
         raise HTTPException(status_code=400, detail="Invalid coach_id.")
     enr.coach_id = payload.coach_id
     enr.coach_time_confirmed = False
+    db.commit()
+    full = (
+        db.query(CourseEnrollment)
+        .options(*_enrollment_load_options())
+        .filter(CourseEnrollment.id == course_id)
+        .first()
+    )
+    assert full is not None
+    return enrollment_to_out(full)
+
+
+@app.patch("/api/admin/courses/{course_id}/assign-branch", response_model=CourseOut)
+def admin_assign_course_branch(
+    course_id: int,
+    payload: CourseAssignBranch,
+    db: Session = Depends(get_db),
+    user: AppUser = Depends(require_admin),
+) -> CourseOut:
+    """[F009][S004] Admin-only: change which branch (分店) an opened package belongs to."""
+    enr = db.query(CourseEnrollment).filter(CourseEnrollment.id == course_id).first()
+    if not enr or _is_deleted(db, "course_enrollments", enr.id):
+        raise HTTPException(status_code=404, detail="Course not found.")
+    branch = db.query(Branch).filter(Branch.id == payload.branch_id).first()
+    if branch is None or _is_deleted(db, "branches", branch.id) or not branch.active:
+        raise HTTPException(status_code=400, detail="Invalid branch_id.")
+    enr.branch_id = payload.branch_id
     db.commit()
     full = (
         db.query(CourseEnrollment)
