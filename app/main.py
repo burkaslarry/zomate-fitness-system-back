@@ -6646,6 +6646,34 @@ def _resolve_legacy_shell_coach_branch(db: Session, student: Student) -> tuple[i
     return int(coach.id), int(coach.branch_id)
 
 
+def _legacy_shell_remaining_lessons(
+    db: Session, category: CategoryEnrollment, student: Student
+) -> int:
+    """[F004][S002] Schedulable shell stores remaining-only (purchased − paper 已上)."""
+    prior = _category_prior_lessons_imported(db, student.id, category.id)
+    total = int(category.total_lessons or 0)
+    remaining = max(0, total - prior)
+    if remaining <= 0:
+        return max(1, total) if total > 0 else 1
+    return remaining
+
+
+def _sync_legacy_shell_total_lessons(
+    db: Session, shell: CourseEnrollment, category: CategoryEnrollment, student: Student
+) -> CourseEnrollment:
+    """
+    [F004][S002]
+    Feature: Admin Reports & Financials
+    Step: Keep legacy PIN shell total_lessons = remaining after 以上堂數 changes
+    Logic: Reused shells previously returned unchanged → UI 總 = shell + prior inflated (e.g. 10+2=12).
+    """
+    remaining = _legacy_shell_remaining_lessons(db, category, student)
+    if int(shell.total_lessons or 0) != remaining:
+        shell.total_lessons = remaining
+        db.add(shell)
+    return shell
+
+
 def _ensure_legacy_category_course_enrollment(
     db: Session, category: CategoryEnrollment, student: Student
 ) -> CourseEnrollment:
@@ -6658,7 +6686,8 @@ def _ensure_legacy_category_course_enrollment(
     )
     for row in existing_rows:
         if not _is_deleted(db, "course_enrollments", row.id):
-            return row
+            # [F004][S002] Always resync remaining when Admin changes 總堂／以上堂數.
+            return _sync_legacy_shell_total_lessons(db, row, category, student)
 
     cat = (
         db.query(CategoryEnrollment)
@@ -6668,11 +6697,7 @@ def _ensure_legacy_category_course_enrollment(
     ) or category
     cat_name = cat.course_category.name if getattr(cat, "course_category", None) else "課程"
     title = f"{cat_name}（舊 package）"
-    prior = _category_prior_lessons_imported(db, student.id, category.id)
-    total = int(category.total_lessons or 0)
-    remaining = max(0, total - prior)
-    if remaining <= 0:
-        remaining = max(1, total) if total > 0 else 1
+    remaining = _legacy_shell_remaining_lessons(db, category, student)
     coach_id, branch_id = _resolve_legacy_shell_coach_branch(db, student)
     placeholder_day = date.today() + timedelta(days=7)
     start = datetime.combine(placeholder_day, time(10, 0))
@@ -10436,10 +10461,16 @@ def coach_list_students(
             legacy_by_student.setdefault(enr.student_id, []).append(enr)
     for sid, legacy_rows in legacy_by_student.items():
         prior_map = _category_prior_lessons_by_enrollment(db, sid)
+        student_row = db.get(Student, sid)
         for legacy_enr in legacy_rows:
-            legacy_prior_by_course[legacy_enr.id] = prior_map.get(
-                int(legacy_enr.legacy_category_enrollment_id or 0), 0
-            )
+            cat_id = int(legacy_enr.legacy_category_enrollment_id or 0)
+            legacy_prior_by_course[legacy_enr.id] = prior_map.get(cat_id, 0)
+            # [F004][S002] Heal shell totals on roster load so Package 進度 總 matches 帳面.
+            if student_row is not None and not _is_deleted(db, "course_enrollments", legacy_enr.id):
+                cat_row = db.get(CategoryEnrollment, cat_id)
+                if cat_row is not None:
+                    _sync_legacy_shell_total_lessons(db, legacy_enr, cat_row, student_row)
+        db.commit()
     for enr in rows:
         st = enr.student
         pending = not enr.coach_time_confirmed
@@ -10581,9 +10612,12 @@ def coach_student_records(
     # [F003][S007] Tell the coach whether a paper ledger was already converted for scheduling.
     # PIN shells from Admin confirm (coach_time_confirmed=False) are not "scheduled" yet —
     # coach booking must still attach a real slot to that shell.
+    # [F003][S007] Live shells (confirmed or not) still hide the ledger from 揀 Package via
+    # legacy_category_enrollment_id on enrollments — avoid 兩個 package for one import.
     scheduled_active: dict[int, int] = {}
     scheduled_once: set[int] = set()
-    category_ids = [c.id for c in categories]
+    category_by_id = {c.id: c for c in categories}
+    category_ids = list(category_by_id)
     if category_ids:
         legacy_rows = (
             db.query(CourseEnrollment)
@@ -10595,9 +10629,14 @@ def coach_student_records(
             if _is_deleted(db, "course_enrollments", row.id):
                 scheduled_once.add(cat_id)
                 continue
+            cat_row = category_by_id.get(cat_id)
+            if cat_row is not None:
+                # [F004][S002] Heal stale shell totals (e.g. 10 kept after 以上 2 → should be 8).
+                _sync_legacy_shell_total_lessons(db, row, cat_row, student)
             if row.coach_time_confirmed:
                 scheduled_active[cat_id] = row.id
                 scheduled_once.add(cat_id)
+        db.commit()
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
@@ -10627,6 +10666,11 @@ def coach_student_records(
                     category_prior.get(int(e.legacy_category_enrollment_id or 0), 0)
                     if e.legacy_category_enrollment_id
                     else 0
+                ),
+                legacy_category_enrollment_id=(
+                    int(e.legacy_category_enrollment_id)
+                    if e.legacy_category_enrollment_id
+                    else None
                 ),
             )
             for e in enrollments

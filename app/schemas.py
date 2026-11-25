@@ -640,6 +640,8 @@ class CoachStudentEnrollmentOut(BaseModel):
     installment_periods: list[CoachInstallmentPeriodOut] = []
     # [F003][S007] Paper lessons already taken before this legacy package was scheduled.
     legacy_prior_lessons: int = 0
+    # [F003][S007] When set, coach 揀 Package must not also list the matching paper ledger.
+    legacy_category_enrollment_id: int | None = None
 
 
 class CoachStudentCheckinOut(BaseModel):

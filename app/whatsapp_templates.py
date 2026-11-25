@@ -303,3 +303,51 @@ def count_course_checkins(db: Session, student_id: int, course_id: int | None) -
         )
         .count()
     )
+
+
+def category_prior_lessons_imported(db: Session, student_id: int, category_enrollment_id: int) -> int:
+    """[F002][S003] Paper 已上 from category ledger ``category_prior_lessons_import`` audit rows."""
+    import json
+
+    from .models import AuditLog
+
+    total = 0
+    rows = (
+        db.query(AuditLog)
+        .filter(
+            AuditLog.action == "category_prior_lessons_import",
+            AuditLog.student_id == student_id,
+        )
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+            if int(detail.get("enrollment_id") or 0) != category_enrollment_id:
+                continue
+            total += int(detail.get("delta") or 0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return max(0, total)
+
+
+def legacy_prior_for_course(db: Session, student_id: int, enr: CourseEnrollment | None) -> int:
+    """[F002][S003][F005][S003] Legacy package shell → category enrollment with paper 已上."""
+    if enr is None:
+        return 0
+    cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+    if not cat_id:
+        return 0
+    return category_prior_lessons_imported(db, student_id, int(cat_id))
+
+
+def whatsapp_lesson_counts(
+    db: Session, student_id: int, enr: CourseEnrollment | None
+) -> tuple[int, int]:
+    """[F005][S003] (attended_display, remaining) for WhatsApp — attended includes paper 已上."""
+    checkins = count_course_checkins(db, student_id, enr.id if enr else None)
+    prior = legacy_prior_for_course(db, student_id, enr)
+    attended_display = checkins + prior
+    total = int(enr.total_lessons or 0) if enr else 0
+    remaining = max(0, total - checkins) if total else 0
+    return attended_display, remaining

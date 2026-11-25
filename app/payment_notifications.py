@@ -37,6 +37,7 @@ from .whatsapp_templates import (
     render_whatsapp_template,
     resolve_payment_template_key,
     sum_receipt_amounts,
+    whatsapp_lesson_counts,
 )
 
 if TYPE_CHECKING:
@@ -336,12 +337,14 @@ def send_payment_whatsapp_notifications(
                 course_title = cat.course_category.name
 
     pin = _resolve_notification_pin(enr, segment_dicts, installment_no, full_payment)
-    attended = count_course_checkins(db, student.id, enr.id if enr else None)
-    total_lessons = int(enr.total_lessons) if enr and enr.total_lessons else 0
-    remaining = max(0, total_lessons - attended) if total_lessons else 0
+    checkin_attended = count_course_checkins(db, student.id, enr.id if enr else None)
+    attended_display, remaining = whatsapp_lesson_counts(db, student.id, enr)
     # [F005][S003] After check-in, show the PIN for the next redeemable lesson tranche.
     if installment_no is None and segment_dicts:
-        next_segment = next((s for s in segment_dicts if int(s.get("lesson_from", 0)) <= attended + 1 <= int(s.get("lesson_to", 0))), None)
+        next_segment = next(
+            (s for s in segment_dicts if int(s.get("lesson_from", 0)) <= checkin_attended + 1 <= int(s.get("lesson_to", 0))),
+            None,
+        )
         if next_segment:
             pin = str(next_segment.get("pin") or pin) if int(next_segment.get("installment_no", 1)) == 1 or next_segment.get("paid") else "待 Admin 確認付款後發出"
 
@@ -418,7 +421,7 @@ def send_payment_whatsapp_notifications(
         course_title=course_title,
         pin=pin,
         next_lesson_date=_format_next_lesson_date(enr),
-        lessons_attended=attended,
+        lessons_attended=attended_display,
         lessons_remaining=remaining,
         payment_status=payment_status,
         amount_paid=paid_amt,
@@ -537,18 +540,7 @@ def send_schedule_booking_whatsapp(
     phone_display = "".join(ch for ch in (student.phone or "") if ch.isdigit())
     if len(phone_display) == 11 and phone_display.startswith("852"):
         phone_display = phone_display[3:]
-    attended = count_course_checkins(db, student.id, enrollment.id)
-    total_lessons = int(enrollment.total_lessons or 0)
-    legacy_prior = 0
-    if getattr(enrollment, "legacy_category_enrollment_id", None):
-        # [F003][S007] Legacy package stores only schedulable lessons; paper 已上 lives in the ledger.
-        from .main import _category_prior_lessons_imported
-
-        legacy_prior = _category_prior_lessons_imported(
-            db, student.id, int(enrollment.legacy_category_enrollment_id)
-        )
-    attended_display = attended + legacy_prior
-    remaining = max(0, total_lessons - attended) if total_lessons else 0
+    attended_display, remaining = whatsapp_lesson_counts(db, student.id, enrollment)
     payment_state = course_payment_state(enrollment)
     if getattr(enrollment, "legacy_category_enrollment_id", None):
         # [F003][S007] Converted paper ledger was paid offline; not a new course sale.
@@ -584,7 +576,7 @@ def send_schedule_booking_whatsapp(
             "pin": pin,
             "next_lesson_date": lesson_when,
             "coach_name": coach_name,
-            "lessons_attended": str(attended),
+            "lessons_attended": str(attended_display),
             "lessons_remaining": str(remaining),
             "payment_status": payment_status,
             "branch_code": branch_code or "",
@@ -603,7 +595,7 @@ def send_schedule_booking_whatsapp(
             f"{student_label}（{phone_display or student.phone}）\n"
             f"上堂時間 : {lesson_when}\n"
             f"教練 : {coach_name}\n"
-            f"已上堂數: {attended}\n"
+            f"已上堂數: {attended_display}\n"
             f"餘下堂數: {remaining}\n"
             f"付款狀態: {payment_status}\n"
             "如需要改期，請於24小時前通知教練"
@@ -620,7 +612,7 @@ def send_schedule_booking_whatsapp(
                 "course_title": enrollment.title,
                 "next_lesson_date": lesson_when,
                 "coach_name": coach_name,
-                "lessons_attended": str(attended),
+                "lessons_attended": str(attended_display),
                 "lessons_remaining": str(remaining),
                 "payment_status": payment_status,
             },
@@ -723,7 +715,7 @@ def send_checkin_student_whatsapp(
     """
     if not (student.phone or "").strip():
         return None
-    attended = count_course_checkins(db, student.id, enrollment.id)
+    attended_display, _ = whatsapp_lesson_counts(db, student.id, enrollment)
     package_rows = _student_package_remaining_rows(db, student.id)
     selected_remaining = _package_remaining_for_enrollment(db, enrollment)
     package_lines = _format_package_remaining_lines(package_rows)
@@ -751,7 +743,7 @@ def send_checkin_student_whatsapp(
             "course_title": enrollment.title,
             "checkin_time": when,
             "lesson_balance": package_compact,
-            "lessons_attended": str(attended),
+            "lessons_attended": str(attended_display),
             "lessons_remaining": str(selected_remaining),
             "package_remaining": package_compact,
             "checked_in_at": when,
@@ -782,9 +774,8 @@ def send_checkin_coach_whatsapp(
     """
     if coach is None or not (coach.phone or "").strip():
         return None
-    attended = count_course_checkins(db, student.id, enrollment.id)
+    attended_display, selected_remaining = whatsapp_lesson_counts(db, student.id, enrollment)
     # Coach must see remaining for the package the student just checked into — never account total.
-    selected_remaining = _package_remaining_for_enrollment(db, enrollment)
     when = _checkin_whatsapp_clock(checked_in_at)
     phone_display = _student_phone_display(student)
     msg = (
@@ -792,7 +783,7 @@ def send_checkin_coach_whatsapp(
         f"學生：{student.full_name}（{phone_display or student.phone}）已成功簽到。\n"
         f"課程：{enrollment.title}\n"
         f"簽到時間（香港）：{when}\n"
-        f"本課程已上：{attended} 堂\n"
+        f"本課程已上：{attended_display} 堂\n"
         f"本課程剩餘堂數：{selected_remaining}\n\n"
         "如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。"
     )
@@ -809,7 +800,7 @@ def send_checkin_coach_whatsapp(
             "course_title": enrollment.title,
             "checkin_time": when,
             "lesson_balance": str(selected_remaining),
-            "lessons_attended": str(attended),
+            "lessons_attended": str(attended_display),
             "lessons_remaining": str(selected_remaining),
             "checked_in_at": when,
         },
@@ -832,15 +823,13 @@ def send_receipt_upload_request_whatsapp(
     """[F005][S003] Log + return wa.me link asking student to upload payment receipt."""
     enr = _resolve_course_enrollment(db, student.id, course_enrollment_id)
     course_title = enr.title if enr else "—"
-    attended = count_course_checkins(db, student.id, enr.id if enr else None)
-    total_lessons = int(enr.total_lessons) if enr and enr.total_lessons else 0
-    remaining = max(0, total_lessons - attended) if total_lessons else 0
+    attended_display, remaining = whatsapp_lesson_counts(db, student.id, enr)
     ctx = build_payment_context(
         student=student,
         course_title=course_title,
         pin=enr.checkin_pin if enr else "—",
         next_lesson_date=format_lesson_datetime(enr),
-        lessons_attended=attended,
+        lessons_attended=attended_display,
         lessons_remaining=remaining,
         payment_status="待上傳收據",
         amount_paid=None,
