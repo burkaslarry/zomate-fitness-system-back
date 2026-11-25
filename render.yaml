@@ -17,3 +17,13 @@ services:
         value: /app/uploads
       - key: KEEPALIVE_ENABLED
         value: "true"
+      - key: DATABASE_POOL_SIZE
+        value: "5"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "10"
+      - key: DATABASE_POOL_TIMEOUT
+        value: "60"
+      - key: DATABASE_POOL_RECYCLE
+        value: "300"
+      - key: UVICORN_LIMIT_CONCURRENCY
+        value: "15"

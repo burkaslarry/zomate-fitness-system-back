@@ -46,6 +46,7 @@ DATABASE_URL = _normalize_database_url(_raw_url)
 _ca = _connect_args(_raw_url)
 _engine_kwargs: dict = {
     "pool_pre_ping": True,
+    "pool_use_lifo": True,
     "pool_size": max(1, int(settings.database_pool_size)),
     "max_overflow": max(0, int(settings.database_max_overflow)),
     "pool_timeout": max(1, int(settings.database_pool_timeout)),

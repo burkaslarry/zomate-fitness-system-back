@@ -13,4 +13,4 @@ COPY run.py ./run.py
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --limit-concurrency ${UVICORN_LIMIT_CONCURRENCY:-15}"]

@@ -3617,33 +3617,53 @@ def _migrate_coach_personal_block_kind(db: Session) -> None:
 
 
 def _sync_startup() -> None:
+    """[F007][S002] Short DB sessions at boot so the pool stays available during Render health checks."""
     Base.metadata.create_all(bind=engine)
-    with db_session() as db:
-        _migrate_branch_extended_columns(db)
-        _migrate_branch_sw_code(db)
-        _migrate_enrollment_merged_columns(db)
-        _migrate_management_columns(db)
-        _migrate_medical_clearance_columns(db)
-        _migrate_installment_proof_columns(db)
-        _migrate_no_document_columns(db)
-        _migrate_upload_blob_columns(db)
-        _migrate_member_profile_columns(db)
-        _migrate_attendance_ledger_columns(db)
-        _backfill_medical_clearance_columns(db)
+
+    def _boot_pass(label: str, fn) -> None:
+        with db_session() as db:
+            fn(db)
+            db.commit()
+        log_event("startup_db_pass_ok", pass_label=label)
+
+    _boot_pass("schema_migrations", lambda db: (
+        _migrate_branch_extended_columns(db),
+        _migrate_branch_sw_code(db),
+        _migrate_enrollment_merged_columns(db),
+        _migrate_management_columns(db),
+        _migrate_medical_clearance_columns(db),
+        _migrate_installment_proof_columns(db),
+        _migrate_no_document_columns(db),
+        _migrate_upload_blob_columns(db),
+        _migrate_member_profile_columns(db),
+        _migrate_attendance_ledger_columns(db),
+        _migrate_coach_hire_date(db),
+        _migrate_coach_user_links(db),
+        _migrate_user_custom_permissions(db),
+        _migrate_coach_personal_block_kind(db),
+    ))
+
+    _boot_pass("backfill_medical", lambda db: _backfill_medical_clearance_columns(db))
+
+    def _blob_backfill(db) -> None:
         try:
             _backfill_upload_blobs(db)
         except Exception as exc:  # noqa: BLE001 — boot must continue
             db.rollback()
             log_event("upload_blob_backfill_error", error=str(exc)[:240])
-        _migrate_coach_hire_date(db)
-        _migrate_coach_user_links(db)
-        _migrate_user_custom_permissions(db)
-        _migrate_coach_personal_block_kind(db)
-        seed_whatsapp_templates(db)
-        _seed_default_branches(db)
-        _seed_management_defaults(db)
-        _seed_default_users(db)
-        # [F005][S003] Never let phone backfill take down boot (unique conflicts → nested rollback).
+
+    _boot_pass("upload_blob_backfill", _blob_backfill)
+    _boot_pass(
+        "seed_defaults",
+        lambda db: (
+            seed_whatsapp_templates(db),
+            _seed_default_branches(db),
+            _seed_management_defaults(db),
+            _seed_default_users(db),
+        ),
+    )
+
+    def _phone_backfill(db) -> None:
         try:
             with db.begin_nested():
                 _backfill_student_phones_e164(db)
@@ -3654,7 +3674,8 @@ def _sync_startup() -> None:
                 _backfill_coach_phones_e164(db)
         except Exception as exc:  # noqa: BLE001 — boot must continue
             log_event("coach_phone_e164_backfill_error", error=str(exc)[:240])
-        db.commit()
+
+    _boot_pass("phone_e164_backfill", _phone_backfill)
 
 
 @app.on_event("startup")
@@ -3689,6 +3710,9 @@ async def _shutdown_keepalive() -> None:
             await task
         except asyncio.CancelledError:
             pass
+    # [F007][S002] Release pooled connections on Render recycle/deploy.
+    await asyncio.get_event_loop().run_in_executor(None, engine.dispose)
+    log_event("database_pool_disposed")
 
 
 API_SERVICE_NAME = "zomate-fitness-api"
