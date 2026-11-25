@@ -181,6 +181,56 @@ def test_coach_booking_attaches_schedule_to_admin_confirm_pin_shell(db_session, 
     assert exc.value.status_code == 409
 
 
+def test_legacy_shell_total_resyncs_after_prior_update(db_session):
+    """[F004][S002] Shell total_lessons stays remaining-only when 以上堂數 changes (10→8, not 12 in UI)."""
+    branch = Branch(name="TST", code="TST", address="Test")
+    coach = Coach(full_name="Coach Fung", phone="91230000", branch=branch, active=True)
+    student = Student(full_name="Yeung Case", phone="91112222", branch=branch)
+    category = CourseCategory(name="續會學生一對一", created_by_role="admin")
+    db_session.add_all([branch, coach, student, category])
+    db_session.commit()
+    admin = AppUser(username="ops", role="ADMIN", password_salt="", password_hash="")
+
+    first = main.admin_upsert_category_enrollment(
+        student.id,
+        main.StudentCategoryEnrollmentCreate(
+            course_category_id=category.id,
+            total_lessons=10,
+            total_installments=1,
+            lessons_already_taken=0,
+        ),
+        db_session,
+        admin,
+    )
+    shell = db_session.get(CourseEnrollment, first["course_enrollment_id"])
+    assert shell is not None
+    assert shell.total_lessons == 10
+
+    main.admin_upsert_category_enrollment(
+        student.id,
+        main.StudentCategoryEnrollmentCreate(
+            course_category_id=category.id,
+            total_lessons=10,
+            total_installments=1,
+            lessons_already_taken=2,
+        ),
+        db_session,
+        admin,
+    )
+    db_session.refresh(shell)
+    assert shell.total_lessons == 8
+
+    rec = main.coach_student_records(
+        student_id=student.id, coach_id=coach.id, db=db_session, user=_coach_user(coach)
+    )
+    enr = next(e for e in rec.enrollments if e.enrollment_id == shell.id)
+    assert enr.total_lessons == 8
+    assert enr.legacy_prior_lessons == 2
+    assert enr.legacy_category_enrollment_id == first["enrollment_id"]
+    # [F003][S007] Ledger still listed for dossier, but picker should skip it via linked id.
+    assert any(c.id == first["enrollment_id"] for c in rec.category_enrollments)
+
+
 def test_coach_booking_attaches_to_upsert_pin_shell(db_session, monkeypatch):
     """[F004][S002] Coach booking reuses the PIN shell created when Admin imports/saves the package."""
     branch = Branch(name="SW", code="SW", address="Test")

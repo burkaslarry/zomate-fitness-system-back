@@ -2632,6 +2632,16 @@ def _course_checkin_pins_for_student(
         }
     # [F003][S007] Converted paper ledgers keep their 已上 on the category ledger.
     legacy_prior = _category_prior_lessons_by_enrollment(db, student.id)
+    # [F004][S002] Heal stale legacy shell totals before Admin Package 進度 renders.
+    for enr in rows:
+        cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+        if not cat_id or _is_deleted(db, "course_enrollments", enr.id):
+            continue
+        cat_row = db.get(CategoryEnrollment, int(cat_id))
+        if cat_row is not None:
+            _sync_legacy_shell_total_lessons(db, enr, cat_row, student)
+    if db.dirty:
+        db.commit()
     out: list[dict] = []
     for enr in rows:
         segs = parse_segment_pins_json(enr.segment_pins_json)
