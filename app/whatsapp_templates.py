@@ -358,5 +358,11 @@ def whatsapp_lesson_counts(
         prior = legacy_prior_for_course(db, student_id, enr)
     attended_display = checkins + prior
     total = int(enr.total_lessons or 0) if enr else 0
-    remaining = max(0, total - checkins) if total else 0
+    from .lesson_credits import course_redeemed_credits, quantize_lesson_credits
+
+    if enr and total:
+        redeemed = course_redeemed_credits(db, enr)
+        remaining = quantize_lesson_credits(max(0.0, float(total) - redeemed))
+    else:
+        remaining = 0
     return attended_display, remaining

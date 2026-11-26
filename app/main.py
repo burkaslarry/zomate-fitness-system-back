@@ -235,6 +235,15 @@ from .enrollment_schedule import (
     parse_lesson_weekdays_str,
     parse_segment_pins_json,
 )
+from .lesson_credits import (
+    allowed_duration_hours,
+    course_redeemed_credits,
+    format_lesson_credits,
+    interval_credit_hours,
+    lesson_credits_available,
+    quantize_lesson_credits,
+    student_scheduled_unredeemed_credits,
+)
 from .coach_sessions import (
     build_coach_attendance_ledger_rows,
     build_coach_attendance_report_rows,
@@ -3563,7 +3572,7 @@ def resolve_checkin_pin_context(
     return None
 
 
-def _lesson_balance_sum(db: Session, student_id: int) -> int:
+def _lesson_balance_sum(db: Session, student_id: int) -> float:
     """[F007][S002]
     Feature: Lesson ledger (Phase-1)
     Step: Balance query
@@ -3574,23 +3583,70 @@ def _lesson_balance_sum(db: Session, student_id: int) -> int:
             LessonLedgerEntry.student_id == student_id,
         ),
     )
-    return int(total or 0)
+    return quantize_lesson_credits(float(total or 0))
+
+
+def _student_lesson_credit_meta(db: Session, student_id: int) -> tuple[float, float, list[float]]:
+    """[F007][S002] Ledger balance, bookable credits, and allowed slot durations."""
+    bal = _lesson_balance_sum(db, student_id)
+    avail = lesson_credits_available(db, student_id, bal)
+    return bal, avail, allowed_duration_hours(avail)
+
+
+def _checkin_credit_for_day(db: Session, enr: CourseEnrollment, day: date) -> float:
+    """[F003][S003] Redeem credits from today's confirmed slot duration."""
+    intervals = _effective_intervals_for_enrollment_on_day(db, enr, day)
+    if not intervals:
+        return 1.0
+    start, end, _original = intervals[0]
+    return interval_credit_hours(start, end)
+
+
+def _assert_booking_lesson_credits(
+    db: Session,
+    student: Student,
+    duration_hours: float,
+    *,
+    exclude_enrollment_id: int | None = None,
+    exclude_original_date: date | None = None,
+) -> None:
+    """[F003][S003] Block bookings when ledger cannot cover committed + new slot credits."""
+    duration_hours = quantize_lesson_credits(float(duration_hours))
+    balance = _lesson_balance_sum(db, student.id)
+    held = student_scheduled_unredeemed_credits(
+        db,
+        student.id,
+        exclude_enrollment_id=exclude_enrollment_id,
+        exclude_original_date=exclude_original_date,
+    )
+    available = quantize_lesson_credits(balance - held)
+    if duration_hours > available + 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"餘額不足：尚可排 {format_lesson_credits(available)} 堂"
+                f"（帳面 {format_lesson_credits(balance)} 堂，"
+                f"已排未簽到 {format_lesson_credits(held)} 堂），"
+                f"今次需 {format_lesson_credits(duration_hours)} 堂。"
+            ),
+        )
 
 
 def apply_lesson_ledger_delta(
     db: Session,
     student: Student,
-    delta_lessons: int,
+    delta_lessons: float,
     reason: str,
     *,
     enrollment_id: int | None = None,
     created_by_role: str = "system",
-) -> int:
+) -> float:
     """[F007][S002]
     Feature: Lesson ledger (Phase-1)
     Step: Credit / debit posting
     Logic: 寫入一筆 ledger 後；回傳該學員 SUM(ledger)（冇 denormalized 欄位）。
     """
+    delta_lessons = quantize_lesson_credits(float(delta_lessons))
     if delta_lessons == 0:
         return _lesson_balance_sum(db, student.id)
     db.add(
@@ -3627,11 +3683,16 @@ def perform_lesson_checkin(
     billing_student = student
     if duo_group is not None:
         billing_student = db.get(Student, int(duo_group.primary_student_id)) or student
-    if _lesson_balance_sum(db, billing_student.id) <= 0:
-        raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
+    session_day = now_hk().date()
+    redeem_credits = (
+        _checkin_credit_for_day(db, resolved_enrollment, session_day)
+        if resolved_enrollment
+        else 1.0
+    )
+    if _lesson_balance_sum(db, billing_student.id) < redeem_credits - 1e-9:
+        raise HTTPException(status_code=400, detail="Student has insufficient remaining lessons.")
 
     attended_at = datetime.utcnow()
-    session_day = now_hk().date()
 
     if resolved_enrollment:
         dup_filter = [student.id]
@@ -3655,7 +3716,11 @@ def perform_lesson_checkin(
     # Add `course_enrollment_id` nullable FKs in a migration, then persist
     # `resolved_enrollment.id` here for exact course package traceability.
     bal_after = apply_lesson_ledger_delta(
-        db, billing_student, -1, "checkin_redeem", created_by_role="student"
+        db,
+        billing_student,
+        -redeem_credits,
+        "checkin_redeem",
+        created_by_role="student",
     )
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
@@ -3693,6 +3758,7 @@ def perform_lesson_checkin(
         "channel": channel,
         "pin_resolution": pin_resolution,
         "lesson_balance_after": bal_after,
+        "lessons_redeemed": redeem_credits,
         "checkin_id": checkin_log.id,
         "course_title": resolved_enrollment.title if resolved_enrollment else None,
         "course_enrollment_id": resolved_enrollment.id if resolved_enrollment else None,
@@ -10703,8 +10769,8 @@ def coach_list_students(
         st = enr.student
         pending = not enr.coach_time_confirmed
         # [F003][S005] Student name stays plain; branch lives on each package row.
-        total = int(enr.total_lessons or 0)
-        used = used_by_course.get(enr.id, 0)
+        total = float(enr.total_lessons or 0)
+        redeemed = course_redeemed_credits(db, enr)
         pay_status, inst_status, _, _ = _coach_payment_summary(db, enr, st)
         next_no, next_reminder = _next_unpaid_installment_meta(enr)
         package = CoachStudentPackageOut(
@@ -10712,9 +10778,9 @@ def coach_list_students(
             course_title=enr.title or "Course",
             branch_name=enr.branch.name if enr.branch else None,
             branch_code=enr.branch.code if enr.branch else None,
-            total_lessons=total,
-            used_lessons=used,
-            remaining_lessons=max(0, total - used),
+            total_lessons=int(total),
+            used_lessons=redeemed,
+            remaining_lessons=max(0.0, quantize_lesson_credits(total - redeemed)),
             coach_time_confirmed=bool(enr.coach_time_confirmed),
             payment_status=pay_status,
             installment_status=inst_status,
@@ -10724,11 +10790,14 @@ def coach_list_students(
             legacy_prior_lessons=legacy_prior_by_course.get(enr.id, 0),
         )
         if st.id not in by_student:
+            bal, avail, durations = _student_lesson_credit_meta(db, st.id)
             by_student[st.id] = CoachStudentBriefOut(
                 student_id=st.id,
                 full_name=st.full_name,
                 phone=st.phone,
-                lesson_balance=_lesson_balance_sum(db, st.id),
+                lesson_balance=bal,
+                lesson_credits_available=avail,
+                allowed_duration_hours=durations,
                 enrollment_count=1,
                 pending_schedule=pending,
                 packages=[package],
@@ -10740,6 +10809,8 @@ def coach_list_students(
                 full_name=cur.full_name,
                 phone=cur.phone,
                 lesson_balance=cur.lesson_balance,
+                lesson_credits_available=cur.lesson_credits_available,
+                allowed_duration_hours=cur.allowed_duration_hours,
                 enrollment_count=cur.enrollment_count + 1,
                 pending_schedule=cur.pending_schedule or pending,
                 packages=[*cur.packages, package],
@@ -10748,11 +10819,14 @@ def coach_list_students(
     for st, _cat in students_onboarded_to_coach(db, cid):
         if st.id in by_student:
             continue
+        bal, avail, durations = _student_lesson_credit_meta(db, st.id)
         by_student[st.id] = CoachStudentBriefOut(
             student_id=st.id,
             full_name=st.full_name,
             phone=st.phone,
-            lesson_balance=_lesson_balance_sum(db, st.id),
+            lesson_balance=bal,
+            lesson_credits_available=avail,
+            allowed_duration_hours=durations,
             enrollment_count=0,
             pending_schedule=False,
         )
@@ -10865,11 +10939,14 @@ def coach_student_records(
                 scheduled_active[cat_id] = row.id
                 scheduled_once.add(cat_id)
         db.commit()
+    bal, avail, durations = _student_lesson_credit_meta(db, student.id)
     return CoachStudentRecordOut(
         student_id=student.id,
         full_name=student.full_name,
         phone=student.phone,
-        lesson_balance=_lesson_balance_sum(db, student.id),
+        lesson_balance=bal,
+        lesson_credits_available=avail,
+        allowed_duration_hours=durations,
         date_of_birth=student.date_of_birth,
         emergency_contact_name=student.emergency_contact_name,
         emergency_contact_relationship=student.emergency_contact_relationship,
@@ -10993,8 +11070,16 @@ def _book_next_lesson(db: Session, user: AppUser, enr: CourseEnrollment, payload
     slots = confirmed_lesson_slots(db, enr)
     if any(a.date() == payload.day for a, _b, _o in slots):
         raise HTTPException(status_code=409, detail="此課程當日已有排程；已簽到課堂已鎖定，請選下一個上堂日期。")
-    if len(slots) >= enr.total_lessons:
+    planned = (
+        sum(interval_credit_hours(a, b) for a, b, _o in slots)
+        + interval_credit_hours(start, end)
+    )
+    if planned > float(enr.total_lessons or 0) + 1e-9:
         raise HTTPException(status_code=400, detail="已排滿課程堂數。")
+    student = db.get(Student, enr.student_id)
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found.")
+    _assert_booking_lesson_credits(db, student, payload.duration_hours)
     _assert_coach_slot_available(db, cid, payload.day, start, end, allow_lesson_overlap=True)
     row = db.query(CourseSessionOverride).filter(CourseSessionOverride.enrollment_id == enr.id,
         CourseSessionOverride.original_date == payload.day).first()
@@ -11246,6 +11331,22 @@ def coach_confirm_enrollment_schedule(
     lesson_dates = enumerate_lesson_dates(first_day, ws_raw, enr.total_lessons)
     if not lesson_dates:
         raise HTTPException(status_code=400, detail="Could not schedule lessons from the given day.")
+    student = db.get(Student, enr.student_id)
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student not found.")
+    series_credits = quantize_lesson_credits(payload.duration_hours * len(lesson_dates))
+    held = student_scheduled_unredeemed_credits(db, student.id, exclude_enrollment_id=enr.id)
+    balance = _lesson_balance_sum(db, student.id)
+    if balance < held + series_credits - 1e-9:
+        available = quantize_lesson_credits(balance - held)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"餘額不足：尚可排 {format_lesson_credits(available)} 堂，"
+                f"此課程 {len(lesson_dates)} 堂 × {format_lesson_credits(payload.duration_hours)} 小時"
+                f" 共需 {format_lesson_credits(series_credits)} 堂。"
+            ),
+        )
     enr.lesson_weekdays = ",".join(str(w) for w in ws_raw)
     enr.series_start_date = first_day
     enr.series_end_date = lesson_dates[-1]

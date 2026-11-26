@@ -20,6 +20,7 @@ from .duo_groups import (
     notify_duo_partner_student_whatsapp,
 )
 from .enrollment_schedule import parse_segment_pins_json
+from .lesson_credits import format_lesson_credits
 from .course_payment_state import course_payment_state
 from .whatsapp_business import normalize_whatsapp_phone
 from .models import (
@@ -712,11 +713,13 @@ def _student_phone_display(student: Student) -> str:
     return phone_display or (student.phone or "")
 
 
-def _package_remaining_for_enrollment(db: Session, enrollment: CourseEnrollment) -> int:
+def _package_remaining_for_enrollment(db: Session, enrollment: CourseEnrollment) -> float:
     """[F003][S003] Remaining lessons on one course / old-package shell after check-ins."""
-    total = int(enrollment.total_lessons or 0)
-    attended = count_course_checkins(db, int(enrollment.student_id), enrollment.id)
-    return max(0, total - attended)
+    from .lesson_credits import course_redeemed_credits, quantize_lesson_credits
+
+    total = float(enrollment.total_lessons or 0)
+    redeemed = course_redeemed_credits(db, enrollment)
+    return quantize_lesson_credits(max(0.0, total - redeemed))
 
 
 def _student_package_remaining_rows(db: Session, student_id: int) -> list[dict[str, Any]]:
@@ -758,14 +761,22 @@ def _format_package_remaining_lines(rows: list[dict[str, Any]]) -> str:
     """[F003][S003] Multiline breakdown for student WhatsApp (never a single account total)."""
     if not rows:
         return "（未有可扣堂 package）"
-    return "\n".join(f"· {row['title']}：剩 {row['remaining']} 堂" for row in rows)
+    from .lesson_credits import format_lesson_credits
+
+    return "\n".join(
+        f"· {row['title']}：剩 {format_lesson_credits(float(row['remaining']))} 堂" for row in rows
+    )
 
 
 def _format_package_remaining_compact(rows: list[dict[str, Any]]) -> str:
     """[F003][S003] Single Meta template parameter — keep package names distinct."""
     if not rows:
         return "—"
-    return "；".join(f"{row['title']} 剩{row['remaining']}堂" for row in rows)
+    from .lesson_credits import format_lesson_credits
+
+    return "；".join(
+        f"{row['title']} 剩{format_lesson_credits(float(row['remaining']))}堂" for row in rows
+    )
 
 
 def send_checkin_student_whatsapp(
@@ -774,7 +785,7 @@ def send_checkin_student_whatsapp(
     *,
     student: Student,
     enrollment: CourseEnrollment,
-    lesson_balance_after: int,
+    lesson_balance_after: float,
     checked_in_at: datetime | None = None,
 ) -> dict[str, Any] | None:
     """[F003][S003]
@@ -795,7 +806,7 @@ def send_checkin_student_whatsapp(
         f"{student.full_name}，你已成功簽到。\n"
         f"課程：{enrollment.title}\n"
         f"簽到時間（香港）：{when}\n"
-        f"本課程剩餘堂數：{selected_remaining}\n"
+        f"本課程剩餘堂數：{format_lesson_credits(float(selected_remaining))}\n"
         f"各 package 剩餘堂數：\n{package_lines}\n\n"
         "查詢請 WhatsApp 6052 9291。此號碼用作系統通知。"
     )
@@ -813,7 +824,7 @@ def send_checkin_student_whatsapp(
             "checkin_time": when,
             "lesson_balance": package_compact,
             "lessons_attended": str(attended_display),
-            "lessons_remaining": str(selected_remaining),
+            "lessons_remaining": format_lesson_credits(float(selected_remaining)),
             "package_remaining": package_compact,
             "checked_in_at": when,
         },
@@ -833,7 +844,7 @@ def send_checkin_coach_whatsapp(
     student: Student,
     enrollment: CourseEnrollment,
     coach: Coach | None,
-    lesson_balance_after: int,
+    lesson_balance_after: float,
     checked_in_at: datetime | None = None,
 ) -> dict[str, Any] | None:
     """[F003][S003]
@@ -853,7 +864,7 @@ def send_checkin_coach_whatsapp(
         f"課程：{enrollment.title}\n"
         f"簽到時間（香港）：{when}\n"
         f"本課程已上：{attended_display} 堂\n"
-        f"本課程剩餘堂數：{selected_remaining}\n\n"
+        f"本課程剩餘堂數：{format_lesson_credits(float(selected_remaining))}\n\n"
         "如有疑問，請 WhatsApp 6052 9291 查詢。此號碼用作系統通知。"
     )
     log_whatsapp_fn(
@@ -868,9 +879,9 @@ def send_checkin_coach_whatsapp(
             "student_phone": phone_display or (student.phone or ""),
             "course_title": enrollment.title,
             "checkin_time": when,
-            "lesson_balance": str(selected_remaining),
+            "lesson_balance": format_lesson_credits(float(selected_remaining)),
             "lessons_attended": str(attended_display),
-            "lessons_remaining": str(selected_remaining),
+            "lessons_remaining": format_lesson_credits(float(selected_remaining)),
             "checked_in_at": when,
         },
     )

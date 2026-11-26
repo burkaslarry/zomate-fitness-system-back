@@ -261,7 +261,7 @@ class ManualLessonRedeemInput(BaseModel):
 class LedgerAdjustInput(BaseModel):
     """[F007][S002] Admin correction when payment + course open double-credited the ledger."""
 
-    delta_lessons: int = Field(..., ge=-100, le=100)
+    delta_lessons: float = Field(..., ge=-100, le=100)
     reason: str = Field(default="admin_ledger_adjust", min_length=1, max_length=160)
     remarks: str | None = Field(default=None, max_length=255)
 
@@ -284,7 +284,7 @@ class StudentOut(BaseModel):
     disclaimer_accepted: bool = False
     photo_path: str | None = None
     signature_image_url: str | None = None
-    lesson_balance: int = Field(description="由 zomate_fs_lesson_ledger 加總；ORM Student 無此欄。")
+    lesson_balance: float = Field(description="由 zomate_fs_lesson_ledger 加總（0.5 步進）；ORM Student 無此欄。")
     face_id_external: str | None
     created_at: datetime
 
@@ -600,8 +600,8 @@ class CoachStudentPackageOut(BaseModel):
     branch_name: str | None = None
     branch_code: str | None = None
     total_lessons: int
-    used_lessons: int
-    remaining_lessons: int
+    used_lessons: float
+    remaining_lessons: float
     coach_time_confirmed: bool
     payment_status: str
     installment_status: str
@@ -618,7 +618,14 @@ class CoachStudentBriefOut(BaseModel):
     student_id: int
     full_name: str
     phone: str
-    lesson_balance: int
+    lesson_balance: float
+    lesson_credits_available: float = Field(
+        description="Ledger minus credits committed to future scheduled slots.",
+    )
+    allowed_duration_hours: list[float] = Field(
+        default_factory=list,
+        description="Durations (0.5–2h) affordable with lesson_credits_available.",
+    )
     enrollment_count: int
     pending_schedule: bool
     packages: list[CoachStudentPackageOut] = []
@@ -680,7 +687,11 @@ class CoachStudentRecordOut(BaseModel):
     student_id: int
     full_name: str
     phone: str
-    lesson_balance: int
+    lesson_balance: float
+    lesson_credits_available: float = Field(
+        description="Ledger minus credits committed to future scheduled slots.",
+    )
+    allowed_duration_hours: list[float] = Field(default_factory=list)
     date_of_birth: date | None = None
     emergency_contact_name: str | None = None
     emergency_contact_relationship: str | None = None

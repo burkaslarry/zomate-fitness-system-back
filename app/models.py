@@ -288,7 +288,7 @@ class LessonLedgerEntry(Base):
     enrollment_id: Mapped[int | None] = mapped_column(
         ForeignKey("zomate_fs_category_enrollments.id", ondelete="SET NULL"), nullable=True
     )
-    delta_lessons: Mapped[int] = mapped_column(Integer, nullable=False)
+    delta_lessons: Mapped[float] = mapped_column(Numeric(10, 1), nullable=False)
     reason: Mapped[str] = mapped_column(String(160), nullable=False)
     created_by_role: Mapped[str] = mapped_column(String(24), nullable=False, default="system")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
