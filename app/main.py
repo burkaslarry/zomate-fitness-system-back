@@ -6820,10 +6820,31 @@ def admin_confirm_category_installment(
     amount = payload.amount if payload is not None and payload.amount is not None else None
     if amount is None and pay.amount:
         amount = float(pay.amount)
+    # [F004][S002] Old-package cash confirm without receipt still needs a tranche amount.
+    if (amount is None or float(amount) <= 0) and pay.no_document_required:
+        raise HTTPException(
+            status_code=400,
+            detail="請先輸入並儲存本期金額，或在確認付款時一併提供金額。",
+        )
     _mark_category_installment_paid(db, plan_id, installment_no, amount)
     # [F004][S002] Imported category packages often have no CourseEnrollment yet — create a PIN shell.
     course = _ensure_legacy_category_course_enrollment(db, enrollment, student)
     _unlock_pin_for_category_confirm(db, course, installment_no)
+    # [F005][S003] Mirror category tranche into course payment_state for WhatsApp totals.
+    if amount is not None and float(amount) > 0:
+        plan_rows = (
+            db.query(InstallmentPayment)
+            .filter(InstallmentPayment.installment_plan_id == plan_id)
+            .order_by(InstallmentPayment.installment_no.asc())
+            .all()
+        )
+        plan_total = sum(float(p.amount or 0) for p in plan_rows)
+        record_course_payment(
+            course,
+            amount=float(amount),
+            total_amount=plan_total if plan_total > 0 else None,
+            installment_no=installment_no,
+        )
     db.add(
         AuditLog(
             action="category_installment_confirmed",

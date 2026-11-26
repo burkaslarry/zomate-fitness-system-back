@@ -190,7 +190,11 @@ def test_category_no_document_allows_confirm_without_proof(db_session, monkeypat
     assert result["no_document_required"] is True
 
     confirmed = main.admin_confirm_category_installment(
-        plan_id=plan.id, installment_no=2, payload=None, db=db_session, user=admin
+        plan_id=plan.id,
+        installment_no=2,
+        payload=main.CategoryInstallmentConfirm(amount=1000.0),
+        db=db_session,
+        user=admin,
     )
     assert confirmed["ok"] is True
     pay = (
@@ -202,6 +206,7 @@ def test_category_no_document_allows_confirm_without_proof(db_session, monkeypat
         .first()
     )
     assert pay.paid_at is not None
+    assert float(pay.amount or 0) == 1000.0
     pin = confirmed["whatsapp"]["pin_unlocked"]
     assert pin and pin.isdigit() and len(pin) == 5
     assert pin in confirmed["whatsapp"]["student"]["message"]

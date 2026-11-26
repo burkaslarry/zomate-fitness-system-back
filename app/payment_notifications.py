@@ -372,10 +372,22 @@ def send_payment_whatsapp_notifications(
     )
     if enr is not None:
         # [F005][S003] Never put another enrollment's money into this course's notification.
-        paid_amt = amount if amount is not None else payment_state.get("last_amount")
+        paid_amt = (
+            float(amount)
+            if amount is not None and float(amount) > 0
+            else payment_state.get("last_amount")
+        )
         total_amt = payment_state.get("total_amount")
         if total_amt is None and segment_dicts and all(s.get("amount_hkd") is not None for s in segment_dicts):
             total_amt = sum(float(s["amount_hkd"]) for s in segment_dicts)
+        if total_amt is None and installment_plan_id is not None and inst_payments:
+            plan_total = sum(float(p.amount or 0) for p in inst_payments if p.amount)
+            if plan_total > 0:
+                total_amt = plan_total
+        if (paid_amt is None or float(paid_amt or 0) <= 0) and installment_no is not None and inst_payments:
+            row = next((p for p in inst_payments if int(p.installment_no) == int(installment_no)), None)
+            if row is not None and row.amount and float(row.amount) > 0:
+                paid_amt = float(row.amount)
         # Confirmed payments + pending checkout amounts (e.g. 第1期 recorded but not Admin-confirmed).
         paid_total = float(payment_state.get("paid_total") or 0)
         pending = payment_state.get("pending_payments") or {}
@@ -409,6 +421,13 @@ def send_payment_whatsapp_notifications(
             else "已分期（部分付款待補足）"
         )
     installment_notes = build_installment_notes_from_segments(segment_dicts) if segment_dicts else ""
+    if not installment_notes and inst_payments:
+        parts = []
+        for p in sorted(inst_payments, key=lambda r: int(r.installment_no)):
+            if p.amount and float(p.amount) > 0:
+                parts.append(f"第{p.installment_no}期 HKD {float(p.amount):,.0f}")
+        if parts:
+            installment_notes = "；".join(parts)
     branch_code = None
     if enr is not None and enr.branch_id:
         from .models import Branch
