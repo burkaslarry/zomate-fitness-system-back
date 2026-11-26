@@ -1320,8 +1320,8 @@ def log_whatsapp(
     elif not result.ok:
         log_message = f"[send_failed:{result.error or 'error'}] {message}"
     else:
-        # [F005][S003] Admin log viewer — Meta acceptance only; wamid/body stay out of DB row.
-        log_message = "[api_accepted]"
+        # [F005][S003] Log Meta acceptance without wamid; keep sent body for admin viewer.
+        log_message = f"[api_accepted] {message}"
     log = WhatsAppLog(student_id=student.id, recipient=meta_recipient, message=log_message)
     db.add(log)
 
