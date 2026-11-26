@@ -1314,16 +1314,15 @@ def log_whatsapp(
         template_context=template_context,
     )
     if not normalize_whatsapp_phone(recip):
-        prefix = "[send_failed:phone_missing_country_code_in_db] "
+        log_message = f"[send_failed:phone_missing_country_code_in_db] {message}"
     elif result.dry_run:
-        prefix = f"[dry_run:{result.error or 'not_dispatched'}] "
+        log_message = f"[dry_run:{result.error or 'not_dispatched'}] {message}"
     elif not result.ok:
-        prefix = f"[send_failed:{result.error or 'error'}] "
-    elif result.message_id:
-        prefix = f"[api_accepted:{result.message_id}] "
+        log_message = f"[send_failed:{result.error or 'error'}] {message}"
     else:
-        prefix = "[api_accepted] "
-    log = WhatsAppLog(student_id=student.id, recipient=meta_recipient, message=f"{prefix}{message}")
+        # [F005][S003] Admin log viewer — Meta acceptance only; wamid/body stay out of DB row.
+        log_message = "[api_accepted]"
+    log = WhatsAppLog(student_id=student.id, recipient=meta_recipient, message=log_message)
     db.add(log)
 
 
