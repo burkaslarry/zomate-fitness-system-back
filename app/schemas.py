@@ -458,6 +458,9 @@ class CourseCreate(BaseModel):
     payment_renewal_id: int | None = Field(default=None, ge=1)
     payment_total_amount: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     payment_received: bool = False
+    # [F002][S003] Reg-course / staff checkout — links category ledger + 一對二 duo bind.
+    course_category_id: int | None = Field(default=None, ge=1)
+    partner_phone: str | None = Field(default=None, max_length=32)
 
     @model_validator(mode="after")
     def validate_weekdays(self) -> "CourseCreate":

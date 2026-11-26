@@ -213,6 +213,7 @@ from .duo_groups import (
     duo_meta_for_category_row,
     duplicate_partner_course_pins,
     ensure_duo_partner_bound,
+    is_duo_course_category,
     member_category_enrollments,
     notify_duo_partner_student_whatsapp,
     partner_category_enrollment_mirrors,
@@ -2786,6 +2787,63 @@ def _resize_category_installment_plan(db: Session, enrollment_id: int, n: int) -
     plan.total_installments = n
 
 
+def _link_reg_course_category_ledger(
+    db: Session,
+    *,
+    student: Student,
+    course_enr: CourseEnrollment,
+    payload: CourseCreate,
+    user: AppUser,
+) -> None:
+    """[F002][S003] Reg-course: category ledger + duo bind; lesson credit stays on course_open_package."""
+    cat_id = payload.course_category_id
+    if not cat_id:
+        return
+    cat = db.get(CourseCategory, int(cat_id))
+    if not cat or cat.is_deleted:
+        raise HTTPException(status_code=400, detail="Invalid course category.")
+    if is_duo_course_category(cat) and not (payload.partner_phone or "").strip():
+        raise HTTPException(status_code=400, detail="一對二 package 必須填寫同伴電話。")
+    role = user.role.lower()
+    prior = min(int(payload.lessons_already_taken or 0), int(payload.total_lessons or 0))
+    n_inst = max(1, min(5, int(payload.total_installments)))
+    existing = (
+        db.query(CategoryEnrollment)
+        .filter(
+            CategoryEnrollment.student_id == student.id,
+            CategoryEnrollment.course_category_id == int(cat_id),
+        )
+        .first()
+    )
+    if existing:
+        existing.total_lessons = payload.total_lessons
+        _apply_category_prior_lessons(db, student, existing, prior, role)
+        _resize_category_installment_plan(db, existing.id, n_inst)
+        cat_enr = existing
+    else:
+        cat_enr = CategoryEnrollment(
+            student_id=student.id,
+            course_category_id=int(cat_id),
+            status="active",
+            started_at=datetime.utcnow().date(),
+            total_lessons=payload.total_lessons,
+            notes=None,
+        )
+        db.add(cat_enr)
+        db.flush()
+        _installment_plan_seed_rows(db, cat_enr.id, n_inst)
+        _apply_category_prior_lessons(db, student, cat_enr, prior, role)
+    ensure_duo_partner_bound(
+        db,
+        primary_student=student,
+        category=cat,
+        enrollment=cat_enr,
+        partner_phone=payload.partner_phone,
+    )
+    course_enr.legacy_category_enrollment_id = cat_enr.id
+    db.add(course_enr)
+
+
 def record_activity(db: Session, student: Student, activity_type: str, ref_id: int | None = None) -> None:
     if student.hkid:
         db.add(ActivityLog(member_hkid=student.hkid, type=activity_type, ref_id=ref_id))
@@ -5182,6 +5240,7 @@ def list_students(
     offset: int = Query(default=0, ge=0),
     q: str | None = Query(default=None),
     medical_pending: bool = Query(default=False),
+    active_only: bool = Query(default=False),
 ) -> dict:
     """[F001][S003]
     Feature: Student Onboarding
@@ -5192,6 +5251,27 @@ def list_students(
     base = db.query(Student).filter(~Student.id.in_(deleted_students))
     if medical_pending:
         base = base.filter(Student.medical_clearance_status == "pending")
+    # [F001][S003] Same definition as roster summary card: ledger balance or recent check-in.
+    if active_only:
+        ledger_positive = (
+            select(LessonLedgerEntry.student_id.label("sid"))
+            .group_by(LessonLedgerEntry.student_id)
+            .having(func.coalesce(func.sum(LessonLedgerEntry.delta_lessons), 0) > 0)
+            .subquery()
+        )
+        cutoff = datetime.utcnow() - timedelta(days=ACTIVE_MEMBER_DAYS)
+        recent_checkin = (
+            select(CheckinLog.student_id.label("sid"))
+            .where(CheckinLog.created_at >= cutoff)
+            .distinct()
+            .subquery()
+        )
+        base = base.filter(
+            or_(
+                Student.id.in_(select(ledger_positive.c.sid)),
+                Student.id.in_(select(recent_checkin.c.sid)),
+            )
+        )
     q_norm = (q or "").strip()
     if q_norm:
         pattern = f"%{q_norm}%"
@@ -9245,6 +9325,9 @@ def _create_course_impl(payload: CourseCreate, db: Session, user: AppUser) -> Co
                 "course_prior_lessons_import",
                 created_by_role=user.role.lower(),
             )
+        if payload.course_category_id:
+            # [F002][S003] Staff reg-course — sync category row + 一對二 companion for admin/installments UI.
+            _link_reg_course_category_ledger(db, student=student, course_enr=enr, payload=payload, user=user)
     if first_created is None:
         raise HTTPException(status_code=400, detail="No valid student_ids to enroll.")
     db.commit()
