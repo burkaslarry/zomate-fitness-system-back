@@ -999,6 +999,8 @@ class StudentCategoryEnrollmentCreate(BaseModel):
     total_installments: int = Field(default=3, ge=1, le=999)
     # [F002][S003] Lessons already taken before the paper package was entered here.
     lessons_already_taken: int = Field(default=0, ge=0, le=998)
+    # [F002][S003] Required when course category is 新／續會 一對二 (companion B).
+    partner_phone: str | None = Field(default=None, max_length=30)
 
     @model_validator(mode="after")
     def validate_prior_lessons(self) -> "StudentCategoryEnrollmentCreate":

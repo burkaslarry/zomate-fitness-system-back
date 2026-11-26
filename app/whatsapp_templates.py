@@ -345,8 +345,17 @@ def whatsapp_lesson_counts(
     db: Session, student_id: int, enr: CourseEnrollment | None
 ) -> tuple[int, int]:
     """[F005][S003] (attended_display, remaining) for WhatsApp — attended includes paper 已上."""
-    checkins = count_course_checkins(db, student_id, enr.id if enr else None)
-    prior = legacy_prior_for_course(db, student_id, enr)
+    from .duo_groups import duo_group_for_legacy_category, shared_course_checkin_count
+
+    group = duo_group_for_legacy_category(
+        db, getattr(enr, "legacy_category_enrollment_id", None) if enr else None
+    )
+    if group is not None and enr is not None:
+        checkins = shared_course_checkin_count(db, enr.id, group)
+        prior = legacy_prior_for_course(db, int(group.primary_student_id), enr)
+    else:
+        checkins = count_course_checkins(db, student_id, enr.id if enr else None)
+        prior = legacy_prior_for_course(db, student_id, enr)
     attended_display = checkins + prior
     total = int(enr.total_lessons or 0) if enr else 0
     remaining = max(0, total - checkins) if total else 0

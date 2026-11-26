@@ -212,6 +212,32 @@ class CategoryEnrollment(Base):
     student: Mapped["Student"] = relationship(back_populates="category_enrollments")
     course_category: Mapped["CourseCategory"] = relationship(back_populates="enrollments")
     installment_plans: Mapped[list["InstallmentPlan"]] = relationship(back_populates="enrollment")
+    # [F002][S003] Set on primary student's category ledger when a 1-on-2 group exists.
+    duo_group_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_duo_groups.id"), nullable=True, index=True
+    )
+    duo_group: Mapped["DuoGroup | None"] = relationship(foreign_keys=[duo_group_id])
+
+
+class DuoGroup(Base):
+    """[F002][S003] One shared 1-on-2 package — payment on primary category enrollment only."""
+
+    __tablename__ = "zomate_fs_duo_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    primary_student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    partner_student_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_students.id"), nullable=False, index=True)
+    primary_category_enrollment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("zomate_fs_category_enrollments.id"), nullable=True, unique=True, index=True
+    )
+    course_category_id: Mapped[int] = mapped_column(ForeignKey("zomate_fs_course_categories.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    primary_student: Mapped["Student"] = relationship(foreign_keys=[primary_student_id])
+    partner_student: Mapped["Student"] = relationship(foreign_keys=[partner_student_id])
+    primary_category_enrollment: Mapped["CategoryEnrollment | None"] = relationship(
+        foreign_keys=[primary_category_enrollment_id]
+    )
 
 
 class InstallmentPlan(Base):

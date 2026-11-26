@@ -207,6 +207,17 @@ from .payment_notifications import (
     send_receipt_upload_request_whatsapp,
     send_schedule_booking_whatsapp,
 )
+from .duo_groups import (
+    duo_group_for_legacy_category,
+    duo_member_student_ids,
+    duo_meta_for_category_row,
+    duplicate_partner_course_pins,
+    ensure_duo_partner_bound,
+    member_category_enrollments,
+    notify_duo_partner_student_whatsapp,
+    partner_category_enrollment_mirrors,
+    shared_course_checkin_count,
+)
 from .payment_records import (
     build_payment_records,
     build_sales_report_rows,
@@ -2662,6 +2673,14 @@ def _course_checkin_pins_for_student(
             legacy_plan_id, seg_dicts, legacy_no_upload = _legacy_category_segments_for_pin_card(db, enr)
             if legacy_no_upload:
                 no_upload_nos = legacy_no_upload
+        duo_meta = None
+        legacy_cat_id = getattr(enr, "legacy_category_enrollment_id", None)
+        if legacy_cat_id:
+            grp = duo_group_for_legacy_category(db, int(legacy_cat_id))
+            if grp is not None:
+                ce_row = db.get(CategoryEnrollment, int(legacy_cat_id))
+                if ce_row is not None:
+                    duo_meta = duo_meta_for_category_row(db, student, ce_row, grp)
         out.append(
             {
                 "course_id": enr.id,
@@ -2689,8 +2708,19 @@ def _course_checkin_pins_for_student(
                 ),
                 "legacy_installment_plan_id": legacy_plan_id,
                 "deleted": enr.id in deleted_ids,
+                "duo": duo_meta,
             }
         )
+    # [F002][S003] 一對二同伴：鏡像主學生共用 PIN（其他課種不受影響）。
+    out = duplicate_partner_course_pins(db, student, out, include_deleted=include_deleted)
+    for row in out:
+        cat_id = row.get("legacy_category_enrollment_id")
+        if not cat_id:
+            continue
+        grp = duo_group_for_legacy_category(db, int(cat_id))
+        if grp is None:
+            continue
+        row["lessons_attended"] = shared_course_checkin_count(db, int(row["course_id"]), grp)
     return out
 
 
@@ -2936,6 +2966,21 @@ def _migrate_branch_sw_code(db: Session) -> None:
         if conflict:
             return
         legacy.code = "SW"
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _migrate_duo_group_columns(db: Session) -> None:
+    """[F002][S003] duo_groups table + category_enrollments.duo_group_id."""
+    stmts = [
+        "ALTER TABLE zomate_fs_category_enrollments ADD COLUMN IF NOT EXISTS duo_group_id INTEGER NULL",
+        "CREATE INDEX IF NOT EXISTS ix_zomate_fs_category_enrollments_duo_group_id "
+        "ON zomate_fs_category_enrollments (duo_group_id)",
+    ]
+    try:
+        for s in stmts:
+            db.execute(text(s))
         db.commit()
     except Exception:
         db.rollback()
@@ -3367,12 +3412,59 @@ def resolve_today_primary_enrollment_for_student(
     return best[0], best[1]
 
 
+def _try_class_pin_match(
+    db: Session,
+    student: Student,
+    pin: str,
+    enr: CourseEnrollment,
+    *,
+    attendance_student_id: int | None = None,
+    dup_student_ids: list[int] | None = None,
+) -> tuple[CourseEnrollment, Coach, str] | Literal["blocked_installment_unpaid"] | None:
+    """[F003][S002] Match one enrollment to today's class PIN (optional duo attendance scope)."""
+    now = now_hk()
+    att_sid = int(attendance_student_id or student.id)
+    dup_ids = dup_student_ids or [student.id]
+    if not enr.coach_time_confirmed:
+        return None
+    if not _enrollment_matches_class_pin(enr, pin):
+        return None
+    segments = json.loads(enr.segment_pins_json or "[]")
+    if segments:
+        used = (
+            db.query(Attendance)
+            .filter(Attendance.student_id == att_sid, Attendance.course_id == enr.id)
+            .count()
+        )
+        current = next((s for s in segments if int(s["lesson_from"]) <= used + 1 <= int(s["lesson_to"])), None)
+        if current is None:
+            return None
+        if int(current["installment_no"]) > 1 and not current.get("paid"):
+            return "blocked_installment_unpaid"
+        if str(current.get("pin") or "") != pin:
+            return None
+    if not _segment_paid_for_matched_pin(enr, pin):
+        return "blocked_installment_unpaid"
+    if _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
+        consumed = (
+            db.query(Attendance.id)
+            .filter(
+                Attendance.course_id == enr.id,
+                Attendance.student_id.in_(dup_ids),
+                Attendance.session_calendar_date == now.date(),
+            )
+            .first()
+        )
+        if not consumed:
+            return enr, enr.coach, "class_pin"
+    return None
+
+
 def resolve_checkin_pin_context(
     db: Session, student: Student, pin: str
 ) -> tuple[CourseEnrollment, Coach, str] | Literal["blocked_installment_unpaid"] | None:
     """[F003][S002] Today-only PIN with first-term credit and a paid/current later-term gate."""
     pin = pin.strip()
-    now = now_hk()
     enrs = (
         db.query(CourseEnrollment)
         .options(joinedload(CourseEnrollment.coach))
@@ -3382,29 +3474,34 @@ def resolve_checkin_pin_context(
         .all()
     )
     for enr in enrs:
-        if not enr.coach_time_confirmed:
-            continue
-        if not _enrollment_matches_class_pin(enr, pin):
-            continue
-        # [F003][S002] A previous tranche PIN cannot redeem lessons from a later tranche.
-        segments = json.loads(enr.segment_pins_json or "[]")
-        if segments:
-            used = db.query(Attendance).filter(Attendance.student_id == student.id, Attendance.course_id == enr.id).count()
-            current = next((s for s in segments if int(s["lesson_from"]) <= used + 1 <= int(s["lesson_to"])), None)
-            if current is None:
-                return None
-            if int(current["installment_no"]) > 1 and not current.get("paid"):
-                return "blocked_installment_unpaid"
-            if str(current.get("pin") or "") != pin:
-                return None
-        if not _segment_paid_for_matched_pin(enr, pin):
-            return "blocked_installment_unpaid"
-        if _effective_intervals_for_enrollment_on_day(db, enr, now.date()):
-            consumed = db.query(Attendance.id).filter(Attendance.course_id == enr.id,
-                Attendance.student_id == student.id, Attendance.session_calendar_date == now.date()).first()
-            if not consumed:
-                return enr, enr.coach, "class_pin"
-        return None
+        matched = _try_class_pin_match(db, student, pin, enr)
+        if matched is not None:
+            return matched
+    # [F002][S003] 一對二 only: partner B may redeem primary A's shared PIN.
+    for group in partner_category_enrollment_mirrors(db, student.id):
+        primary_id = int(group.primary_student_id)
+        primary_enrs = (
+            db.query(CourseEnrollment)
+            .options(joinedload(CourseEnrollment.coach))
+            .filter(
+                CourseEnrollment.student_id == primary_id,
+                ~CourseEnrollment.id.in_(_deleted_course_enrollment_ids()),
+            )
+            .order_by(CourseEnrollment.id.asc())
+            .all()
+        )
+        dup_ids = duo_member_student_ids(group)
+        for enr in primary_enrs:
+            matched = _try_class_pin_match(
+                db,
+                student,
+                pin,
+                enr,
+                attendance_student_id=primary_id,
+                dup_student_ids=dup_ids,
+            )
+            if matched is not None:
+                return matched
     return None
 
 
@@ -3466,17 +3563,26 @@ def perform_lesson_checkin(
     db.query(Student).filter(Student.id == student.id).with_for_update().one()
     if resolved_enrollment is None or not resolved_enrollment.coach_time_confirmed or not _effective_intervals_for_enrollment_on_day(db, resolved_enrollment, now_hk().date()):
         raise HTTPException(status_code=400, detail="請先由教練確認今日排程，再簽到。")
-    if _lesson_balance_sum(db, student.id) <= 0:
+    duo_group = duo_group_for_legacy_category(
+        db, getattr(resolved_enrollment, "legacy_category_enrollment_id", None)
+    )
+    billing_student = student
+    if duo_group is not None:
+        billing_student = db.get(Student, int(duo_group.primary_student_id)) or student
+    if _lesson_balance_sum(db, billing_student.id) <= 0:
         raise HTTPException(status_code=400, detail="Student has no remaining lessons.")
 
     attended_at = datetime.utcnow()
     session_day = now_hk().date()
 
     if resolved_enrollment:
+        dup_filter = [student.id]
+        if duo_group is not None:
+            dup_filter = duo_member_student_ids(duo_group)
         dup = (
             db.query(Attendance)
             .filter(
-                Attendance.student_id == student.id,
+                Attendance.student_id.in_(dup_filter),
                 Attendance.course_id == resolved_enrollment.id,
                 Attendance.session_calendar_date == session_day,
             )
@@ -3490,23 +3596,40 @@ def perform_lesson_checkin(
     # currently point to `zomate_fs_category_enrollments`, not `zomate_fs_course_enrollments`.
     # Add `course_enrollment_id` nullable FKs in a migration, then persist
     # `resolved_enrollment.id` here for exact course package traceability.
-    bal_after = apply_lesson_ledger_delta(db, student, -1, "checkin_redeem", created_by_role="student")
+    bal_after = apply_lesson_ledger_delta(
+        db, billing_student, -1, "checkin_redeem", created_by_role="student"
+    )
     checkin_log = CheckinLog(student_id=student.id, channel=channel, remarks=remarks)
     db.add(checkin_log)
     db.flush()
 
     if resolved_enrollment:
-        db.add(
-            Attendance(
-                student_id=student.id,
-                enrollment_id=None,
-                coach_id=resolved_enrollment.coach_id,
-                branch_id=resolved_enrollment.branch_id,
-                course_id=resolved_enrollment.id,
-                attended_at=attended_at,
-                session_calendar_date=session_day,
+        attend_ids = [student.id]
+        if duo_group is not None:
+            attend_ids = duo_member_student_ids(duo_group)
+        for sid in attend_ids:
+            exists = (
+                db.query(Attendance.id)
+                .filter(
+                    Attendance.student_id == sid,
+                    Attendance.course_id == resolved_enrollment.id,
+                    Attendance.session_calendar_date == session_day,
+                )
+                .first()
             )
-        )
+            if exists:
+                continue
+            db.add(
+                Attendance(
+                    student_id=sid,
+                    enrollment_id=None,
+                    coach_id=resolved_enrollment.coach_id,
+                    branch_id=resolved_enrollment.branch_id,
+                    course_id=resolved_enrollment.id,
+                    attended_at=attended_at,
+                    session_calendar_date=session_day,
+                )
+            )
 
     detail_obj: dict = {
         "channel": channel,
@@ -3536,7 +3659,7 @@ def perform_lesson_checkin(
         coach = notified_coach or (
             db.get(Coach, resolved_enrollment.coach_id) if resolved_enrollment.coach_id else None
         )
-        send_checkin_student_whatsapp(
+        student_wa = send_checkin_student_whatsapp(
             db,
             log_whatsapp,
             student=student,
@@ -3553,6 +3676,22 @@ def perform_lesson_checkin(
             lesson_balance_after=bal_after,
             checked_in_at=attended_at,
         )
+        if duo_group is not None and student_wa:
+            partner = db.get(Student, int(duo_group.partner_student_id))
+            primary = db.get(Student, int(duo_group.primary_student_id))
+            for peer in (partner, primary):
+                if peer is None:
+                    continue
+                notify_duo_partner_student_whatsapp(
+                    db,
+                    log_whatsapp,
+                    group=duo_group,
+                    triggering_student=student,
+                    recipient=peer,
+                    message=str(student_wa.get("message") or ""),
+                    template_key=student_wa.get("template_key"),
+                    template_context=None,
+                )
     db.commit()
 
     checkin_branch = None
@@ -3651,6 +3790,7 @@ def _sync_startup() -> None:
         _migrate_coach_user_links(db),
         _migrate_user_custom_permissions(db),
         _migrate_coach_personal_block_kind(db),
+        _migrate_duo_group_columns(db),
     ))
 
     _boot_pass("backfill_medical", lambda db: _backfill_medical_clearance_columns(db))
@@ -4462,52 +4602,12 @@ def _member_full_payload(
         ],
         "course_checkin_pins": _course_checkin_pins_for_student(db, student, include_deleted=include_deleted),
         "payment_records": build_payment_records(db, student_id=student.id, file_url_fn=_file_url),
-        "category_enrollments": [
-            {
-                "id": ce.id,
-                "course_category_id": ce.course_category_id,
-                "category_name": ce.course_category.name,
-                "status": ce.status,
-                "total_lessons": ce.total_lessons,
-                "lessons_already_taken": category_prior.get(ce.id, 0),
-                "remaining_from_paper": max(0, ce.total_lessons - category_prior.get(ce.id, 0)),
-                "started_at": ce.started_at.isoformat(),
-                "installment_plans": [
-                    {
-                        "id": plan.id,
-                        "total_installments": plan.total_installments,
-                        "status": plan.status,
-                        "created_at": plan.created_at.isoformat(),
-                        "payments": [
-                            {
-                                "id": pay.id,
-                                "installment_no": pay.installment_no,
-                                "amount": float(pay.amount),
-                                "due_date": pay.due_date.isoformat(),
-                                "paid_at": pay.paid_at.isoformat() if pay.paid_at else None,
-                                "status": pay.status,
-                                "proof_receipt_id": pay.proof_receipt_id,
-                                "proof_uploaded_at": (
-                                    pay.proof_uploaded_at.isoformat() if pay.proof_uploaded_at else None
-                                ),
-                                "no_document_required": bool(pay.no_document_required),
-                            }
-                            for pay in sorted(plan.payments, key=lambda p: p.installment_no)
-                        ],
-                    }
-                    for plan in ce.installment_plans
-                ],
-            }
-            for ce in (
-                db.query(CategoryEnrollment)
-                .options(
-                    joinedload(CategoryEnrollment.course_category),
-                    joinedload(CategoryEnrollment.installment_plans).joinedload(InstallmentPlan.payments),
-                )
-                .filter(CategoryEnrollment.student_id == student.id)
-                .all()
-            )
-        ],
+        "category_enrollments": member_category_enrollments(
+            db,
+            student,
+            category_prior,
+            primary_prior_fn=lambda sid: _category_prior_lessons_by_enrollment(db, sid),
+        ),
     }
 
 
@@ -7283,6 +7383,13 @@ def admin_upsert_category_enrollment(
             )
         _apply_category_prior_lessons(db, student, existing, payload.lessons_already_taken, role)
         _resize_category_installment_plan(db, existing.id, payload.total_installments)
+        ensure_duo_partner_bound(
+            db,
+            primary_student=student,
+            category=cat,
+            enrollment=existing,
+            partner_phone=payload.partner_phone,
+        )
         pin_fields = _category_enrollment_pin_shell_fields(db, existing, student)
         db.commit()
         return {
@@ -7314,6 +7421,13 @@ def admin_upsert_category_enrollment(
         created_by_role=role,
     )
     _apply_category_prior_lessons(db, student, enr, payload.lessons_already_taken, role)
+    ensure_duo_partner_bound(
+        db,
+        primary_student=student,
+        category=cat,
+        enrollment=enr,
+        partner_phone=payload.partner_phone,
+    )
     db.add(
         AuditLog(
             action="category_enrollment_create",

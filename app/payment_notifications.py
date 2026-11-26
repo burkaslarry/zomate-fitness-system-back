@@ -14,6 +14,11 @@ from urllib.parse import quote
 from fastapi import HTTPException, UploadFile
 from sqlalchemy.orm import Session, joinedload
 
+from .duo_groups import (
+    duo_group_for_legacy_category,
+    duo_member_student_ids,
+    notify_duo_partner_student_whatsapp,
+)
 from .enrollment_schedule import parse_segment_pins_json
 from .course_payment_state import course_payment_state
 from .whatsapp_business import normalize_whatsapp_phone
@@ -503,6 +508,32 @@ def send_payment_whatsapp_notifications(
             "template_key": coach_key,
         }
 
+    # [F002][S003] 一對二 only — duplicate student payment WhatsApp to companion B.
+    duo_group = None
+    if installment_plan_id is not None:
+        plan = db.get(InstallmentPlan, installment_plan_id)
+        if plan is not None:
+            duo_group = duo_group_for_legacy_category(db, plan.enrollment_id)
+    elif enr is not None:
+        duo_group = duo_group_for_legacy_category(db, enr.legacy_category_enrollment_id)
+    if duo_group is not None:
+        for peer_id in duo_member_student_ids(duo_group):
+            if int(peer_id) == int(student.id):
+                continue
+            peer = db.get(Student, int(peer_id))
+            if peer is None:
+                continue
+            notify_duo_partner_student_whatsapp(
+                db,
+                log_whatsapp_fn,
+                group=duo_group,
+                triggering_student=student,
+                recipient=peer,
+                message=student_msg,
+                template_key=student_key,
+                template_context=ctx,
+            )
+
     return result
 
 
@@ -642,6 +673,25 @@ def send_schedule_booking_whatsapp(
             "wa_me_url": wa_me_link(coach.phone, coach_msg),
             "template_key": "schedule_booking_coach",
         }
+    duo_group = duo_group_for_legacy_category(db, enrollment.legacy_category_enrollment_id)
+    if duo_group is not None and result.get("student"):
+        student_msg = str(result["student"].get("message") or msg)
+        for peer_id in duo_member_student_ids(duo_group):
+            if int(peer_id) == int(student.id):
+                continue
+            peer = db.get(Student, int(peer_id))
+            if peer is None:
+                continue
+            notify_duo_partner_student_whatsapp(
+                db,
+                log_whatsapp_fn,
+                group=duo_group,
+                triggering_student=student,
+                recipient=peer,
+                message=student_msg,
+                template_key="schedule_booking_student",
+                template_context=result["student"].get("template_context"),
+            )
     return result
 
 
